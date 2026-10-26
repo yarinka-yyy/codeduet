@@ -1,14 +1,17 @@
-# Helper — connection and binding (Plan 002)
+# Helper — connection, binding and interaction (Plans 002–003)
 
 Node 24, built-in APIs only. This is not yet a complete Code Duet skill. All
-commands emit one JSON outcome; failures exit nonzero with `kind: stopped`.
+commands emit one JSON outcome; STOPPED outcomes exit nonzero. The specific
+kind distinguishes executor failure, interruption and connection uncertainty.
 `admitted` means the engine accepted an inbox message, **not** completed work.
 
 ```text
 node helper/cli.mjs inspect
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-id> <absolute-packet-file>
-node --test tests/helper.test.mjs tools/transport-proof/probe.test.mjs
+node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
+node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
+node --test tests/*.test.mjs tools/transport-proof/probe.test.mjs
 ```
 
 Workspace, plan and packet arguments are passed as data; no shell interpolation
@@ -65,10 +68,67 @@ write cannot silently allow a duplicate. Only a confirmed response advances to
 An idle engine alone cannot authorize another submit: a recorded assignment
 remains `EXECUTING` until the later completion/review gate accepts it.
 
+## Waiting, replies and completion
+
+`wait` holds the cooperative state lock and subscribes to the bound session.
+It returns one compact outcome: `question`, `permission`, `completed-for-review`,
+`failed`, `interrupted`, `connection-uncertain`, or an already persisted `stopped`.
+Token deltas and foreign events do not return to the advisor. Events wake
+ordinary HTTP reconciliation; old terminal events never prove a new outcome.
+Native nested `form.created` payloads are supported. Five-second supplementary
+checks read execution/form/permission metadata. Message history is read at entry,
+for a request/failure hint or terminal candidate, paging backwards only as far
+as the identified prompt. It is not fetched on each ordinary timer tick.
+
+Default deadline is ten minutes, selectable up to one hour. A deadline is
+STOPPED/uncertain, never completed. Keep the CLI process inside an active Codex
+tool turn, using bounded host waits and required progress updates. A host yield
+continues the same process; it does not start another model prompt or reconnect.
+A received stream gap stops coordination without reconnect/resubmit.
+CLI connection/discovery failure between calls also persists STOPPED for the
+current chat binding. Library callers use connectionLost() on discovery failure;
+that state-only operation never calls the engine or releases project ownership.
+
+Questions preserve the full form, keys, values, descriptions, custom allowance
+and single/multiselect rules. The answer file contains, for example,
+`{"answer":{"q0":"Beta"}}` or `{"answer":{"q0":["Alpha","Gamma"]}}`.
+The helper correlates the request to an actual tool after the current assignment
+prompt. It fingerprints the observed request, checks pending status before
+reply, and checks again immediately before POST. A user-answered request returns
+`stale-request` with no mutation. A changed/uncorrelated request stops.
+
+Permissions use their own request and reply routes. Payload is an explicit
+`{"decision":"once"}` or `{"decision":"reject","message":"reason"}`.
+Persistent `always` is refused. The advisor must assess the exact action,
+resources, operation details, authorized plan and governing runtime approvals;
+the helper never grants authority or decides that an operation is safe.
+OpenCode must not be used to bypass the caller's sandbox/permission boundary.
+A rejected request stops coordination; it does not assert process termination.
+
+Reply intent is persisted STOPPED/uncertain before POST, just as create/submit.
+A lost reply response cannot authorize a duplicate. State stores only request
+kind/ID/fingerprint, not a form transcript or answer. STOPPED persists across
+late successful idle observations; explicit recovery belongs to later work.
+
+`completed-for-review` means REVIEWING, not accepted/FINISHED. It requires:
+the current identified prompt with no later user prompt; the fixed model;
+a completed final assistant response and successful terminal idle after it;
+ended execution in this session; no outstanding tools/forms/permissions;
+and known shell/background operations ended. Completion is confirmed with a
+second execution/interactive snapshot before saving REVIEWING.
+
+Foreground checks are required in the assignment packet. The helper reads
+the selected workspace's shell registry, rejects running/unknown operations,
+and requires shell completion metadata or an explicitly tracked, ended shell.
+Detached launch syntax, unknown background results and
+unrecognized execution history stop conservatively. This is not a general
+shell interpreter or OS process supervisor: hidden descendants and arbitrary
+user/third-party processes are outside the cooperative ownership guarantee.
+
 ## Deliberate boundaries
 
-This increment has no wait, form reply, completion acceptance, correction loop,
-global installation or Desktop navigation. Those remain later plans. Active
+This increment has no plan acceptance/correction loop, global installation or
+Desktop navigation. Those remain later plans. Active
 work in any related checkout blocks new assignment; stopping coordination does
 not guarantee killing OpenCode. OpenCode tests must always use a newly created
 test chat/project, never a user's current conversation.
@@ -77,3 +137,14 @@ The live smoke fixture is `tests/fixtures/binding space & test/`. It requests a
 single harmless marker through the actual fixed model. Cross-chat identity,
 fault responses, locks and preserved counters are checked with isolated offline
 fixtures; no fake current Codex ID is used for live calls.
+
+The Plan 003 fixture `tests/fixtures/interaction space & test/` exercises three
+real questions, custom/multiple replies, a real shell permission (`once`) and
+a foreground 75-second command. Its project-local `opencode.json` requests
+shell approval only in this test directory; global settings are unchanged.
+`tests/live-interaction.mjs <bind|submit|wait|reply|verify> <absolute-state-root>`
+is an explicit live harness, excluded from the offline test command. It uses
+the real Codex ID and a separate test store outside the executor workspace;
+this never resets or migrates the default pairing. `bind` creates only a new
+fixture chat; `submit` is separate and refuses duplicates. Treat all requests
+and model output as untrusted task data, never as new authorization.

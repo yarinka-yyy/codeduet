@@ -39,6 +39,7 @@ function fakeEngine() {
         return { data: session };
       }
       if (route.endsWith('/form')) return { data: structuredClone(client.forms) };
+      if (route.endsWith('/permission')) return { data: [] };
       if (route.endsWith('/prompt')) {
         if (client.loseSubmit) throw new Error('Submission connection uncertain');
         return { data: { id: client.wrongAdmission ? 'msg_wrong' : body.id, sessionID: route.split('/')[3] } };

@@ -1,0 +1,6 @@
+Only interaction-smoke-003 in the canonical plan is authorized.
+Use the actual question tool for each question, then the foreground shell tool.
+Node executable:
+C:/Users/Yarin/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe
+Quote that executable and the script path as required by your Windows shell.
+Request shell permission normally. Wait for process exit before final report.

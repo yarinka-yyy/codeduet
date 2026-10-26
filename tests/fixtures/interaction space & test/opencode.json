@@ -1,0 +1,5 @@
+{
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" }
+  ]
+}
