@@ -1,0 +1,1 @@
+One consolidated review correction for block 2: padded input lost accepted trimming. Preserve uppercase, restore trimming, verify label(' alpha ') equals ALPHA and label('beta') equals BETA. Change only label.mjs; preserve protected.txt and canonical plans. Runtime/owner acceptance remains pending.

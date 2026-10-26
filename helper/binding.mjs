@@ -43,7 +43,8 @@ export function validateState(state) {
     need(['workspace', 'checkout', 'planPath'].every(key => text(binding[key]) && isAbsolute(binding[key])), 'Invalid binding paths');
     need(['workspaceID', 'checkoutID', 'engineID'].every(key => text(binding[key])) && phases.includes(binding.phase), 'Invalid binding identity/phase');
     need(binding.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(binding.sessionID), 'Invalid saved session ID');
-    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason'].includes(key)), 'Unexpected binding fields');
+    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment'].includes(key)), 'Unexpected binding fields');
+    if (binding.nextAssignment !== undefined) need(['block', 'correction'].includes(binding.nextAssignment) && ['PREPARING', 'STOPPED'].includes(binding.phase), 'Invalid next assignment');
     if (binding.uncertain !== undefined) need(['create', 'submit', 'reply'].includes(binding.uncertain) && binding.phase === 'STOPPED', 'Invalid pending mutation');
     if (binding.stopReason !== undefined) need(text(binding.stopReason) && binding.phase === 'STOPPED', 'Invalid stop reason');
     if (binding.pending !== undefined) need(['WAITING_FOR_ANSWER', 'STOPPED'].includes(binding.phase) && ['question', 'permission'].includes(binding.pending.kind) && /^(frm_|per)[a-zA-Z0-9_]+$/.test(binding.pending.id) && /^[a-f0-9]{64}$/.test(binding.pending.fingerprint) && Object.keys(binding.pending).length === 3, 'Invalid pending request');
@@ -124,7 +125,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   function summary(state, binding, kind) {
     const plan = state.plans.find(plan => plan.planPath === binding.planPath);
-    return { kind, workspace: binding.workspace, planPath: binding.planPath, sessionID: binding.sessionID, phase: binding.phase, model: MODEL, correctionCount: plan.correctionCount, ...(binding.assignmentID ? { assignmentID: binding.assignmentID, messageID: binding.messageID } : {}) };
+    return { kind, workspace: binding.workspace, planPath: binding.planPath, sessionID: binding.sessionID, phase: binding.phase, model: MODEL, correctionCount: plan.correctionCount, ...(binding.nextAssignment ? { nextAssignment: binding.nextAssignment } : {}), ...(binding.assignmentID ? { assignmentID: binding.assignmentID, messageID: binding.messageID } : {}) };
   }
   function stop(state, binding, kind, reason) {
     binding.phase = 'STOPPED'; delete binding.pending;
@@ -132,14 +133,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     saveState(statePath, state);
     return { ...summary(state, binding, kind), error: reason, executorStopped: false, retried: false };
   }
-  async function observed(workspace, planPath, nonGitBaseline, operation) {
+  async function observed(workspace, planPath, nonGitBaseline, operation, allowedPhases = ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING']) {
     return locked(async state => {
       const binding = state.bindings.find(binding => binding.codexChat === chatID);
       need(binding, 'No binding for this Codex chat');
       if (binding.phase === 'STOPPED') return { ...summary(state, binding, 'stopped'), error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required', executorStopped: false, retried: false };
       try {
         savedContext(binding, context(workspace, planPath, nonGitBaseline));
-        need(binding.assignmentID && ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING'].includes(binding.phase), 'No observable assignment');
+        need(binding.assignmentID && allowedPhases.includes(binding.phase), 'No observable assignment in the required phase');
         return await operation(state, binding);
       } catch (error) { return stop(state, binding, 'connection-uncertain', error.message); }
     });
@@ -159,8 +160,52 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
   }
 
+
+  function planCounter(state, ctx, importedCount) {
+    need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20, 'Invalid imported correction count');
+    let plan = state.plans.find(plan => plan.planPath === ctx.planPath);
+    if (!plan) {
+      plan = { workspace: ctx.workspace, planPath: ctx.planPath, correctionCount: importedCount ?? 0 };
+      state.plans.push(plan);
+    }
+    need(plan.workspace === ctx.workspace && (importedCount === undefined || plan.correctionCount === importedCount), 'Plan workspace/count conflicts with saved history');
+    return plan;
+  }
+  async function reviewedResult(binding) {
+    const current = await snapshot(binding);
+    need(!current.active && !current.forms.length && !current.permissions.length && current.session.outcome === 'succeeded' &&
+      current.session.time?.idle >= binding.submittedAt, 'Executor has not ended this assignment');
+    const history = inspectMessages(binding, await assignmentMessages(client, binding));
+    need(!history.kind, 'Failed/interrupted assignment cannot be released');
+    const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace));
+    completion(history, current.session, shells);
+    const confirmed = await snapshot(binding);
+    need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+      JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
+  }
   return {
     statePath,
+
+    async next(workspace, planPath, kind, nonGitBaseline) {
+      need(['block', 'correction'].includes(kind), 'Next assignment kind must be block or correction');
+      return observed(workspace, planPath, nonGitBaseline, async (state, binding) => {
+        await reviewedResult(binding);
+        if (kind === 'correction' && planCounter(state, binding).correctionCount === 20) {
+          return stop(state, binding, 'correction-limit', 'Twenty correction cycles exhausted; review remains incomplete');
+        }
+        binding.nextAssignment = kind; binding.phase = 'PREPARING';
+        saveState(statePath, state);
+        return summary(state, binding, 'prepared');
+      }, ['REVIEWING', 'FINISHED']);
+    },
+    async finish(workspace, planPath, nonGitBaseline) {
+      return observed(workspace, planPath, nonGitBaseline, async (state, binding) => {
+        await reviewedResult(binding);
+        binding.phase = 'FINISHED';
+        saveState(statePath, state);
+        return summary(state, binding, 'released');
+      }, ['REVIEWING', 'FINISHED']);
+    },
     async connectionLost() {
       return locked(async state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
@@ -250,19 +295,30 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       });
     },
 
-    async bind(workspace, planPath, nonGitBaseline) {
+    async bind(workspace, planPath, nonGitBaseline, importedCount) {
       return locked(async state => {
         const ctx = context(workspace, planPath, nonGitBaseline);
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         if (existing) {
+          if (existing.planPath !== ctx.planPath) {
+            savedContext({ ...existing, planPath: ctx.planPath }, ctx);
+            need(existing.phase === 'FINISHED', 'Previous plan assignment not released; no plan switch');
+            try { await reviewedResult(existing); }
+            catch (error) { return stop(state, existing, 'connection-uncertain', error.message); }
+            planCounter(state, ctx, importedCount);
+            existing.planPath = ctx.planPath; existing.phase = 'PREPARING';
+            for (const key of ['assignmentID', 'messageID', 'submittedAt', 'nextAssignment']) delete existing[key];
+            saveState(statePath, state);
+            return summary(state, existing, 'reused-plan');
+          }
           savedContext(existing, ctx);
           await sessionMatches(existing);
           await noForms(existing);
+          planCounter(state, ctx, importedCount);
           return summary(state, existing, 'reused');
         }
         await idleWorkspace(state, ctx);
-        if (!state.plans.some(plan => plan.planPath === ctx.planPath)) state.plans.push({ workspace: ctx.workspace, planPath: ctx.planPath, correctionCount: 0 });
-        need(state.plans.find(plan => plan.planPath === ctx.planPath).workspace === ctx.workspace, 'Plan workspace counter conflict');
+        planCounter(state, ctx, importedCount);
         const binding = { codexChat: chatID, ...ctx, engineID: client.engineID, sessionID: null, phase: 'STOPPED', uncertain: 'create' };
         state.bindings.push(binding);
         saveState(statePath, state);
@@ -277,13 +333,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return summary(state, binding, 'created');
       });
     },
-    async submit(workspace, planPath, assignmentID, packetPath, nonGitBaseline) {
+    async submit(workspace, planPath, assignmentID, packetPath, nonGitBaseline, kind = 'initial') {
       return locked(async state => {
         const ctx = context(workspace, planPath, nonGitBaseline);
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
         need(binding, 'No binding for this Codex chat');
         savedContext(binding, ctx);
-        need(binding.phase === 'PREPARING' && binding.assignmentID === undefined, 'Previous assignment not accepted; no repeat submit');
+        need(['initial', 'block', 'correction'].includes(kind), 'Invalid assignment kind');
+        need(binding.phase === 'PREPARING' && (binding.assignmentID === undefined || binding.nextAssignment === kind), 'Previous assignment not accepted; no repeat submit');
+        need(binding.assignmentID !== assignmentID, 'Use a fresh assignment ID after review');
+        const plan = planCounter(state, ctx);
+        if (kind === 'correction' && plan.correctionCount === 20) return stop(state, binding, 'correction-limit', 'Twenty correction cycles exhausted; no cycle 21');
         need(text(assignmentID) && /^[a-zA-Z0-9._-]{1,120}$/.test(assignmentID), 'Invalid assignment ID');
         need(isAbsolute(packetPath), 'Use absolute packet path');
         const packet = realpathSync(packetPath);
@@ -293,6 +353,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         await sessionMatches(binding);
         await noForms(binding);
         await idleWorkspace(state, ctx);
+        // Reserve once before POST: an uncertain delivery may already have consumed the cycle.
+        if (kind === 'correction') plan.correctionCount++;
         binding.assignmentID = assignmentID;
         binding.messageID = 'msg_' + randomUUID().replaceAll('-', '');
         binding.submittedAt = Date.now();
@@ -300,10 +362,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         saveState(statePath, state);
         const response = await client.request(`/api/session/${binding.sessionID}/prompt`, {
           id: binding.messageID,
-          text: `Assignment ID: ${assignmentID}\nCanonical plan: ${JSON.stringify(ctx.planPath)}\nRead that plan; only the assignment below is authorized. Finish all edits and ordinary foreground checks before the final response. Do not detach project-changing work. Report any remaining background operations; a final response does not itself transfer ownership.\n\n${task}`,
+          text: `Assignment ID: ${assignmentID}\nCanonical plan: ${JSON.stringify(ctx.planPath)}\nRead that plan; only the assignment below is authorized. Do not edit canonical plans/index/checkpoints, commit, push, merge, switch branches, delegate, broaden scope or execute unassigned blocks. Finish all edits and ordinary foreground checks before the final response. Do not detach project-changing work. Report any remaining background operations; a final response does not itself transfer ownership.\n\n${task}`,
         });
         need(response?.data?.id === binding.messageID && response.data.sessionID === binding.sessionID, 'Submission identity uncertain; no retry');
-        delete binding.uncertain;
+        delete binding.uncertain; delete binding.nextAssignment;
         binding.phase = 'EXECUTING';
         saveState(statePath, state);
         return summary(state, binding, 'admitted');

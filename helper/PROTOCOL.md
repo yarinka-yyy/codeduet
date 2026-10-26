@@ -1,4 +1,4 @@
-# Helper — connection, binding and interaction (Plans 002–003)
+# Helper — connection, binding, interaction and review (Plans 002–004)
 
 Node 24, built-in APIs only. This is not yet a complete Code Duet skill. All
 commands emit one JSON outcome; STOPPED outcomes exit nonzero. The specific
@@ -8,7 +8,11 @@ kind distinguishes executor failure, interruption and connection uncertainty.
 ```text
 node helper/cli.mjs inspect
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
+node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-count <0..20>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-id> <absolute-packet-file>
+node helper/cli.mjs next <absolute-workspace> <absolute-plan.md> <block|correction>
+node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assignment-id> <absolute-packet-file> --kind <block|correction>
+node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
 node --test tests/*.test.mjs tools/transport-proof/probe.test.mjs
@@ -36,7 +40,9 @@ bindings by Codex chat and counters by exact physical plan path/workspace. Each
 binding contains workspace/checkout paths and filesystem identities, engine and
 OpenCode session IDs, current plan, phase, and current assignment/message IDs.
 There is no task transcript, password, Git baseline history or second task list.
-Existing counter values are validated and preserved; increment policy is 004.
+Existing counter values are validated and preserved. The advisor imports an
+established count when first adopting a plan; conflicting imports stop without
+overwriting saved history. Count policy and operating contract are below.
 
 Writes use a same-directory temporary file and atomic rename. A cooperative
 `state.lock` serializes helper operations and is removed only by its owner.
@@ -54,7 +60,10 @@ First bind creates a new OpenCode session at the physical workspace. Repeated
 bind in the same Codex chat validates/reuses that exact session. A new actual
 Codex chat creates a new pair only if previous work is not executing, uncertain
 or under review. Another selected workspace/plan is not silently substituted.
-Plan reassignment after acceptance belongs to workflow integration in 004.
+Plan reassignment requires FINISHED and another confirmation of stopped
+execution. It reuses the same session only in the same physical workspace;
+each plan retains its own counter. Changing workspace requires a fresh actual
+Codex chat/pair, not silent reassociation.
 
 Before submit, the helper verifies session/model/directory, forms, saved phase,
 and all active session directory metadata. An active session anywhere within
@@ -125,10 +134,45 @@ unrecognized execution history stop conservatively. This is not a general
 shell interpreter or OS process supervisor: hidden descendants and arbitrary
 user/third-party processes are outside the cooperative ownership guarantee.
 
+## Plan review transitions
+
+See ../references/workflow.md and ../references/assignment-template.md for
+canonical-directory selection, authorization, baseline, protected files,
+questions/permissions, independent review, cross-route handoff and checkpoints.
+The helper has no Markdown parser/writer or automatic acceptance decision.
+
+After completed-for-review, the advisor inspects actual changes and records
+its checkpoint. next ... correction or next ... block rechecks the stopped
+assignment and prepares the selected kind. The following submit must use the
+matching --kind and a different assignment ID. The old assignment stays in the
+technical record until a new identified submission replaces it.
+
+Initial implementation defaults to --kind initial. A fresh pair adopting
+unfinished work explicitly uses block or correction according to the existing
+checkpoint; a new chat never turns corrections into initial implementation.
+For a new technical plan record, bind --correction-count imports its established
+0..20 count. It never resets an existing record. Missing/conflicting history
+is an advisor STOP condition, not permission to guess zero.
+
+Only corrective submission increments the count. Reservation is atomic with
+STOPPED/uncertain submit intent immediately before its one POST; local invalid
+arguments, preparing a task, questions/replies and independent checks spend no
+cycle. Uncertain delivery retains the one possible cycle; no automatic refund
+or resubmit. At 20, review is still allowed; a further correction produces
+correction-limit / STOPPED before any prompt. Do not disguise fixes as a block.
+
+finish rechecks ended execution and releases this adapter assignment as
+FINISHED; it sends no engine prompt and changes no plan/index. The advisor may
+leave the MD plan ACTIVE/BLOCKED because required runtime/visual/owner gates
+are missing. Only the advisor can mark all required work DONE.
+FINISHED can explicitly continue via next in the same plan, or bind can select
+a new plan after checking the previous assignment. Neither resets counters.
+STOPPED has no automatic recovery; next/finish do not bypass it.
+
 ## Deliberate boundaries
 
-This increment has no plan acceptance/correction loop, global installation or
-Desktop navigation. Those remain later plans. Active
+This increment has no automatic advisor, global installation or Desktop
+navigation. Those remain later plans. Active
 work in any related checkout blocks new assignment; stopping coordination does
 not guarantee killing OpenCode. OpenCode tests must always use a newly created
 test chat/project, never a user's current conversation.

@@ -1,0 +1,1 @@
+Implement only block 2 of the canonical plan: uppercase while preserving accepted trimming. Only label.mjs may change. Preserve protected.txt. Run the required plain/padded-input checks; runtime/owner acceptance remains pending.
