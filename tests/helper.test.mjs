@@ -214,3 +214,17 @@ test('discovery refuses missing/corrupt registration, changed versions, unavaila
   await assert.rejects(connect({ registrationPath, fetchImpl: async url => Response.json(url.endsWith('/api/info') ? { version: '2.1.4' } : { data: [{ ...MODEL, enabled: false, status: 'active' }] }) }), /unavailable/);
   await assert.rejects(connect({ registrationPath, fetchImpl: async () => Response.json({}) }), /Invalid engine info/);
 });
+
+for (const fault of ['read', 'http', 'json']) test('connection ' + fault + ' keeps safe diagnosis without body or raw cause', async t => {
+  const f = fixture(t), registrationPath = join(f.root, 'service.json'), secret = 'PRIVATE_TRANSPORT_007';
+  writeFileSync(registrationPath, JSON.stringify({ id: 'engine1', version: '2.1.4', url: 'http://127.0.0.1:1234', password: secret }));
+  await assert.rejects(connect({ registrationPath, fetchImpl: async () => {
+    if (fault === 'read') throw Object.assign(new TypeError(secret), { cause: { code: 'ECONNRESET', message: secret } });
+    return new Response(secret, { status: fault === 'http' ? 429 : 200 });
+  } }), error => {
+    assert.equal(error.diagnostic.category, { read: 'request-read', http: 'request-http', json: 'request-json' }[fault]);
+    if (fault === 'read') assert.equal(error.diagnostic.errorCode, 'ECONNRESET');
+    if (fault === 'http') assert.equal(error.diagnostic.httpStatus, 429);
+    assert.ok(!error.message.includes(secret) && !JSON.stringify(error.diagnostic).includes(secret)); return true;
+  });
+});

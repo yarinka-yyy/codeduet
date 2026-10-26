@@ -1,24 +1,25 @@
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { MODEL, connect } from './connection.mjs';
-import { helper } from './binding.mjs';
+import { connect, diagnose } from './connection.mjs';
+import { helper, inspect } from './binding.mjs';
 
 try {
   const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
-  if (!['inspect', 'bind', 'submit', 'wait', 'reply', 'next', 'finish'].includes(command) || args.length !== ({ inspect: 1, bind: 3, submit: 5, wait: 3, reply: 6, next: 4, finish: 3 })[command]) {
-    throw new Error('Usage: cli.mjs inspect | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>]; paths must be absolute');
+  if (!['inspect', 'bind', 'submit', 'wait', 'reply', 'next', 'finish'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ bind: 3, submit: 5, wait: 3, reply: 6, next: 4, finish: 3 })[command])) {
+    throw new Error('Usage: cli.mjs inspect [<workspace>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>]; paths must be absolute');
   }
   if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && command !== 'bind') throw new Error('Assignment kind belongs to submit; correction-count import belongs to bind');
-  let client;
+  let client, connectionError;
   try { client = await connect(); }
   catch (error) {
-    if (command !== 'inspect') await helper(null).connectionLost();
-    throw error;
+    if (command !== 'inspect') { await helper(null).connectionLost(error); throw error; }
+    connectionError = error;
   }
   let result;
-  if (command === 'inspect') result = { kind: 'connected', version: client.version, model: MODEL };
+  if (command === 'inspect') result = await inspect(client, { workspace, connectionError });
   else {
     const adapter = helper(client);
     const baseline = values['non-git-baseline'];
@@ -39,9 +40,11 @@ try {
       result = await adapter.reply(workspace, plan, assignment, packet, payload, baseline);
     }
   }
-  console.log(JSON.stringify(result));
-  if (result.phase === 'STOPPED') process.exitCode = 1;
+  if (result.kind === 'stopped') console.error(JSON.stringify(result));
+  else console.log(JSON.stringify(result));
+  if (result.phase === 'STOPPED' || result.kind === 'stopped') process.exitCode = 1;
 } catch (error) {
-  console.error(JSON.stringify({ kind: 'stopped', error: error.message, retried: false }));
+  console.error(JSON.stringify({ kind: 'stopped', error: error.message, retried: false,
+    ...(error.diagnostic ? { diagnostic: diagnose(error, 'unknown', 'connection') } : {}) }));
   process.exitCode = 1;
 }

@@ -38,7 +38,10 @@ test('copied CLI runs independently and missing registration fails without creat
   const result = spawnSync(process.execPath, [join(f.destination, 'helper', 'cli.mjs'), 'inspect'],
     { cwd: f.root, env: { ...process.env, USERPROFILE: emptyHome, HOME: emptyHome }, encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 1, result.error?.message);
-  assert.deepEqual(JSON.parse(result.stderr.trim()), { kind: 'stopped', error: 'Missing or invalid engine registration', retried: false });
+  const outcome = JSON.parse(result.stderr.trim());
+  assert.equal(outcome.kind, 'stopped'); assert.equal(outcome.error, 'Missing or invalid engine registration');
+  assert.equal(outcome.retried, false); assert.equal(outcome.live.verified, false);
+  assert.equal(outcome.snapshotOnly, true);
   assert.ok(!existsSync(join(emptyHome, '.local', 'state', 'code-duet')));
 });
 

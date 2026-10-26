@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { MODEL, requireValue as need } from './connection.mjs';
+import { MODEL, requireValue as need, diagnose, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 
 const phases = ['PREPARING', 'EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING', 'STOPPED', 'FINISHED'];
@@ -43,7 +43,8 @@ export function validateState(state) {
     need(['workspace', 'checkout', 'planPath'].every(key => text(binding[key]) && isAbsolute(binding[key])), 'Invalid binding paths');
     need(['workspaceID', 'checkoutID', 'engineID'].every(key => text(binding[key])) && phases.includes(binding.phase), 'Invalid binding identity/phase');
     need(binding.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(binding.sessionID), 'Invalid saved session ID');
-    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment'].includes(key)), 'Unexpected binding fields');
+    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment', 'diagnostic'].includes(key)), 'Unexpected binding fields');
+    if (binding.diagnostic !== undefined) { need(binding.phase === 'STOPPED', 'Diagnostic requires STOPPED'); validateDiagnostic(binding.diagnostic); }
     if (binding.nextAssignment !== undefined) need(['block', 'correction'].includes(binding.nextAssignment) && ['PREPARING', 'STOPPED'].includes(binding.phase), 'Invalid next assignment');
     if (binding.uncertain !== undefined) need(['create', 'submit', 'reply'].includes(binding.uncertain) && binding.phase === 'STOPPED', 'Invalid pending mutation');
     if (binding.stopReason !== undefined) need(text(binding.stopReason) && binding.phase === 'STOPPED', 'Invalid stop reason');
@@ -78,6 +79,94 @@ function saveState(path, state) {
   } finally { if (existsSync(temporary)) unlinkSync(temporary); }
 }
 
+async function matchingSession(client, binding) {
+  const response = await client.request('/api/session/' + binding.sessionID);
+  const session = response?.data;
+  need(session?.id === binding.sessionID && session.model?.providerID === MODEL.providerID && session.model?.id === MODEL.id, 'Wrong session/model');
+  need(typeof session.location?.directory === 'string' && realpathSync(session.location.directory) === binding.workspace &&
+    realpathSync(binding.workspace) === binding.workspace && realpathSync(binding.checkout) === binding.checkout &&
+    identity(binding.workspace) === binding.workspaceID && identity(binding.checkout) === binding.checkoutID, 'Session physical directory mismatch');
+  return session;
+}
+
+// A snapshot never bootstraps, locks, repairs or advances the execution store.
+export async function inspect(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'),
+  chatID = process.env.CODEX_THREAD_ID, workspace, connectionError } = {}) {
+  const result = { kind: client ? 'connected' : 'stopped', version: client?.version ?? null, model: MODEL,
+    connection: { verified: !!client, engineID: client?.engineID ?? null },
+    binding: { status: text(chatID) ? 'unbound' : 'unknown' }, workspace: null, session: null,
+    live: { verified: false }, blockers: [], snapshotOnly: true,
+    stateLocked: existsSync(join(stateRoot, 'state.lock')) };
+  try {
+    const state = readState(join(stateRoot, 'state.json'));
+    if (workspace !== undefined) {
+      need(isAbsolute(workspace), 'Use an absolute inspection workspace');
+      result.workspace = { directory: realpathSync(workspace), checkout: null };
+      need(statSync(result.workspace.directory).isDirectory(), 'Inspection workspace is not a directory');
+    }
+    const binding = text(chatID) ? state.bindings.find(item => item.codexChat === chatID) : undefined;
+    if (binding) {
+      const plan = state.plans.find(item => item.planPath === binding.planPath);
+      result.binding = { status: 'bound', sessionID: binding.sessionID, planPath: binding.planPath,
+        phase: binding.phase, correctionCount: plan.correctionCount,
+        ...(binding.assignmentID ? { assignmentID: binding.assignmentID, messageID: binding.messageID } : {}),
+        ...(binding.uncertain ? { uncertain: binding.uncertain } : {}),
+        ...(binding.stopReason ? { stopReason: binding.stopReason } : {}),
+        ...(binding.diagnostic ? { diagnostic: binding.diagnostic } : {}) };
+      need(!result.workspace || result.workspace.directory === binding.workspace, 'Inspection workspace differs from saved binding');
+      result.workspace = { directory: binding.workspace, checkout: binding.checkout };
+      if (binding.phase !== 'PREPARING') result.blockers.push('Binding phase is ' + binding.phase);
+      if (binding.uncertain) result.blockers.push('Prior mutation uncertain; no retry');
+      if (binding.nextAssignment === 'correction' && plan.correctionCount === 20) result.blockers.push('Twenty corrections exhausted');
+      if (state.bindings.some(other => other !== binding && overlaps(binding.checkout, other.checkout) &&
+        (!['PREPARING', 'FINISHED'].includes(other.phase) || other.uncertain))) result.blockers.push('Another helper owns this checkout');
+      if (client && binding.sessionID) {
+        need(binding.engineID === client.engineID, 'Engine changed; saved session is unverified');
+        need(realpathSync(binding.planPath) === binding.planPath && statSync(binding.planPath).isFile() &&
+          inside(binding.workspace, binding.planPath), 'Saved plan identity changed');
+        const [session, active, forms, permissions, shells] = await Promise.all([
+          matchingSession(client, binding), client.request('/api/session/active'),
+          client.request('/api/session/' + binding.sessionID + '/form'),
+          client.request('/api/session/' + binding.sessionID + '/permission'),
+          client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace)),
+        ]);
+        need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data) &&
+          Array.isArray(forms?.data) && Array.isArray(permissions?.data) && Array.isArray(shells?.data), 'Unknown live inspection status');
+        for (const [id, status] of Object.entries(active.data)) {
+          need(/^ses_[a-zA-Z0-9]+$/.test(id) && status?.type === 'running', 'Unknown active execution status');
+          if (id === binding.sessionID) result.blockers.push('Bound session is running');
+          else {
+            const other = await client.request('/api/session/' + id);
+            need(other?.data?.id === id && text(other.data.location?.directory), 'Unknown active session identity');
+            if (overlaps(binding.checkout, realpathSync(other.data.location.directory))) result.blockers.push('Another executor in this checkout');
+          }
+        }
+        need(shells.data.every(shell => ['running', 'exited', 'timeout', 'killed'].includes(shell.status) &&
+          (shell.status === 'running' || Number.isFinite(shell.time?.completed))), 'Unknown project shell status');
+        const runningShells = shells.data.filter(shell => shell.status === 'running').length;
+        if (forms.data.length) result.blockers.push('Pending forms');
+        if (permissions.data.length) result.blockers.push('Pending permissions');
+        if (runningShells) result.blockers.push('Project shells are running');
+        result.session = { id: session.id, title: typeof session.title === 'string' ? session.title.slice(0, 200) : null,
+          directory: session.location.directory, model: { providerID: session.model.providerID, id: session.model.id,
+            ...(typeof session.model.variant === 'string' ? { variant: session.model.variant.slice(0, 80) } : {}) } };
+        result.live = { verified: true, observedAt: Date.now(), active: !!active.data[binding.sessionID],
+          outcome: ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome : 'unknown',
+          forms: forms.data.length, permissions: permissions.data.length, runningShells,
+          knownShells: shells.data.length, hiddenProcesses: 'not-observed' };
+      } else result.blockers.push(client ? 'No confirmed session ID' : 'Live state unverified; engine unavailable');
+    } else result.blockers.push(text(chatID) ? 'No binding; no recipient assigned' : 'Actual CODEX_THREAD_ID unavailable; binding unknown');
+    if (!client) {
+      result.error = connectionError?.message ?? 'Engine unavailable';
+      result.diagnostic = diagnose(connectionError, 'unknown', 'connection');
+      result.retried = false;
+    }
+    return result;
+  } catch (error) {
+    return { ...result, kind: 'stopped', error: error.message, diagnostic: diagnose(error, 'unknown', 'snapshot'), retried: false };
+  }
+}
+
 export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID } = {}) {
   need(text(chatID), 'Actual CODEX_THREAD_ID is required');
   const statePath = join(stateRoot, 'state.json');
@@ -96,13 +185,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(binding.engineID === client.engineID, 'Engine changed; explicit continuation required');
     need(binding.sessionID && !binding.uncertain && binding.phase !== 'STOPPED', 'Binding stopped or mutation uncertain; do not retry');
   }
-  async function sessionMatches(binding) {
-    const response = await client.request('/api/session/' + binding.sessionID);
-    const session = response?.data;
-    need(session?.id === binding.sessionID && session.model?.providerID === MODEL.providerID && session.model?.id === MODEL.id, 'Wrong session/model');
-    need(typeof session.location?.directory === 'string' && realpathSync(session.location.directory) === binding.workspace && realpathSync(binding.workspace) === binding.workspace && identity(binding.workspace) === binding.workspaceID && identity(binding.checkout) === binding.checkoutID, 'Session physical directory mismatch');
-    return session;
-  }
+  const sessionMatches = binding => matchingSession(client, binding);
   async function idleWorkspace(state, ctx) {
     for (const binding of state.bindings) {
       if (overlaps(ctx.checkout, binding.checkout)) need(['PREPARING', 'FINISHED'].includes(binding.phase) && !binding.uncertain, 'Prior helper assignment not reviewed/stopped; no new writer');
@@ -125,11 +208,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   function summary(state, binding, kind) {
     const plan = state.plans.find(plan => plan.planPath === binding.planPath);
-    return { kind, workspace: binding.workspace, planPath: binding.planPath, sessionID: binding.sessionID, phase: binding.phase, model: MODEL, correctionCount: plan.correctionCount, ...(binding.nextAssignment ? { nextAssignment: binding.nextAssignment } : {}), ...(binding.assignmentID ? { assignmentID: binding.assignmentID, messageID: binding.messageID } : {}) };
+    return { kind, workspace: binding.workspace, planPath: binding.planPath, sessionID: binding.sessionID, phase: binding.phase, model: MODEL, correctionCount: plan.correctionCount, ...(binding.nextAssignment ? { nextAssignment: binding.nextAssignment } : {}), ...(binding.assignmentID ? { assignmentID: binding.assignmentID, messageID: binding.messageID } : {}), ...(binding.diagnostic ? { diagnostic: binding.diagnostic } : {}) };
   }
-  function stop(state, binding, kind, reason) {
+  function stop(state, binding, kind, reason, diagnostic) {
     binding.phase = 'STOPPED'; delete binding.pending;
     binding.stopReason = reason;
+    if (diagnostic) binding.diagnostic = validateDiagnostic(diagnostic);
     saveState(statePath, state);
     return { ...summary(state, binding, kind), error: reason, executorStopped: false, retried: false };
   }
@@ -206,16 +290,19 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return summary(state, binding, 'released');
       }, ['REVIEWING', 'FINISHED']);
     },
-    async connectionLost() {
+    async connectionLost(error) {
       return locked(async state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
         if (!binding) return null;
-        return stop(state, binding, 'connection-uncertain', 'Connection/discovery failed; explicit continuation required');
+        if (binding.phase === 'STOPPED') return { ...summary(state, binding, 'stopped'),
+          error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required', executorStopped: false, retried: false };
+        return stop(state, binding, 'connection-uncertain', 'Connection/discovery failed; explicit continuation required', diagnose(error, 'unknown', 'connection'));
       });
     },
-    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 600_000, signal = new AbortController().signal } = {}) {
+    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000, 'Wait timeout must be 1..3600000 ms');
       return observed(workspace, planPath, nonGitBaseline, async (state, binding) => {
+        const startedAt = Date.now();
         const deadline = AbortSignal.timeout(timeoutMs);
         const combined = AbortSignal.any([signal, deadline]);
         let stream;
@@ -223,9 +310,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           stream = await watch(client, binding.sessionID, combined);
           let history;
           while (true) {
-            if (signal.aborted) return stop(state, binding, 'interrupted', 'Advisor wait interrupted; executor termination unconfirmed');
-            if (deadline.aborted) return stop(state, binding, 'connection-uncertain', 'Wait deadline reached; executor termination unconfirmed');
-            if (stream.fault) return stop(state, binding, stream.fault, 'Event stream failed/interrupted; no reconnect or ownership transfer');
+            if (signal.aborted) return stop(state, binding, 'interrupted', 'Advisor wait interrupted; executor termination unconfirmed', diagnose(null, 'interrupted', 'wait', stream.observation));
+            if (deadline.aborted) return stop(state, binding, 'connection-uncertain', 'Wait deadline reached; executor termination unconfirmed', diagnose(null, 'deadline', 'wait', stream.observation));
+            if (stream.fault) return stop(state, binding, stream.fault, 'Event stream failed/interrupted; no reconnect or ownership transfer', stream.diagnostic);
             const current = await snapshot(binding);
             const refresh = stream.takeFailureHint();
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) history = inspectMessages(binding, await assignmentMessages(client, binding));
@@ -256,7 +343,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             await stream.next(Math.min(5_000, timeoutMs));
           }
         } catch (error) {
-          return stop(state, binding, signal.aborted ? 'interrupted' : 'connection-uncertain', error.message);
+          const category = signal.aborted ? 'interrupted' : deadline.aborted ? 'deadline' : null;
+          return stop(state, binding, signal.aborted ? 'interrupted' : 'connection-uncertain', error.message,
+            diagnose(category ? null : error, category ?? 'unknown', category ? 'wait' : 'snapshot',
+              stream?.observation ?? { elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent: null }));
         } finally { await stream?.close(); }
       });
     },

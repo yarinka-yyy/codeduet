@@ -4,8 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSy
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { helper } from '../helper/binding.mjs';
-import { MODEL } from '../helper/connection.mjs';
-import { assignmentMessages, decodeFrame } from '../helper/interaction.mjs';
+import { MODEL, validateDiagnostic } from '../helper/connection.mjs';
+import { assignmentMessages, decodeFrame, watch } from '../helper/interaction.mjs';
 
 test('discovery failure between invocations persists STOP without a transport or mutation', async t => {
   const f = await setup(t);
@@ -296,4 +296,74 @@ test('pagination stops at current prompt, supports short pages with next cursor 
   assert.equal(decodeFrame(': heartbeat\n'), null);
   assert.equal(decodeFrame('data: {"type":"session.execution.succeeded","data":{}}\r\n').type, 'session.execution.succeeded');
   assert.throws(() => decodeFrame('data: invalid'), /Invalid/);
+});
+
+for (const category of ['event-eof', 'event-read', 'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown']) {
+  test('watch preserves sanitized ' + category + ' through wait, store and later STOP', async t => {
+    const f = await setup(t), secret = 'PRIVATE_EVENT_BODY_007';
+    const waiting = f.wait(); await new Promise(resolve => setTimeout(resolve, 15));
+    f.client.event('execution.started'); f.client.event('execution.failed', 'ses_other');
+    await new Promise(resolve => setTimeout(resolve, 15));
+    if (category === 'event-eof') f.client.controller.close();
+    if (category === 'event-read') f.client.controller.error(Object.assign(new TypeError(secret), { cause: { code: 'UND_ERR_SOCKET', message: secret } }));
+    if (category === 'event-json') f.client.controller.enqueue(new TextEncoder().encode('data: ' + secret + '\n\n'));
+    if (category === 'event-shape') f.client.controller.enqueue(new TextEncoder().encode('data: {"private":"' + secret + '"}\n\n'));
+    if (category === 'event-buffer-limit') f.client.controller.enqueue(new TextEncoder().encode('x'.repeat(1_048_577)));
+    if (category === 'engine-shutdown') f.client.event('server.shutdown');
+    const outcome = await waiting;
+    assert.equal(outcome.kind, 'connection-uncertain'); assert.equal(outcome.phase, 'STOPPED');
+    assert.equal(outcome.executorStopped, false); assert.equal(outcome.retried, false);
+    const diagnostic = validateDiagnostic(outcome.diagnostic);
+    assert.equal(diagnostic.category, category); assert.ok(diagnostic.elapsedMs >= 0);
+    assert.equal(diagnostic.lastEvent.type, 'execution.started');
+    assert.ok(Number.isSafeInteger(diagnostic.lastEvent.at));
+    if (category === 'event-read') assert.equal(diagnostic.errorCode, 'UND_ERR_SOCKET');
+    assert.deepEqual(f.state().diagnostic, diagnostic);
+    assert.deepEqual((await f.wait()).diagnostic, diagnostic);
+    const stoppedState = readFileSync(f.adapter.statePath);
+    const offline = helper(null, { stateRoot: resolve(f.adapter.statePath, '..'), chatID: 'offline-chat-only' });
+    assert.deepEqual((await offline.connectionLost(new Error('Later discovery failure'))).diagnostic, diagnostic);
+    assert.deepEqual(readFileSync(f.adapter.statePath), stoppedState);
+    assert.ok(!JSON.stringify(outcome).includes(secret) && !readFileSync(f.adapter.statePath, 'utf8').includes(secret));
+    assert.equal(f.posts().length, 2);
+  });
+}
+
+test('unknown relevant event names are bounded metadata, not copied into diagnostic', async t => {
+  const f = await setup(t), waiting = f.wait();
+  await new Promise(resolve => setTimeout(resolve, 15));
+  f.client.event('PRIVATE_EVENT_NAME_007');
+  await new Promise(resolve => setTimeout(resolve, 15)); f.client.controller.close();
+  const outcome = await waiting;
+  assert.equal(outcome.diagnostic.lastEvent.type, 'other');
+  assert.ok(!JSON.stringify(outcome).includes('PRIVATE_EVENT_NAME_007'));
+});
+
+for (const kind of ['http', 'content-type', 'open', 'interrupted', 'deadline']) {
+  test('wait distinguishes ' + kind + ' without leaking handshake/abort data', async t => {
+    const f = await setup(t), controller = new AbortController(), secret = 'PRIVATE_HANDSHAKE_007';
+    if (kind === 'http') f.client.events = async () => new Response(secret, { status: 429 });
+    if (kind === 'content-type') f.client.events = async () => new Response(secret);
+    if (kind === 'open') f.client.events = async () => { throw new TypeError(secret); };
+    const waiting = f.wait({ signal: controller.signal, timeoutMs: kind === 'deadline' ? 30 : 500 });
+    if (kind === 'interrupted') { await new Promise(resolve => setTimeout(resolve, 15)); controller.abort(secret); }
+    const outcome = await waiting;
+    assert.equal(outcome.phase, 'STOPPED');
+    assert.equal(outcome.diagnostic.category, { http: 'event-http', 'content-type': 'event-content-type', open: 'event-open',
+      interrupted: 'interrupted', deadline: 'deadline' }[kind]);
+    if (kind === 'http') assert.equal(outcome.diagnostic.httpStatus, 429);
+    assert.deepEqual(f.state().diagnostic, outcome.diagnostic);
+    assert.ok(!JSON.stringify(outcome).includes(secret));
+  });
+}
+
+test('handshake timeout is distinguished from stream EOF, and normal close has no fault', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = { events: signal => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('PRIVATE_ABORT_007')), { once: true })) };
+  const opening = watch(client, 'ses_test', new AbortController().signal);
+  t.mock.timers.tick(20_000);
+  await assert.rejects(opening, error => error.diagnostic.category === 'event-handshake-timeout' && !error.message.includes('PRIVATE_ABORT_007'));
+  const stream = await watch({ events: async () => new Response(new ReadableStream({ start() {} }), { headers: { 'Content-Type': 'text/event-stream' } }) },
+    'ses_test', new AbortController().signal);
+  await stream.close(); assert.equal(stream.fault, null); assert.equal(stream.diagnostic, null);
 });

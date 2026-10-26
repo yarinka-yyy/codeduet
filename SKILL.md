@@ -28,7 +28,9 @@ or change global agent settings. Resolve this skill's physical directory; run
 its helper by absolute path while keeping the target workspace explicit.
 
 Read the [helper protocol](helper/PROTOCOL.md) before helper operations. Inspect
-connection/model without dispatch, then bind the real current CODEX_THREAD_ID
+connection, saved binding and live recipient using inspect [absolute-workspace]
+without dispatch. Unbound means no recipient is assigned; unknown/offline is
+not permission to send. Then bind the real current CODEX_THREAD_ID
 to a new OpenCode session on first use. Reuse that pair in the same Codex chat;
 the user creates fresh Codex chats manually. Never spoof identity, select an
 existing user conversation, rotate chats automatically or reset a plan count.
@@ -43,7 +45,11 @@ files, checks and remaining gates. Submit once; send no raw GPT transcript.
 
 While EXECUTING or WAITING_FOR_ANSWER, keep the active tool wait and follow its
 bounded host continuations. Do not edit shared files/plans or run interfering
-checks. Handle real forms/permissions using exact request IDs within user and
+checks. Do not separately poll message history/inspect or narrate token/tool
+progress; the helper already observes execution. Return to reasoning for a
+result, real request, failure or user input. Host-required continuations/updates
+may still wake GPT; do not claim zero inference from a quiet chat.
+Handle real forms/permissions using exact request IDs within user and
 runtime authority; an ordinary question is not another correction cycle.
 
 Only completed-for-review permits actual-diff review: current assignment final,
@@ -61,6 +67,8 @@ assignment and does not mark the MD plan DONE. Follow workflow for handoff.
 
 Stop on unknown ownership/state, failed connection, limits, scope or permission
 conflicts. No automatic retry, recovery, model/provider fallback or watcher.
+Preserve the helper's sanitized diagnostic. A later user-requested inspect is
+a read-only snapshot, never recovery or proof that an uncertain writer stopped.
 Report accepted work, meaningful corrections, exact checks and missing gates.
 Do not commit/push/merge/switch branches without separate user authority.
 

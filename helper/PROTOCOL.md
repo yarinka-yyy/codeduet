@@ -1,4 +1,4 @@
-# Helper — connection, binding, interaction and review (Plans 002–004)
+# Helper — connection, binding, interaction, inspection and review
 
 Node 24, built-in APIs only. The packaged skill still needs full live acceptance. All
 commands emit one JSON outcome; STOPPED outcomes exit nonzero. The specific
@@ -7,6 +7,7 @@ kind distinguishes executor failure, interruption and connection uncertainty.
 
 ```text
 node helper/cli.mjs inspect
+node helper/cli.mjs inspect <absolute-workspace>
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-count <0..20>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-id> <absolute-packet-file>
@@ -21,6 +22,7 @@ Workspace, plan and packet arguments are passed as data; no shell interpolation
 is used. Quote paths containing spaces/`&` when invoking the CLI. Plan and packet
 must resolve to regular files inside the selected physical workspace. The
 actual `CODEX_THREAD_ID` is required; there is no CLI override for chat identity.
+Inspect is the exception: without that variable it reports binding unknown.
 This helper sends packet contents only after an authorized caller chooses them;
 it does not infer execution authorization from the mere existence of a plan.
 
@@ -31,6 +33,11 @@ only, rejects redirects, validates installed/API version 2.1.4 and the enabled
 the exposed client, state, results and errors contain no auth/response-body data.
 The default model variant is left unchanged. No second engine or fallback is
 started, and no service/global configuration is changed.
+
+Ordinary JSON requests use fetch with a twenty-second deadline. SSE alone uses
+a dedicated node:http connection and a web-readable body; it does not inherit
+fetch/Undici's body-idle timeout. The wait owns its handshake/total lifetime.
+No SSE redirects, automatic reconnects or extra dependency are introduced.
 
 ## Identity and persistence
 
@@ -88,14 +95,61 @@ checks read execution/form/permission metadata. Message history is read at entry
 for a request/failure hint or terminal candidate, paging backwards only as far
 as the identified prompt. It is not fetched on each ordinary timer tick.
 
-Default deadline is ten minutes, selectable up to one hour. A deadline is
-STOPPED/uncertain, never completed. Keep the CLI process inside an active Codex
-tool turn, using bounded host waits and required progress updates. A host yield
-continues the same process; it does not start another model prompt or reconnect.
+Default total deadline is one hour, selectable with --timeout-ms from 1 to
+3600000 milliseconds. The request/initial event-handshake limits remain twenty
+seconds. A deadline is STOPPED/uncertain, never completed. Keep the CLI process
+inside an active Codex tool turn, continuing the same process handle through
+bounded host waits. The helper emits no heartbeat/token/tool progress output.
+A host yield does not reconnect or send another DeepSeek prompt; it may still
+return control to GPT. Do not add advisor history reads or narrate progress.
 A received stream gap stops coordination without reconnect/resubmit.
 CLI connection/discovery failure between calls also persists STOPPED for the
-current chat binding. Library callers use connectionLost() on discovery failure;
+current chat binding. Library callers use connectionLost(error) on discovery failure;
 that state-only operation never calls the engine or releases project ownership.
+
+### Sanitized diagnostics
+
+A failed wait includes diagnostic alongside its existing kind/phase/error,
+executorStopped false and retried false. The same optional diagnostic is saved
+on its schema-1 STOPPED binding and appears on later stopped outcomes/inspection.
+Older schema-1 records without it remain valid; invalid/extra diagnostic fields
+are rejected rather than silently copied.
+
+Fields: category, stage, elapsedMs, lastEvent (null or timestamp at plus a
+bounded event type). Optional httpStatus/errorName/errorCode use explicit
+allowlists. Categories distinguish HTTP request read/timeout/status/JSON,
+event opening/handshake/status/content-type, EOF/read/JSON/shape/frame limit,
+engine shutdown, user interruption, total deadline and unknown. Last event is
+for the bound session; unrecognized names become other, and foreign events do
+not replace it. Diagnostics are not a transcript or an authenticated event log.
+No raw exception message/cause/stack, response body, event payload, credentials
+or prompt is stored in this diagnostic. The safe public error text remains.
+A transport code identifies an observation, not the root cause of an old failure.
+Later discovery failures do not overwrite an already STOPPED binding's first
+diagnostic/stop reason.
+
+### Read-only inspection
+
+inspect [absolute-workspace] reports connection/version/required model, binding
+for the actual current Codex chat, and a live snapshot of that exact session
+when available. Binding status is bound/unbound/unknown; a missing thread ID
+is unknown, not a selected chat. Optional workspace must match the saved
+physical directory. It never discovers/adopts an arbitrary existing session.
+
+Session data includes title/ID/directory and observed model/variant. Live data
+includes active status, outcome, form/permission counts and known shell state.
+Unknown shapes/identity mismatch return a stopped diagnostic outcome. Private
+history and shell commands are not read for this snapshot; hidden OS processes
+remain unobserved. Blockers are advisory; snapshotOnly never grants ownership
+or replaces assignment correlation/completion before review.
+
+This path reads the existing store without mkdir, lock acquisition, cleanup
+or save. An active wait's lock is only reported. A failed engine connection
+retains readable saved binding/diagnostic while marking live state unverified;
+inspect exits nonzero for an unavailable engine or invalid snapshot. A valid
+snapshot of a STOPPED binding can succeed, but cannot clear STOPPED/uncertainty,
+retry delivery, resume events or authorize implementation. Use it after an
+error only when the user requests that read-only diagnosis.
 
 Questions preserve the full form, keys, values, descriptions, custom allowance
 and single/multiselect rules. The answer file contains, for example,

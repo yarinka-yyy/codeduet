@@ -50,3 +50,36 @@ another corrective POST. The temporary registration/protected file are preserved
 These checks supplement the helper/workflow regressions; they do not prove
 live skill invocation, model implementation/correction, Desktop behavior or
 user-created chat pairing. Those remain manual acceptance with the owner.
+
+## Plan 007 diagnostics and quiet waiting
+
+tests/http-fixture.mjs is shared disposable CLI/HTTP/SSE infrastructure for
+acceptance and inspect tests. It does not use the real registration/engine.
+Inspect tests cover missing identity/binding, bound/offline/STOPPED snapshots,
+invalid identity/status/store, metadata-only GETs and inspection during a
+separate CLI wait without taking its lock. Fault tests preserve sanitized
+EOF/read/parser/size/HTTP/abort diagnostics through the actual store.
+
+Explicit long simulator, excluded from ordinary node --test:
+
+```text
+node tests/wait-smoke.mjs <absolute-new-evidence-directory> 1200000 [<absolute-baseline-cli>]
+```
+
+It creates one disposable home/workspace/store and one actual CLI wait process.
+After twenty unchanged minutes it emits a controlled completion. It asserts
+zero pre-completion stdout/stderr, one SSE subscription, one entry history read,
+unchanged EXECUTING state and only one create plus one submit. Its final report
+separates simulator requests from model calls. hostModelRequests remains
+NOT_OBSERVABLE; silence in this test is not evidence of zero Codex inference.
+Run it on a copied prior package for baseline comparison without editing it.
+Simulator duration does not establish live OpenCode SSE reliability; a separate
+new-session live smoke and owner acceptance are distinct evidence.
+
+The harness saves wait-outcome.json before success assertions, including on a
+failed long run. A historical fetch-SSE simulator failed with
+UND_ERR_BODY_TIMEOUT after roughly five idle minutes; retain that failure.
+The corrected native-HTTP SSE is tested without heartbeat comments or events
+until the explicit terminal signal. Short tests also verify HTTP 429, rejected
+redirects/content type, body cancellation and the separate 20-second JSON
+request deadline.

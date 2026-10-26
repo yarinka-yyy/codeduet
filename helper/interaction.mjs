@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { MODEL, requireValue as need } from './connection.mjs';
+import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 
 export function fingerprint(request) {
   return createHash('sha256').update(JSON.stringify(request)).digest('hex');
@@ -10,46 +10,65 @@ export function decodeFrame(frame) {
   if (!data) return null;
   let value;
   try { value = JSON.parse(data); if (typeof value === 'string') value = JSON.parse(value); }
-  catch { throw new Error('Invalid event frame'); }
-  need(value && typeof value.type === 'string' && value.data && typeof value.data === 'object', 'Unknown event shape');
+  catch (error) { throw diagnosticError('Invalid event frame', 'event-json', 'decode', {}, error); }
+  if (!(value && typeof value.type === 'string' && value.data && typeof value.data === 'object' && !Array.isArray(value.data))) throw diagnosticError('Unknown event shape', 'event-shape', 'decode');
   return value;
 }
 
 // The stream only wakes ordinary reconciliation; a token is never a result.
 export async function watch(client, sessionID, signal) {
+  const startedAt = Date.now();
+  let lastEvent = null;
+  const observation = () => ({ elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent });
   const handshake = new AbortController();
   const timer = setTimeout(() => handshake.abort(), 20_000);
   let response;
   try { response = await client.events(AbortSignal.any([signal, handshake.signal])); }
+  catch (error) {
+    if (handshake.signal.aborted && !signal.aborted) throw diagnosticError('Event handshake deadline reached', 'event-handshake-timeout', 'handshake', observation());
+    throw Object.assign(new Error('Event connection uncertain'), { diagnostic: diagnose(error, 'event-open', 'handshake', observation()) });
+  }
   finally { clearTimeout(timer); }
-  need(response.ok && response.headers.get('content-type')?.includes('text/event-stream') && response.body, 'Invalid event stream');
+  if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream') || !response.body) {
+    const error = !response.ok ? diagnosticError('Event HTTP ' + response.status, 'event-http', 'handshake', { ...observation(), httpStatus: response.status }) :
+      diagnosticError('Invalid event stream', 'event-content-type', 'handshake', observation());
+    await response.body?.cancel().catch(() => {});
+    throw error;
+  }
   const reader = response.body.getReader();
-  let wake, changed = false, fault = null, failureHint = false, closed = false;
+  let wake, changed = false, fault = null, diagnostic = null, failureHint = false, closed = false;
   const notify = () => { changed = true; wake?.(); };
   const pumping = (async () => {
     let buffer = ''; const decoder = new TextDecoder();
     try {
       while (!closed) {
         const part = await reader.read();
-        if (part.done) throw new Error('Event stream closed; executor state unknown');
+        if (part.done) throw diagnosticError('Event stream closed; executor state unknown', 'event-eof', 'stream');
         buffer += decoder.decode(part.value, { stream: true });
-        need(buffer.length <= 1_048_576, 'Event frame too large');
+        if (buffer.length > 1_048_576) throw diagnosticError('Event frame too large', 'event-buffer-limit', 'decode');
         let boundary;
         while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
           const separator = buffer.slice(boundary).match(/^\r?\n\r?\n/)[0];
           const event = decodeFrame(buffer.slice(0, boundary));
           buffer = buffer.slice(boundary + separator.length);
           if (!event) continue;
-          if (/^(server|location)\.(shutdown|disposed)$/.test(event.type)) throw new Error('Engine/location shutdown');
+          if (/^(server|location)\.(shutdown|disposed)$/.test(event.type)) throw diagnosticError('Engine/location shutdown', 'engine-shutdown', 'stream');
           if (event.data.sessionID !== sessionID && event.data.session?.id !== sessionID && event.data.form?.sessionID !== sessionID) continue;
+          lastEvent = { at: Date.now(), type: diagnosticEvent(event.type) };
           if (/execution\.(failed|interrupted)|step\.(failed|retry)/.test(event.type)) failureHint = true;
           if (/^(form|permission)\.|execution\.|step\.ended|tool\.(success|failed)$/.test(event.type)) notify();
         }
       }
-    } catch { if (!closed) { fault ||= 'connection-uncertain'; notify(); } }
+    } catch (error) {
+      if (!closed) {
+        fault = 'connection-uncertain'; diagnostic = diagnose(error, 'event-read', 'stream', observation()); notify();
+      }
+    }
   })();
   return {
     get fault() { return fault; },
+    get diagnostic() { return diagnostic; },
+    get observation() { return observation(); },
     takeFailureHint() { const pending = failureHint; failureHint = false; return pending; },
     async next(milliseconds) {
       if (changed) { changed = false; return; }

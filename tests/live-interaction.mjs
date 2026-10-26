@@ -13,7 +13,7 @@ assert.ok(isAbsolute(stateRoot || ''), 'Explicit absolute, isolated test stateRo
 const workspace = realpathSync(fileURLToPath(new URL('./fixtures/interaction space & test/', import.meta.url)));
 assert.ok(!resolve(stateRoot).startsWith(workspace), 'Technical bookkeeping must stay outside executor workspace');
 const plan = join(workspace, '001-smoke.md');
-const client = await connect().catch(async error => { await helper(null, { stateRoot }).connectionLost(); throw error; });
+const client = await connect().catch(async error => { await helper(null, { stateRoot }).connectionLost(error); throw error; });
 const adapter = helper(client, { stateRoot });
 const started = Date.now();
 let result;

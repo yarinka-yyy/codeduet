@@ -10,7 +10,8 @@ The helper reads the current user's ~/.local/state/opencode/service.json at
 execution time. Credentials stay on that machine inside the HTTP client; never
 copy registration, helper state, transcripts or private session IDs into a package.
 Bindings/counts live separately in ~/.local/state/code-duet/state.json.
-Only the real host CODEX_THREAD_ID is accepted for binding; inspect needs none.
+Only the real host CODEX_THREAD_ID is accepted for binding. Inspect without it
+still checks connection, but reports binding unknown rather than unbound.
 
 ## Build a folder without installing it
 
@@ -43,6 +44,22 @@ Expected: JSON kind connected, version 2.1.4 and the exact Go/Flash model.
 Missing engine registration yields kind stopped with a sanitized explanation
 and nonzero exit; it does not launch OpenCode or create helper state.
 
+To check the intended workspace as well, append its quoted absolute path:
+
+```powershell
+& $duetNode $duetCli inspect "C:\target project"
+```
+
+The snapshot separates connection, saved binding and verified live session
+(title/ID/directory/model/variant, execution and pending counts). The top-level
+model is the required model; session.model is the observed one. Unbound means
+no recipient was assigned; a discovered/visible chat is not selected. Offline
+inspection preserves local binding information but marks live state unverified.
+Inspect never creates the store, takes its lock, repairs a binding or resumes
+STOPPED. Its blockers and snapshotOnly flag do not authorize submission or
+replace the completion gate. Use the same source/installed package version for
+execution against one store; an older package may reject newer diagnostic fields.
+
 For execution commands use that absolute CLI path, separately quoted absolute
 target workspace/plan/packet paths, and the [protocol](../helper/PROTOCOL.md).
 Do not change the target project just to locate the helper.
@@ -64,8 +81,27 @@ The installed skills/list schema does not expose invocation policy; do not
 claim its effective filtering was tested by metadata discovery alone.
 
 During a real helper wait, allow its process to stay alive through host yields
-and poll the same returned process/session handle. Keep host waits at most
-55 seconds for user updates. Do not interrupt/relaunch the helper at a host
-yield or treat that yield as execution completion. A real helper deadline,
-connection loss or interruption is STOPPED; no automatic reconnect/resubmit.
+and continue the same returned process/session handle. Use the longest bounded
+wait permitted by the host and its interruption/update rules; do not impose a
+separate short progress cadence. Do not interrupt/relaunch the helper at a
+yield or treat that yield as execution completion. Do not add separate history
+reads, inspect calls or step-by-step commentary merely because control returned.
+If a host update is required, use the already known waiting state.
+
+The helper produces one meaningful outcome, without routine heartbeat output.
+Its Node SSE/metadata checks do not call GPT. A host yield can nevertheless
+return control to GPT; silence in stdout/chat does not prove zero model requests.
+Background hooks do not start an idle turn, so they are not a substitute for
+this active wait. Strict event-only model wakeup is not established in this host.
+
+Default total wait deadline is one hour, with --timeout-ms selectable from 1
+to 3600000. Initial HTTP requests and the event handshake retain 20-second
+limits. Host yields, request timeouts, total deadline and stream EOF are
+different events. Choose a shorter deadline explicitly for a bounded task;
+unchanged execution alone is not a failure. A real deadline, connection loss
+or interruption is STOPPED with sanitized diagnostics, no reconnect/resubmit.
 Stopping coordination does not guarantee stopping DeepSeek or OS processes.
+
+The SSE connection uses node:http rather than fetch so a silent event body is
+not cut off by Undici's separate idle timer. It still stops on real EOF/read
+failure or the explicit wait deadline. No server heartbeat is assumed.

@@ -72,12 +72,14 @@ try {
   await closed; clearTimeout(timer); lines.close();
 }
 const inspect = spawnSync(process.execPath, [join(destination, 'helper', 'cli.mjs'), 'inspect'],
-  { cwd: workspace, encoding: 'utf8', windowsHide: true, timeout: 25_000 });
+  { cwd: workspace, env: { ...process.env, CODEX_THREAD_ID: '' }, encoding: 'utf8', windowsHide: true, timeout: 25_000 });
 assert.equal(inspect.status, 0, inspect.stderr || inspect.error?.message);
 report.inspect = JSON.parse(inspect.stdout.trim());
 assert.equal(report.inspect.kind, 'connected');
 assert.equal(report.inspect.version, '2.1.4');
 assert.deepEqual(report.inspect.model, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
+assert.equal(report.inspect.binding.status, 'unknown');
+assert.equal(report.inspect.snapshotOnly, true);
 assert.equal(digest(statePath), stateBefore, 'Unexpected binding state mutation');
 assert.equal(digest(registrationPath), registrationBefore, 'Unexpected engine registration mutation');
 assert.equal(digest(configPath), configBefore, 'Unexpected global Codex config mutation');
