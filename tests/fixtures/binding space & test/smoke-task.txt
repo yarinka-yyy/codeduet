@@ -1,0 +1,4 @@
+This is the authorized no-op binding-smoke-001 acceptance experiment only.
+Read the canonical fixture plan. Return CODE_DUET_BINDING_SMOKE_002 and state
+whether any project-changing/background operation exists. No code/file changes,
+shell commands, questions, installs, subagents, settings, git or other sessions.

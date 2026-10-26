@@ -1,43 +1,17 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { MODEL, connect } from '../../helper/connection.mjs';
+export { MODEL, localEndpoint } from '../../helper/connection.mjs';
 
-export const MODEL = { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' };
 const fixture = realpathSync(fileURLToPath(new URL('../../tests/fixtures/transport space & test/', import.meta.url)));
 const statePath = resolve(fixture, '.probe-state.json');
 const foregroundPath = resolve(fixture, '.probe-foreground.json');
 const read = path => JSON.parse(readFileSync(path, 'utf8'));
 const save = state => writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
 const emit = value => console.log(JSON.stringify(value));
-
-export function localEndpoint(value) {
-  const url = new URL(value);
-  assert.equal(url.protocol, 'http:');
-  assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Non-loopback engine');
-  assert.ok(!url.username && !url.password && url.pathname === '/' && !url.search && !url.hash);
-  return url.origin;
-}
-
-function connection() {
-  const registration = read(resolve(homedir(), '.local/state/opencode/service.json'));
-  const base = localEndpoint(registration.url);
-  assert.equal(registration.version, '2.1.4', 'Revalidate API for changed version');
-  const headers = { Authorization: 'Basic ' + Buffer.from('opencode:' + registration.password).toString('base64') };
-  async function request(route, body) {
-    const response = await fetch(base + route, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(20_000), redirect: 'error',
-    });
-    assert.ok(response.ok, `HTTP ${response.status}: ${route}`);
-    return response.status === 204 ? undefined : response.json();
-  }
-  return { registration, base, headers, request };
-}
 
 export function decodeFrame(frame) {
   const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
@@ -107,7 +81,7 @@ async function wait(client, state) {
   const started = Date.now();
   const metrics = { checks: 0, messageReads: 0, eventTypes: [] };
   const controller = new AbortController();
-  const stream = await fetch(client.base + '/api/event', { headers: client.headers, signal: controller.signal, redirect: 'error' });
+  const stream = await client.events(controller.signal);
   assert.ok(stream.ok && stream.headers.get('content-type')?.includes('text/event-stream'), 'No SSE stream');
   return new Promise((resolveWait, reject) => {
     let settled = false;
@@ -136,7 +110,7 @@ async function wait(client, state) {
           client.request('/api/session/active'),
           client.request(`/api/session/${state.sessionID}/form`),
         ]);
-        bound(state, info.data, client.registration.id);
+        bound(state, info.data, client.engineID);
         for (const form of forms.data) assert.equal(form.sessionID, state.sessionID);
         if (forms.data.length) {
           assert.equal(forms.data.length, 1);
@@ -190,7 +164,7 @@ async function wait(client, state) {
 
 async function main() {
   const [command, argument] = process.argv.slice(2);
-  const client = connection();
+  const client = await connect();
   const api = client.request;
   if (command === 'inspect') {
     const [info, models] = await Promise.all([api('/api/info'), api('/api/model')]);
@@ -206,16 +180,16 @@ async function main() {
     const active = await api('/api/session/active');
     assert.ok(!sessions.data.some(session => active.data[session.id]), 'Existing writer in fixture');
     const { data: session } = await api('/api/session', { title: 'Code Duet 001 transport proof', location: { directory: fixture }, model: MODEL });
-    const state = { workspace: fixture, codexChat: process.env.CODEX_THREAD_ID, engineID: client.registration.id, sessionID: session.id, phase: 'created', model: MODEL };
+    const state = { workspace: fixture, codexChat: process.env.CODEX_THREAD_ID, engineID: client.engineID, sessionID: session.id, phase: 'created', model: MODEL };
     save(state);
-    bound(state, session, client.registration.id);
+    bound(state, session, client.engineID);
     emit({ kind: 'created', sessionID: session.id, workspace: fixture, model: session.model });
     return;
   }
   const state = read(statePath);
   assert.equal(state.codexChat, process.env.CODEX_THREAD_ID, 'Wrong Codex chat');
   const { data: info } = await api(`/api/session/${state.sessionID}`);
-  bound(state, info, client.registration.id);
+  bound(state, info, client.engineID);
   if (command === 'status') {
     const [active, forms] = await Promise.all([api('/api/session/active'), api(`/api/session/${state.sessionID}/form`)]);
     emit({ sessionID: state.sessionID, phase: state.phase, outcome: info.outcome, active: active.data[state.sessionID] ?? null, pendingForms: forms.data.map(form => form.id), waits: state.waits, results: state.results });
