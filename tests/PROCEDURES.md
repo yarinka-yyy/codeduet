@@ -83,3 +83,20 @@ The corrected native-HTTP SSE is tested without heartbeat comments or events
 until the explicit terminal signal. Short tests also verify HTTP 429, rejected
 redirects/content type, body cancellation and the separate 20-second JSON
 request deadline.
+
+## Plan 008 existing sessions
+
+tests/adoption.test.mjs uses the shared disposable native CLI/HTTP fixture.
+It seeds existing history without touching OpenCode and checks paged metadata
+discovery, ambiguous titles, exact recipient identity, no POST on adoption,
+no transcript copy, explicit/imported counters, busy/unknown/history/tool/shell
+states, locks, conflicts and races. The common submit/wait/next/finish/new-plan
+route keeps history boundaries and counts, including uncertain correction 20.
+
+For a live component smoke, create a NEW dedicated fixture session with a short
+harmless prior exchange, then adopt it with the actual CODEX_THREAD_ID and a
+separate technical store outside its workspace. Only that newly created fixture
+can receive test messages. tests/fixtures/adoption space & test/ defines its
+no-edit scope. Preserve default bindings, registration/config/global install
+and product file hashes; never substitute P4 or another user conversation.
+Direct API/helper component proof does not establish actual skill-entry routing.

@@ -8,6 +8,8 @@ kind distinguishes executor failure, interruption and connection uncertainty.
 ```text
 node helper/cli.mjs inspect
 node helper/cli.mjs inspect <absolute-workspace>
+node helper/cli.mjs sessions <absolute-workspace> [--cursor <cursor>]
+node helper/cli.mjs adopt <absolute-workspace> <absolute-plan.md> <exact-session-id> [--correction-count <0..20>]
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-count <0..20>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-id> <absolute-packet-file>
@@ -22,7 +24,8 @@ Workspace, plan and packet arguments are passed as data; no shell interpolation
 is used. Quote paths containing spaces/`&` when invoking the CLI. Plan and packet
 must resolve to regular files inside the selected physical workspace. The
 actual `CODEX_THREAD_ID` is required; there is no CLI override for chat identity.
-Inspect is the exception: without that variable it reports binding unknown.
+Read-only inspect and sessions are exceptions: inspect reports binding unknown
+without that variable; sessions returns directory-scoped candidates only.
 This helper sends packet contents only after an authorized caller chooses them;
 it does not infer execution authorization from the mere existence of a plan.
 
@@ -62,7 +65,9 @@ bind/submit: that exact, explicit baseline declaration must already occur in
 the selected plan. The advisor owns its correctness and acceptance; the helper
 does not initialize Git or treat declaration text as proof of file contents.
 
-First bind creates a new OpenCode session at the physical workspace. Repeated
+First bind creates a new OpenCode session at the physical workspace. Explicit
+existing-recipient selection instead uses adopt; see the conditional
+[existing-session procedure](../references/existing-session.md). Repeated
 bind in the same Codex chat validates/reuses that exact session. A new actual
 Codex chat creates a new pair only if previous work is not executing, uncertain
 or under review. Another selected workspace/plan is not silently substituted.
@@ -75,6 +80,44 @@ Before submit, the helper verifies session/model/directory, forms, saved phase,
 and all active session directory metadata. An active session anywhere within
 the same Git checkout (including sibling subdirectories) blocks another writer;
 unrelated projects are not touched. It reads their directory metadata only.
+
+### Explicit existing-session adoption
+
+sessions reads one page (limit 50) for the physical directory, returning bounded
+ID/title/model metadata, nextCursor and exhausted. A truncated title is marked;
+never infer an exact unique title match from it. Follow nonempty cursors until
+exhausted, including on short pages. No current chat, store, lock, transcript
+read or engine mutation is needed. Discovery is not binding or authorization.
+
+adopt requires an exact session ID and a canonical plan. With no saved plan
+counter, --correction-count N is required; with one, an omitted count preserves
+it and a conflicting import fails. The advisor establishes the actual count.
+Adoption checks physical/model identity and idle/interactive/overlapping writer
+state, and reads only the latest exchange back to its user prompt with bounded
+pagination. The shared completion gate must accept its final/idle/tools and
+known shells. Empty history requires never-executed status. Unknown, archived,
+failed/interrupted or changed state stops; no takeover or automatic recovery.
+
+The cooperative lock encloses the checks and atomic local save; identity,
+execution and latest message are reconfirmed. No OpenCode create/prompt/rename
+or model/config mutation occurs. A different/STOPPED/uncertain current pair or
+another chat's binding to the selected session cannot be replaced. Repeating
+the same valid prepared/finished adoption returns reused without rewriting it.
+
+Legacy schema-1 bindings remain valid. An adopted binding adds optional adoption
+with exactly variant (null or bounded string), lastMessageID and idleAt
+(both null for a never-used session, otherwise ID and timestamp). No title,
+prompt, response or transcript is persisted. Its saved variant must match the
+live model before subsequent operations. An older package may reject this field.
+
+Before each adopted submit, recheck the latest completed exchange and compare
+the saved boundary, then normal identity/forms/ownership checks. External work
+after preparation blocks dispatch even if it has already become idle. Accepted
+next/new-plan transitions advance the boundary through the same review gate.
+The new assignment/message ID excludes old finals/forms from wait/reply.
+Count reservation, STOP, next/finish and completion policy are shared unchanged.
+The remaining check-to-POST race against manual OpenCode actions is outside the
+cooperative lock guarantee; there is no engine-wide session reservation.
 
 Create/submit intent is persisted as `STOPPED` with an uncertainty marker
 **before** HTTP mutation. A lost response, crash, invalid ID or failed state

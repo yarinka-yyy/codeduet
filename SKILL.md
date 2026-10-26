@@ -30,10 +30,12 @@ its helper by absolute path while keeping the target workspace explicit.
 Read the [helper protocol](helper/PROTOCOL.md) before helper operations. Inspect
 connection, saved binding and live recipient using inspect [absolute-workspace]
 without dispatch. Unbound means no recipient is assigned; unknown/offline is
-not permission to send. Then bind the real current CODEX_THREAD_ID
-to a new OpenCode session on first use. Reuse that pair in the same Codex chat;
-the user creates fresh Codex chats manually. Never spoof identity, select an
-existing user conversation, rotate chats automatically or reset a plan count.
+not permission to send. Reuse a valid pair for the real current CODEX_THREAD_ID.
+With no pair, bind a new OpenCode session unless the user explicitly selected
+an existing recipient: only then read [existing-session routing](references/existing-session.md)
+and use its discovery/adoption checks. Code Duet can start in an already-used
+Codex chat. The user creates fresh Codex chats manually; never spoof identity,
+guess a recipient, replace a conflicting pair, rotate chats or reset a plan count.
 Only opencode-go/deepseek-v4.1-flash with existing/default options is supported.
 
 ## Assign, wait and review

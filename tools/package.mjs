@@ -7,7 +7,7 @@ export const packageFiles = Object.freeze([
   'helper/cli.mjs', 'helper/connection.mjs', 'helper/binding.mjs',
   'helper/interaction.mjs', 'helper/PROTOCOL.md',
   'references/workflow.md', 'references/assignment-template.md',
-  'references/plan-template.md', 'references/runtime.md', 'tools/package.mjs',
+  'references/plan-template.md', 'references/runtime.md', 'references/existing-session.md', 'tools/package.mjs',
 ]);
 const root = realpathSync(fileURLToPath(new URL('../', import.meta.url)));
 

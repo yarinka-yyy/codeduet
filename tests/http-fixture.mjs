@@ -32,6 +32,7 @@ export async function fixture(t, cli = defaultCli) {
       let raw = ''; for await (const chunk of request) raw += chunk;
       const body = raw ? JSON.parse(raw) : undefined, route = request.url;
       calls.push({ method: request.method, route });
+      await f.onRequest?.(route);
       const send = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
       if (route === '/api/info') { if (f.fault === 'info-timeout') return; return send({ version: '2.1.4' }); }
       if (route === '/api/model') return send({ data: f.models });
@@ -48,6 +49,13 @@ export async function fixture(t, cli = defaultCli) {
       if (route.endsWith('/form')) return send({ data: f.forms });
       if (route.endsWith('/permission')) return send({ data: f.permissions });
       if (route.startsWith('/api/shell?')) return send({ data: f.shells });
+      if (route.startsWith('/api/session?')) {
+        if (f.sessionPage) return send(f.sessionPage);
+        const query = new URL(route, 'http://localhost').searchParams;
+        const selected = [...sessions.values()].filter(session => session.location.directory === query.get('directory'));
+        const offset = Number(query.get('cursor') ?? 0), limit = Number(query.get('limit') ?? 50);
+        return send({ data: selected.slice(offset, offset + limit), cursor: { next: String(offset + limit) } });
+      }
       if (route === '/api/session' && request.method === 'POST') {
         const session = { id: 'ses_http' + (sessions.size + 1), title: body.title, location: body.location, model: body.model, time: {} };
         sessions.set(session.id, session); return send({ data: session });
@@ -56,11 +64,17 @@ export async function fixture(t, cli = defaultCli) {
       if (route.endsWith('/prompt') && request.method === 'POST') {
         if (f.fault === 'drop') { response.destroy(); return; }
         if (f.fault === 'http429') { response.writeHead(429); response.end(secret); return; }
-        messages.set(sessionID, [{ id: body.id, type: 'user', text: body.text }]);
+        messages.set(sessionID, [...(messages.get(sessionID) ?? []), { id: body.id, type: 'user', text: body.text }]);
         f.active[sessionID] = { type: 'running' };
         return send({ data: { id: body.id, sessionID } });
       }
-      if (route.includes('/message?')) return send({ data: [...(messages.get(sessionID) ?? [])].reverse(), cursor: {} });
+      if (route.includes('/message?')) {
+        if (f.messagePage) return send(f.messagePage);
+        const query = new URL(route, 'http://localhost').searchParams;
+        const reversed = [...(messages.get(sessionID) ?? [])].reverse();
+        const offset = Number(query.get('cursor') ?? 0), limit = Number(query.get('limit') ?? 100);
+        return send({ data: reversed.slice(offset, offset + limit), cursor: { next: String(offset + limit) } });
+      }
       if (route.startsWith('/api/session/')) return send({ data: sessions.get(sessionID) });
       response.writeHead(404); response.end();
     } catch { response.writeHead(500); response.end(); }

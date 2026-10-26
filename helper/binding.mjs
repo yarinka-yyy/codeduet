@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { MODEL, requireValue as need, diagnose, validateDiagnostic } from './connection.mjs';
-import { assignmentMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
+import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 
 const phases = ['PREPARING', 'EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING', 'STOPPED', 'FINISHED'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
@@ -43,7 +43,13 @@ export function validateState(state) {
     need(['workspace', 'checkout', 'planPath'].every(key => text(binding[key]) && isAbsolute(binding[key])), 'Invalid binding paths');
     need(['workspaceID', 'checkoutID', 'engineID'].every(key => text(binding[key])) && phases.includes(binding.phase), 'Invalid binding identity/phase');
     need(binding.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(binding.sessionID), 'Invalid saved session ID');
-    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment', 'diagnostic'].includes(key)), 'Unexpected binding fields');
+    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment', 'diagnostic', 'adoption'].includes(key)), 'Unexpected binding fields');
+    if (binding.adoption !== undefined) {
+      const value = binding.adoption;
+      need(value && Object.keys(value).length === 3 &&
+        (value.variant === null || text(value.variant) && value.variant.length <= 80) &&
+        (value.lastMessageID === null && value.idleAt === null || text(value.lastMessageID) && value.lastMessageID.length <= 128 && Number.isSafeInteger(value.idleAt) && value.idleAt >= 0), 'Invalid adoption boundary');
+    }
     if (binding.diagnostic !== undefined) { need(binding.phase === 'STOPPED', 'Diagnostic requires STOPPED'); validateDiagnostic(binding.diagnostic); }
     if (binding.nextAssignment !== undefined) need(['block', 'correction'].includes(binding.nextAssignment) && ['PREPARING', 'STOPPED'].includes(binding.phase), 'Invalid next assignment');
     if (binding.uncertain !== undefined) need(['create', 'submit', 'reply'].includes(binding.uncertain) && binding.phase === 'STOPPED', 'Invalid pending mutation');
@@ -83,10 +89,38 @@ async function matchingSession(client, binding) {
   const response = await client.request('/api/session/' + binding.sessionID);
   const session = response?.data;
   need(session?.id === binding.sessionID && session.model?.providerID === MODEL.providerID && session.model?.id === MODEL.id, 'Wrong session/model');
+  if (binding.adoption) need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
+    (session.model.variant ?? null) === binding.adoption.variant, 'Adopted session model options changed');
   need(typeof session.location?.directory === 'string' && realpathSync(session.location.directory) === binding.workspace &&
     realpathSync(binding.workspace) === binding.workspace && realpathSync(binding.checkout) === binding.checkout &&
     identity(binding.workspace) === binding.workspaceID && identity(binding.checkout) === binding.checkoutID, 'Session physical directory mismatch');
   return session;
+}
+
+// Explicit paged discovery, independent of binding and without a store/lock.
+export async function listSessions(client, workspace, cursor) {
+  need(isAbsolute(workspace), 'Use an absolute discovery workspace');
+  const directory = realpathSync(workspace);
+  need(statSync(directory).isDirectory(), 'Discovery workspace is not a directory');
+  need(cursor === undefined || text(cursor) && cursor.length <= 2048, 'Invalid session cursor');
+  const page = await client.request('/api/session?directory=' + encodeURIComponent(directory) + '&limit=50&order=desc' +
+    (cursor === undefined ? '' : '&cursor=' + encodeURIComponent(cursor)));
+  need(Array.isArray(page?.data) && page.data.length <= 50 && page.cursor && typeof page.cursor === 'object' && !Array.isArray(page.cursor) &&
+    (page.cursor.next === undefined || page.cursor.next === null || text(page.cursor.next) && page.cursor.next.length <= 2048), 'Unknown session page');
+  const ids = new Set();
+  const sessions = page.data.map(session => {
+    need(/^ses_[a-zA-Z0-9]+$/.test(session?.id) && !ids.has(session.id) && text(session.location?.directory) &&
+      realpathSync(session.location.directory) === directory, 'Ambiguous session discovery identity/directory');
+    ids.add(session.id);
+    return { id: session.id, title: typeof session.title === 'string' ? session.title.slice(0, 200) : null,
+      titleTruncated: typeof session.title === 'string' && session.title.length > 200,
+      directory, model: { providerID: typeof session.model?.providerID === 'string' ? session.model.providerID.slice(0, 80) : null,
+        id: typeof session.model?.id === 'string' ? session.model.id.slice(0, 80) : null,
+        variant: typeof session.model?.variant === 'string' ? session.model.variant.slice(0, 80) : null } };
+  });
+  const nextCursor = page.data.length ? page.cursor.next ?? null : null;
+  return { kind: 'session-candidates', workspace: directory, sessions, nextCursor,
+    exhausted: nextCursor === null, snapshotOnly: true, recipientSelected: false };
 }
 
 // A snapshot never bootstraps, locks, repairs or advances the execution store.
@@ -266,6 +300,36 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     const confirmed = await snapshot(binding);
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
+    return { lastMessageID: history.idle.id, idleAt: current.session.time.idle };
+  }
+  async function idleExisting(state, binding) {
+    await idleWorkspace(state, binding);
+    const current = await snapshot(binding), session = current.session;
+    need(!current.active && !current.forms.length && !current.permissions.length, 'Existing session busy or interactive');
+    need(session.time && typeof session.time === 'object' && session.time.archived === undefined &&
+      (session.archived === undefined || session.archived === false), 'Archived/unknown existing session');
+    need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
+      (session.model.variant === undefined || text(session.model.variant) && session.model.variant.length <= 80), 'Unsupported existing model options');
+    const messages = await recentSessionMessages(client, binding.sessionID);
+    const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace));
+    need(Array.isArray(shells?.data) && shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) &&
+      Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
+    if (messages.length) {
+      need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
+      const history = inspectMessages({ messageID: messages[0].id }, messages);
+      need(!history.kind, 'Existing session failed/interrupted; no automatic recovery');
+      completion(history, session, shells);
+    } else need(session.outcome === undefined && session.time.idle === undefined, 'Existing history/status mismatch');
+    const lastMessageID = messages.at(-1)?.id ?? null;
+    const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
+    need(Array.isArray(head?.data) && head.data.length === (lastMessageID === null ? 0 : 1) &&
+      (head.data[0]?.id ?? null) === lastMessageID, 'Existing history changed during inspection');
+    const confirmed = await snapshot(binding);
+    need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+      JSON.stringify(confirmed.session.time) === JSON.stringify(session.time) &&
+      JSON.stringify(confirmed.session.model) === JSON.stringify(session.model), 'Existing session changed during inspection');
+    await idleWorkspace(state, binding);
+    return { variant: session.model.variant ?? null, lastMessageID, idleAt: session.time.idle ?? null };
   }
   return {
     statePath,
@@ -273,7 +337,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     async next(workspace, planPath, kind, nonGitBaseline) {
       need(['block', 'correction'].includes(kind), 'Next assignment kind must be block or correction');
       return observed(workspace, planPath, nonGitBaseline, async (state, binding) => {
-        await reviewedResult(binding);
+        const boundary = await reviewedResult(binding);
+        if (binding.adoption) Object.assign(binding.adoption, boundary);
         if (kind === 'correction' && planCounter(state, binding).correctionCount === 20) {
           return stop(state, binding, 'correction-limit', 'Twenty correction cycles exhausted; review remains incomplete');
         }
@@ -385,6 +450,33 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       });
     },
 
+    async adopt(workspace, planPath, sessionID, nonGitBaseline, importedCount) {
+      need(/^ses_[a-zA-Z0-9]+$/.test(sessionID), 'Use an exact existing session ID');
+      return locked(async state => {
+        const ctx = context(workspace, planPath, nonGitBaseline);
+        const existing = state.bindings.find(binding => binding.codexChat === chatID);
+        need(importedCount !== undefined || state.plans.some(plan => plan.planPath === ctx.planPath), 'Established correction count required for adoption; do not guess zero');
+        if (existing) {
+          savedContext(existing, ctx);
+          need(existing.sessionID === sessionID, 'Another session is already bound to this Codex chat');
+          need(['PREPARING', 'FINISHED'].includes(existing.phase), 'Existing binding still owns an assignment');
+          planCounter(state, ctx, importedCount);
+          if (existing.phase === 'FINISHED') await reviewedResult(existing);
+          else {
+            const current = await idleExisting(state, existing);
+            if (existing.adoption) need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === existing.adoption[key]), 'Existing session changed since preparation; no dispatch');
+          }
+          return summary(state, existing, 'reused');
+        }
+        need(!state.bindings.some(binding => binding.engineID === client.engineID && binding.sessionID === sessionID), 'Session is already bound to another Codex chat; no takeover');
+        const binding = { codexChat: chatID, ...ctx, engineID: client.engineID, sessionID, phase: 'PREPARING' };
+        binding.adoption = await idleExisting(state, binding);
+        planCounter(state, ctx, importedCount);
+        state.bindings.push(binding);
+        saveState(statePath, state);
+        return summary(state, binding, 'adopted');
+      });
+    },
     async bind(workspace, planPath, nonGitBaseline, importedCount) {
       return locked(async state => {
         const ctx = context(workspace, planPath, nonGitBaseline);
@@ -393,7 +485,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           if (existing.planPath !== ctx.planPath) {
             savedContext({ ...existing, planPath: ctx.planPath }, ctx);
             need(existing.phase === 'FINISHED', 'Previous plan assignment not released; no plan switch');
-            try { await reviewedResult(existing); }
+            try { const boundary = await reviewedResult(existing); if (existing.adoption) Object.assign(existing.adoption, boundary); }
             catch (error) { return stop(state, existing, 'connection-uncertain', error.message); }
             planCounter(state, ctx, importedCount);
             existing.planPath = ctx.planPath; existing.phase = 'PREPARING';
@@ -440,6 +532,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         need(statSync(packet).isFile() && inside(ctx.workspace, packet), 'Packet outside physical workspace');
         const task = readFileSync(packet, 'utf8');
         need(text(task), 'Empty assignment packet');
+        if (binding.adoption) {
+          const current = await idleExisting(state, binding);
+          need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === binding.adoption[key]), 'Existing session changed since preparation; no dispatch');
+        }
         await sessionMatches(binding);
         await noForms(binding);
         await idleWorkspace(state, ctx);

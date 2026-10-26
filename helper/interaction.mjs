@@ -82,8 +82,8 @@ export async function watch(client, sessionID, signal) {
   };
 }
 
-export async function assignmentMessages(client, binding) {
-  let route = `/api/session/${binding.sessionID}/message?limit=100&order=desc`;
+async function messagesSince(client, sessionID, boundary, allowEmpty = false) {
+  let route = `/api/session/${sessionID}/message?limit=100&order=desc`;
   const result = [], ids = new Set(), cursors = new Set();
   // Bound reads stop at this assignment, never at an arbitrary short page.
   for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
@@ -92,17 +92,26 @@ export async function assignmentMessages(client, binding) {
     for (const message of page.data) {
       need(message && typeof message.id === 'string' && !ids.has(message.id), 'Ambiguous message pagination');
       ids.add(message.id); result.push(message);
-      if (message.id === binding.messageID) {
-        need(message.type === 'user' && message.text?.startsWith('Assignment ID: ' + binding.assignmentID + '\n'), 'Assignment message mismatch');
-        return result.reverse();
-      }
+      if (boundary(message)) return result.reverse();
     }
+    if (allowEmpty && result.length === 0 && page.data.length === 0) return [];
     need(page.data.length > 0 && typeof page.cursor?.next === 'string' && !cursors.has(page.cursor.next), 'Assignment absent from message history');
     cursors.add(page.cursor.next);
-    route = `/api/session/${binding.sessionID}/message?cursor=${encodeURIComponent(page.cursor.next)}`;
+    route = `/api/session/${sessionID}/message?limit=100&order=desc&cursor=${encodeURIComponent(page.cursor.next)}`;
   }
   throw new Error('Assignment history exceeds bounded read');
 }
+
+export function assignmentMessages(client, binding) {
+  return messagesSince(client, binding.sessionID, message => {
+    if (message.id !== binding.messageID) return false;
+    need(message.type === 'user' && message.text?.startsWith('Assignment ID: ' + binding.assignmentID + '\n'), 'Assignment message mismatch');
+    return true;
+  });
+}
+
+// Adoption examines only the latest exchange, never the whole prior transcript.
+export const recentSessionMessages = (client, sessionID) => messagesSince(client, sessionID, message => message.type === 'user', true);
 
 export function inspectMessages(binding, messages) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');

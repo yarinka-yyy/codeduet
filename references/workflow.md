@@ -23,7 +23,7 @@ skill or start an executor merely because a plan exists.
    must be resolved before dispatch, rather than silently reinterpreted.
 5. Read the plan's correction count. A fresh, never-executed plan starts at 0.
    When adopting an existing plan from the other route or after missing state,
-   import its established count with bind --correction-count N. Never invent
+   import its established count with bind/adopt --correction-count N. Never invent
    zero for missing history. A conflicting saved/imported count stops; the
    helper does not overwrite it. Keep the count in the canonical checkpoint.
 
@@ -41,8 +41,10 @@ For non-Git work, record an explicit alternative baseline; never initialize Git
 for the product. Ordinary source inspection and evidence collection are advisor
 work before dispatch; capture enough to detect changes outside assignment.
 
-Bind the actual current Codex chat to a new OpenCode session on first use;
-reuse that same pair thereafter. Only opencode-go/deepseek-v4.1-flash with the
+Reuse the actual current Codex chat's valid pair. Without one, bind a new
+OpenCode session unless the user explicitly selected an existing recipient;
+for that case alone use [existing-session routing](existing-session.md).
+Beginning in an already-used Codex chat is supported. Only opencode-go/deepseek-v4.1-flash with the
 existing/default options. No model/billing fallback, automatic chat rotation,
 subagents, new service or global agent configuration. The user creates a new
 Codex chat manually; it does not reset the plan's correction count.

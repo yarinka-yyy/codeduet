@@ -1,0 +1,1 @@
+For assignment adoption-smoke-008, obey the fixture plan and AGENTS.md. Return exactly CODE_DUET_ADOPTED_008. Do not repeat the previous marker, change files, run shell commands, delegate or start background work. Reading the fixture plan is permitted.

@@ -60,6 +60,14 @@ STOPPED. Its blockers and snapshotOnly flag do not authorize submission or
 replace the completion gate. Use the same source/installed package version for
 execution against one store; an older package may reject newer diagnostic fields.
 
+For an explicitly selected existing recipient, read
+[existing-session routing](existing-session.md). sessions <absolute-workspace>
+[--cursor <cursor>] lists one page of metadata without selecting or sending.
+adopt <workspace> <plan> <exact-session-id> [--correction-count N] validates
+and saves only a local association; ordinary submit is still separate. Neither
+the Codex chat's age nor the currently visible OpenCode tab chooses the route.
+Use the same package version for a store containing adoption/diagnostic fields.
+
 For execution commands use that absolute CLI path, separately quoted absolute
 target workspace/plan/packet paths, and the [protocol](../helper/PROTOCOL.md).
 Do not change the target project just to locate the helper.
