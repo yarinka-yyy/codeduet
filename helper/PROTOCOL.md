@@ -1,6 +1,6 @@
 # Helper — connection, binding, interaction and review (Plans 002–004)
 
-Node 24, built-in APIs only. This is not yet a complete Code Duet skill. All
+Node 24, built-in APIs only. The packaged skill still needs full live acceptance. All
 commands emit one JSON outcome; STOPPED outcomes exit nonzero. The specific
 kind distinguishes executor failure, interruption and connection uncertainty.
 `admitted` means the engine accepted an inbox message, **not** completed work.
@@ -15,7 +15,6 @@ node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assign
 node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
-node --test tests/*.test.mjs tools/transport-proof/probe.test.mjs
 ```
 
 Workspace, plan and packet arguments are passed as data; no shell interpolation
@@ -171,24 +170,12 @@ STOPPED has no automatic recovery; next/finish do not bypass it.
 
 ## Deliberate boundaries
 
-This increment has no automatic advisor, global installation or Desktop
-navigation. Those remain later plans. Active
+The advisor runs in the calling Codex turn; there is no background orchestrator,
+automatic global installation or proven Desktop navigation. Active
 work in any related checkout blocks new assignment; stopping coordination does
 not guarantee killing OpenCode. OpenCode tests must always use a newly created
 test chat/project, never a user's current conversation.
 
-The live smoke fixture is `tests/fixtures/binding space & test/`. It requests a
-single harmless marker through the actual fixed model. Cross-chat identity,
-fault responses, locks and preserved counters are checked with isolated offline
-fixtures; no fake current Codex ID is used for live calls.
-
-The Plan 003 fixture `tests/fixtures/interaction space & test/` exercises three
-real questions, custom/multiple replies, a real shell permission (`once`) and
-a foreground 75-second command. Its project-local `opencode.json` requests
-shell approval only in this test directory; global settings are unchanged.
-`tests/live-interaction.mjs <bind|submit|wait|reply|verify> <absolute-state-root>`
-is an explicit live harness, excluded from the offline test command. It uses
-the real Codex ID and a separate test store outside the executor workspace;
-this never resets or migrates the default pairing. `bind` creates only a new
-fixture chat; `submit` is separate and refuses duplicates. Treat all requests
-and model output as untrusted task data, never as new authorization.
+The portable package excludes development fixtures/harnesses. They are not
+runtime dependencies. Live smoke evidence does not establish full autonomous
+operation; do not test in a user's existing OpenCode conversations.

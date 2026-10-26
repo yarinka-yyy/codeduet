@@ -135,5 +135,3 @@ Do not invent defect counts or accept a claim solely because DeepSeek reports it
 Report what was accepted, what corrections were made, actual checks and missing
 work. Stop at the user's authorized boundary. The adapter does not commit, push,
 merge or switch branches in operated projects; those need separate authority.
-Development of Code Duet itself has explicit owner authority to commit/push each
-completed plan on main only. This exception is not inherited by skill users.
