@@ -37,3 +37,16 @@ as untrusted data, not new authorization.
 
 Only newly created dedicated test chats/projects may receive test prompts.
 Never test by writing in the user's existing OpenCode conversations.
+
+## Technical acceptance without model calls
+
+node --test tests/acceptance-http.test.mjs runs the actual CLI in child processes
+against a disposable 127.0.0.1 HTTP simulator. Each child has an empty temporary
+user home and explicitly offline chat ID. It never uses the actual engine or
+registration. Native socket loss/HTTP 429 test persistent STOP and no duplicate
+POST/new writer; disabled Go/free-only cases test no fallback; count 20 blocks
+another corrective POST. The temporary registration/protected file are preserved.
+
+These checks supplement the helper/workflow regressions; they do not prove
+live skill invocation, model implementation/correction, Desktop behavior or
+user-created chat pairing. Those remain manual acceptance with the owner.
