@@ -7,11 +7,14 @@ import { Readable } from 'node:stream';
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
   'event-open', 'event-handshake-timeout', 'event-http', 'event-content-type', 'event-eof', 'event-read',
-  'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown', 'interrupted', 'deadline']);
-const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot']);
+  'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown', 'interrupted', 'deadline',
+  'state-locked', 'state-access', 'state-io']);
+const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'state-directory', 'state-lock']);
 const names = new Set(['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError']);
 const codes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ABORT_ERR',
-  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'EEXIST', 'EACCES', 'EPERM', 'EROFS', 'ERR_ACCESS_DENIED', 'ENOENT', 'ENOTDIR', 'EISDIR',
+  'ENOSPC', 'EDQUOT', 'EIO', 'EMFILE', 'ENFILE', 'ELOOP', 'EBUSY', 'ENAMETOOLONG', 'UNKNOWN']);
 const eventType = /^(?:(?:session\.)?(?:execution\.(?:started|running|succeeded|failed|interrupted)|step\.(?:ended|failed|retry))|(?:form|permission)\.(?:created|updated|replied|resolved)|tool\.(?:success|failed)|(?:server|location)\.(?:shutdown|disposed)|other)$/;
 export function validateDiagnostic(value) {
   requireValue(value && categories.has(value.category) && stages.has(value.stage) &&

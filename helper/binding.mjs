@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { MODEL, requireValue as need, diagnose, validateDiagnostic } from './connection.mjs';
+import { MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 
 const phases = ['PREPARING', 'EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING', 'STOPPED', 'FINISHED'];
@@ -201,14 +201,25 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
   }
 }
 
+function stateFailure(error, stage) {
+  const conflict = stage === 'state-lock' && error?.code === 'EEXIST';
+  const denied = ['EACCES', 'EPERM', 'EROFS', 'ERR_ACCESS_DENIED'].includes(error?.code);
+  return diagnosticError(conflict ? 'Helper state locked; inspect previous writer, no automatic unlock' :
+    denied ? 'Helper state access denied; request host-approved access to the existing store, no automatic retry or relocation' :
+      'Helper state filesystem error; inspect diagnostic, no automatic retry',
+    conflict ? 'state-locked' : denied ? 'state-access' : 'state-io', stage, {}, error);
+}
+
 export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID } = {}) {
   need(text(chatID), 'Actual CODEX_THREAD_ID is required');
   const statePath = join(stateRoot, 'state.json');
   async function locked(operation) {
-    mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+    try { mkdirSync(stateRoot, { recursive: true, mode: 0o700 }); }
+    catch (error) { throw stateFailure(error, 'state-directory'); }
     const lockPath = join(stateRoot, 'state.lock');
     let lock;
-    try { lock = openSync(lockPath, 'wx', 0o600); } catch { throw new Error('Helper state locked; inspect previous writer, no automatic unlock'); }
+    try { lock = openSync(lockPath, 'wx', 0o600); }
+    catch (error) { throw stateFailure(error, 'state-lock'); }
     try { return await operation(readState(statePath)); }
     finally { closeSync(lock); unlinkSync(lockPath); }
   }

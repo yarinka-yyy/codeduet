@@ -10,6 +10,17 @@ The helper reads the current user's ~/.local/state/opencode/service.json at
 execution time. Credentials stay on that machine inside the HTTP client; never
 copy registration, helper state, transcripts or private session IDs into a package.
 Bindings/counts live separately in ~/.local/state/code-duet/state.json.
+This shared store is intentionally outside individual projects. Write commands
+(including adopt and wait) must create its directory/lock and update its state.
+Read-only inspect/sessions working does not establish that write access exists.
+If the host sandbox excludes this directory, request its normal approval for
+the exact authorized helper command; keep the real CODEX_THREAD_ID and store.
+If approval is unavailable/denied, stop and report that boundary. Do not disable
+sandboxing, change ACLs/config automatically, spoof HOME/USERPROFILE, or relocate
+the store into a project/temp directory: separate stores lose shared writer and
+correction-count protection. Access approval never clears STOPPED or permits
+resending an uncertain assignment. Recheck ownership/checkpoint before an
+explicit continuation; a lock-acquisition failure itself sends no engine mutation.
 Only the real host CODEX_THREAD_ID is accepted for binding. Inspect without it
 still checks connection, but reports binding unknown rather than unbound.
 

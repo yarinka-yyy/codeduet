@@ -58,6 +58,17 @@ Writes use a same-directory temporary file and atomic rename. A cooperative
 A stale lock/corrupt file stops work; it is never automatically replaced or
 unlocked. This does not lock the OS or prevent user edits to the project.
 
+Lock acquisition fails before reading/changing state or any engine mutation.
+Only EEXIST from exclusive lock creation means state-locked. Access failures
+(EACCES/EPERM/EROFS/ERR_ACCESS_DENIED) report state-access; other directory/lock
+failures report state-io. The validated diagnostic includes state-directory or
+state-lock and an allowlisted errorCode, never raw paths, exception text or
+credentials. An unknown code is omitted rather than echoed. These are local
+stopped outcomes, not a replacement/reset of a saved STOPPED/uncertain binding.
+A later stateLocked=false snapshot proves neither past lock ownership nor
+current writability. No automatic retry, unlock or alternate store is introduced.
+See [runtime](../references/runtime.md) for host-approved access to the same shared store.
+
 Git root discovery is read-only (`git rev-parse --show-toplevel`). Different
 physical clones are not interchangeable; filesystem identities catch directory
 replacement. For a non-Git project add `--non-git-baseline <declaration>` to
