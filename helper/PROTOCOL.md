@@ -6,7 +6,7 @@ Use only the operation sections needed: [connection](#connection),
 [binding and reuse](#binding-and-reuse),
 [preflight](#preflight),
 [explicit adoption](#explicit-existing-session-adoption),
-[submit intent](#submit-intent), [wait](#wait), [reply](#reply),
+[submit intent](#submit-intent), [wait](#wait), [resume observation](#resume-observation), [reply](#reply),
 [completion](#completion), [inspection](#inspect-and-sessions) and
 [plan transitions](#plan-review-transitions). Read
 [diagnostics](#diagnostics) when interpreting a failure. Existing-session
@@ -30,6 +30,7 @@ node helper/cli.mjs next <absolute-workspace> <absolute-plan.md> <block|correcti
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assignment-id> <absolute-packet-file> --kind <block|correction>
 node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
+node helper/cli.mjs resume-watch <absolute-workspace> <absolute-plan.md> <assignment-id> <message-id> --session <exact-session-id> [--timeout-ms <ms>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
 ```
 
@@ -261,6 +262,39 @@ unchanged. In EXECUTING, WAITING_FOR_ANSWER or REVIEWING it records STOPPED with
 the connection diagnostic; an existing STOPPED binding remains sticky. Library
 callers use `connectionLost(error)` for the same state-only transition; it never
 sends a mutation or releases a persisted uncertainty marker.
+
+## Resume observation
+
+Use `resume-watch` only after an explicit user request to continue observing an
+already delivered assignment. Run it in the original owner Codex chat with the
+same workspace, plan, session, assignment and message IDs from inspect/checkpoint.
+The real CODEX_THREAD_ID and shared store remain unchanged. Dispatch preflight
+still blocks STOPPED; it is not the entrypoint for this observation-only route.
+
+Only a STOPPED binding with an admitted assignment and no uncertain create,
+submit or reply mutation, or prepared next assignment, can enter this route.
+The command acquires the existing per-checkout lease, verifies identity/model/
+variant, reads history back to the exact assignment prompt and validates fresh
+execution/form/permission state. It performs GET/SSE only: no prompt, engine
+resume/cancel, answer, new session, count import/reset or automatic retry.
+
+A verified active execution becomes EXECUTING and continues the same wait;
+a correlated pending request becomes WAITING_FOR_ANSWER without answering it;
+a confirmed completed result passes the unchanged final/tool/shell gate before
+REVIEWING. This does not accept the implementation or authorize project edits
+while the executor is active. Unknown/failed/interrupted execution, missing or
+changed history, foreign ownership and failed validation leave the original
+STOPPED state/diagnostic byte-for-byte unchanged. A later observation failure
+after successful resumption records a new STOPPED diagnostic normally.
+
+Successful/reconciled outcomes include observationOnly=true and taskSent=false.
+The saved correction count and delivery IDs are preserved, including count 20.
+Another resume-watch cannot attach concurrently; ordinary wait remains sticky
+on STOPPED. Do not spoof a chat ID or remove a lock to enter this route.
+An isolated tool-error record may be observed while the engine remains running;
+it does not prove terminal failure or success. It remains a failure at the
+completion boundary, and a pending request on that failed history stops for
+inspection. Hard execution failures/interruption still block continuation.
 
 ## Diagnostics
 

@@ -56,7 +56,10 @@ the store into a project or temporary directory. Approval does not clear a
 STOPPED or uncertain assignment. The protocol defines lock and failure behavior.
 A `history-uncertain` result with `history-correlation` identifies unverified
 synthetic input, not a connection failure. Do not resend a delivered assignment
-or clear STOPPED; preserve the assignment/message IDs for diagnosis.
+or manually clear STOPPED; preserve the assignment/message IDs for diagnosis.
+After explicit user authorization to continue observation, use
+[resume-watch](../helper/PROTOCOL.md#resume-observation) in the original owner
+Codex chat with those exact IDs. No count import, new pair or replacement store.
 
 ## Build a folder without installing it
 

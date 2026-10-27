@@ -42,7 +42,9 @@ when preparing a packet.
 Confirm that the prior writer and known project-changing operations ended.
 Runtime STOPPED or uncertain delivery is a blocker, not a reason to start a
 fresh chat or another executor. On an explicit continuation request, first read
-the checkpoint/diff and inspect old execution; no automatic recovery is supplied.
+the checkpoint and inspect old execution. For observation of a delivered
+assignment, use explicitly authorized [resume-watch](../helper/PROTOCOL.md#resume-observation).
+It does not retry delivery or permit project edits during execution. No automatic recovery is supplied.
 
 Record the pre-dispatch baseline in the plan: physical workspace/checkout, Git
 HEAD and status, assigned paths, pre-existing dirty/untracked files and hashes

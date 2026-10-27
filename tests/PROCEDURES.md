@@ -154,3 +154,9 @@ or malformed synthetic input. The HTTP/SSE fixtures verify completion on both
 supported releases, unchanged final/tool gates, one correction delivery, count
 preservation and durable history diagnostics without private instruction text.
 A stopped delivered assignment stays stopped; these tests never resume P4.
+
+`node --test tests/resume-watch.test.mjs` checks explicitly authorized observation
+continuation in disposable HTTP/SSE fixtures: exact delivery/owner pins, legacy
+STOPPED diagnosis, unchanged counters, no POST, active/completed/pending routes,
+uncertain mutation refusal, foreign ownership, unsafe histories and drift.
+It does not resume a production conversation or prove independent implementation acceptance.

@@ -114,7 +114,7 @@ function readOwnerships(root) {
       !isAbsolute(owner.workspace) || !isAbsolute(owner.checkout) ||
       !(owner.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(owner.sessionID)) ||
       !(owner.assignmentID === null || text(owner.assignmentID)) ||
-      !['bind', 'adopt', 'submit', 'wait', 'reply', 'next', 'finish'].includes(owner.operation) ||
+      !['bind', 'adopt', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(owner.operation) ||
       Object.keys(owner).some(key => !['schema', 'token', 'codexChat', 'workspace', 'checkout',
         'sessionID', 'assignmentID', 'operation'].includes(key))) invalid = true;
     else owners.push({ ...owner, path: join(root, name) });
@@ -784,11 +784,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     return result;
   }
 
-  function savedContext(binding, ctx) {
+  function savedContext(binding, ctx, resumeObservation = false) {
     need(binding.codexChat === chatID, 'Wrong Codex chat');
     for (const key of ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath']) need(binding[key] === ctx[key], 'Saved workspace/plan identity changed');
     need(binding.engineID === client.engineID, 'Engine changed; explicit continuation required');
-    need(binding.sessionID && !binding.uncertain && binding.phase !== 'STOPPED', 'Binding stopped or mutation uncertain; do not retry');
+    need(binding.sessionID && !binding.uncertain && (binding.phase !== 'STOPPED' || resumeObservation), 'Binding stopped or mutation uncertain; do not retry');
   }
   const sessionMatches = binding => matchingSession(client, binding);
   async function idleWorkspace(state, ctx) {
@@ -842,10 +842,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     return locked(state => {
       const binding = state.bindings.find(binding => binding.codexChat === chatID);
       need(binding, 'No binding for this Codex chat');
-      if (binding.phase === 'STOPPED') return { outcome: { ...summary(state, binding, 'stopped'),
+      if (binding.phase === 'STOPPED' && operation !== 'resume-watch') return { outcome: { ...summary(state, binding, 'stopped'),
         error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required',
         executorStopped: false, retried: false, stateChange: 'unchanged' } };
-      savedContext(binding, ctx);
+      savedContext(binding, ctx, operation === 'resume-watch');
       if (!binding.assignmentID || !allowedPhases.includes(binding.phase)) {
         const kind = operation === 'reply' && binding.assignmentID && binding.phase === 'EXECUTING' ? 'stale-request' : 'rejected';
         return { outcome: { ...summary(state, binding, kind),
@@ -1026,24 +1026,43 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return { ...result, diagnostic, retried, bootstrap: error?.bootstrap };
       });
     },
-    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal } = {}) {
+    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal, resume } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000, 'Wait timeout must be 1..3600000 ms');
+      const resuming = resume !== undefined;
+      if (resuming) need(resume && Object.keys(resume).length === 3 &&
+        ['sessionID', 'assignmentID', 'messageID'].every(key => typeof resume[key] === 'string') &&
+        /^ses_[a-zA-Z0-9]+$/.test(resume.sessionID) && /^[a-zA-Z0-9._-]{1,120}$/.test(resume.assignmentID) &&
+        /^msg_[a-zA-Z0-9]+$/.test(resume.messageID), 'Explicit resume requires exact session, assignment and message IDs');
       const begun = beginObserved(workspace, planPath, nonGitBaseline,
-        ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING'], 'wait');
+        resuming ? ['STOPPED'] : ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING'], resuming ? 'resume-watch' : 'wait',
+        resuming ? (state, binding) => need(!binding.nextAssignment &&
+          ['sessionID', 'assignmentID', 'messageID'].every(key => binding[key] === resume[key]),
+        'Resume selection differs from the delivered assignment; no state change') : undefined);
       if (begun.outcome) return begun.outcome;
-      return withOwnership(begun.lease, async () => {
+      const outcome = await withOwnership(begun.lease, async () => {
         const startedAt = Date.now(), deadline = AbortSignal.timeout(timeoutMs);
         const combined = AbortSignal.any([signal, deadline]);
         let expected = begun.expected, stream;
         const record = (change, kind) => {
           const saved = commit(expected, (state, binding) => {
+            if (resuming) {
+              need(planCounter(state, binding).correctionCount === expected.correctionCount,
+                'Saved correction count changed during resumed observation');
+              if (expected.phase === 'STOPPED') {
+                need(binding.stopReason === expected.stopReason && JSON.stringify(binding.diagnostic) === JSON.stringify(expected.diagnostic),
+                  'Stopped diagnostic changed during resumed observation');
+                delete binding.stopReason; delete binding.diagnostic;
+              }
+            }
             change(state, binding);
             return summary(state, binding, kind);
           });
           expected = saved.expected;
           return saved.result;
         };
-        const stopWait = (kind, reason, diagnostic) =>
+        const stopWait = (kind, reason, diagnostic) => resuming && expected.phase === 'STOPPED' ?
+          { ...rejectedOutcome(expected, new Error(reason)), phase: 'STOPPED', assignmentID: expected.assignmentID,
+            messageID: expected.messageID, diagnostic, executorStopped: false } :
           stoppedOutcome(expected, Object.assign(new Error(reason), { diagnostic }), kind);
         try {
           stream = await watch(client, expected.sessionID, combined);
@@ -1057,12 +1076,20 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               diagnose(null, 'deadline', 'wait', stream.observation));
             if (stream.fault) return stopWait(stream.fault, 'Event stream failed/interrupted; no reconnect or ownership transfer', stream.diagnostic);
             const current = await snapshot(expected);
+            if (resuming && expected.phase === 'STOPPED') {
+              need(current.session.time?.archived === undefined &&
+                (current.session.archived === undefined || current.session.archived === false), 'Cannot observe an archived session');
+              need(current.active === undefined || current.active?.type === 'running' && Object.keys(current.active).length === 1,
+                'Unknown active execution status');
+            }
             const refresh = stream.takeFailureHint();
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) {
               history = inspectMessages(expected, await assignmentMessages(client, expected));
             }
             if (stream.fault || combined.aborted) continue;
-            if (history.kind) return stopWait(history.kind, 'Bound assignment failed/interrupted; inspect its session');
+            if (history.kind && !(resuming && history.toolFailure && current.active?.type === 'running' &&
+              !current.forms.length && !current.permissions.length))
+              return stopWait(history.kind, 'Bound assignment failed/interrupted; inspect its session');
             if (!current.active && current.session.time?.idle >= expected.submittedAt &&
               ['failed', 'interrupted'].includes(current.session.outcome)) {
               return stopWait(current.session.outcome, 'Bound session execution failed/interrupted');
@@ -1077,7 +1104,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               }, result.kind);
               return { ...saved, request: result.request, fingerprint: result.fingerprint };
             }
-            if (expected.pending) record((state, binding) => {
+            if (expected.pending && expected.phase !== 'STOPPED') record((state, binding) => {
               delete binding.pending; binding.phase = 'EXECUTING';
             }, 'observing');
             if (!current.active && current.session.time?.idle >= expected.submittedAt) {
@@ -1088,7 +1115,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
                 JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during completion confirmation');
               if (stream.fault || combined.aborted) continue;
-              return { ...record((state, binding) => { binding.phase = 'REVIEWING'; }, result.kind), result: result.result };
+              return { ...record((state, binding) => { delete binding.pending; binding.phase = 'REVIEWING'; }, result.kind), result: result.result };
+            }
+            if (resuming && expected.phase === 'STOPPED') {
+              need(current.active?.type === 'running', 'No correlated active execution, request or completed result');
+              const confirmed = await snapshot(expected);
+              history = inspectMessages(expected, await assignmentMessages(client, expected));
+              need(!history.kind || history.toolFailure && confirmed.active?.type === 'running',
+                'Failed/interrupted assignment cannot resume observation');
+              if (!confirmed.active || confirmed.forms.length || confirmed.permissions.length) continue;
+              need(confirmed.active.type === 'running' && Object.keys(confirmed.active).length === 1, 'Unknown active execution status');
+              record((state, binding) => { delete binding.pending; binding.phase = 'EXECUTING'; }, 'observing');
             }
             await stream.next(Math.min(5_000, timeoutMs));
           }
@@ -1097,9 +1134,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const diagnostic = diagnose(category ? null : error, category ?? 'unknown', category ? 'wait' : 'snapshot',
             stream?.observation ?? { elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent: null });
           return stopWait(signal.aborted ? 'interrupted' : 'connection-uncertain',
-            error?.message ?? 'Wait observation failed; inspect before continuing', diagnostic);
+            resuming && error?.code && !error?.diagnostic ? 'Workspace or state I/O failed; inspect diagnostic' :
+              error?.message ?? 'Wait observation failed; inspect before continuing', diagnostic);
         } finally { await stream?.close(); }
       });
+      return resuming ? { ...outcome, observationOnly: true, taskSent: false } : outcome;
     },
     async reply(workspace, planPath, kind, requestID, payload, nonGitBaseline) {
       need(['question', 'permission'].includes(kind) && /^(frm_|per)[a-zA-Z0-9_]+$/.test(requestID), 'Invalid interactive kind/request ID');

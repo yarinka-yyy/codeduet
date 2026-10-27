@@ -8,12 +8,15 @@ let client;
 try {
   const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
-  if (!['inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'reply', 'next', 'finish'].includes(command) ||
-    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, reply: 6, next: 4, finish: 3 })[command])) {
-    throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>]; paths must be absolute');
+  if (!['inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3 })[command])) {
+    throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>]; paths must be absolute');
   }
-  if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && command !== 'preflight') throw new Error('Assignment kind belongs to submit; correction-count to bind/adopt/preflight; session to preflight; cursor to sessions');
-  if (values['timeout-ms'] !== undefined && command !== 'wait') throw new Error('timeout-ms belongs to wait');
+  if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch'].includes(command)) throw new Error('Assignment kind belongs to submit; correction-count to bind/adopt/preflight; session to preflight/resume-watch; cursor to sessions');
+  if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
+  if (command === 'resume-watch' && (!/^ses_[a-zA-Z0-9]+$/.test(values.session) ||
+    !/^[a-zA-Z0-9._-]{1,120}$/.test(assignment) || !/^msg_[a-zA-Z0-9]+$/.test(packet)))
+    throw new Error('resume-watch <workspace> <plan> <assignment-id> <message-id> requires --session <exact-id>');
   let importedCount, timeoutMs, replyPayload;
   if (values['correction-count'] !== undefined) {
     importedCount = Number(values['correction-count']);
@@ -61,11 +64,13 @@ try {
     else if (command === 'submit') result = await adapter.submit(workspace, plan, assignment, packet, baseline, values.kind ?? 'initial');
     else if (command === 'next') result = await adapter.next(workspace, plan, assignment, baseline);
     else if (command === 'finish') result = await adapter.finish(workspace, plan, baseline);
-    else if (command === 'wait') {
+    else if (['wait', 'resume-watch'].includes(command)) {
       const abort = new AbortController();
       const interrupt = () => abort.abort();
       process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
-      try { result = await adapter.wait(workspace, plan, { nonGitBaseline: baseline, signal: abort.signal, ...(timeoutMs ? { timeoutMs } : {}) }); }
+      try { result = await adapter.wait(workspace, plan, { nonGitBaseline: baseline, signal: abort.signal,
+        ...(timeoutMs ? { timeoutMs } : {}), ...(command === 'resume-watch' ? {
+          resume: { sessionID: values.session, assignmentID: assignment, messageID: packet } } : {}) }); }
       finally { process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); }
     } else {
       result = await adapter.reply(workspace, plan, assignment, packet, replyPayload, baseline);

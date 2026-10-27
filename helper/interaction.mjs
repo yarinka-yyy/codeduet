@@ -169,8 +169,9 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   }
   if (tail.some(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
     message.type === 'compaction' && message.status === 'failed' ||
-    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish) ||
-    message.content?.some(part => part.type === 'tool' && part.state?.status === 'error'))) return { kind: 'failed' };
+    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish))) return { kind: 'failed' };
+  if (tail.some(message => message.content?.some(part => part.type === 'tool' && part.state?.status === 'error')))
+    return { kind: 'failed', toolFailure: !tail.some(message => message.type === 'idle' && message.outcome === 'interrupted') };
   if (tail.some(message => message.type === 'idle' && message.outcome === 'interrupted')) return { kind: 'interrupted' };
   const tools = assistants.flatMap(message => message.content.filter(part => part.type === 'tool').map(part => ({ ...part, messageID: message.id })));
   const final = assistants.at(-1);
