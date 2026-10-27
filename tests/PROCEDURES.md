@@ -145,3 +145,12 @@ test events without a model. Prompt admission may be checked only with explicit
 cancellation of that probe's own queued inbox item. Never send to a working chat.
 This is not proof of running-model completion or owner live acceptance; preserve
 and compare production state/registration/config hashes separately.
+
+## Instruction injection during an assignment
+
+`node --test tests/synthetic.test.mjs` covers nested AGENTS.md injection inside
+a running/completed read, matching paths and tool times, and rejecting unrelated
+or malformed synthetic input. The HTTP/SSE fixtures verify completion on both
+supported releases, unchanged final/tool gates, one correction delivery, count
+preservation and durable history diagnostics without private instruction text.
+A stopped delivered assignment stays stopped; these tests never resume P4.

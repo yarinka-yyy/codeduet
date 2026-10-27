@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 
 export function fingerprint(request) {
@@ -113,6 +114,32 @@ export function assignmentMessages(client, binding) {
 // Adoption examines only the latest exchange, never the whole prior transcript.
 export const recentSessionMessages = (client, sessionID) => messagesSince(client, sessionID, message => message.type === 'user', true);
 
+function nativeInstructions(binding, messages, index) {
+  const message = messages[index], metadata = message.metadata, instruction = metadata?.instruction;
+  if (typeof binding.workspace !== 'string' || !isAbsolute(binding.workspace) ||
+    !metadata || Object.keys(metadata).length !== 1 || !instruction || Object.keys(instruction).length !== 1 ||
+    !Array.isArray(instruction.paths) || !instruction.paths.length || new Set(instruction.paths).size !== instruction.paths.length) return false;
+  const inside = (root, path) => { const rel = relative(root, path); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep); };
+  const paths = instruction.paths;
+  if (!paths.every(path => typeof path === 'string' && isAbsolute(path) && basename(path) === 'AGENTS.md' &&
+    inside(binding.workspace, path) && relative(binding.workspace, dirname(path)) !== '')) return false;
+  if (!message.text.startsWith('Instructions from: ' + paths[0] + '\n') ||
+    !paths.slice(1).every(path => message.text.includes('\n\nInstructions from: ' + path + '\n'))) return false;
+  return messages.slice(1, index).some(assistant => assistant.type === 'assistant' && Array.isArray(assistant.content) &&
+    assistant.content.some(tool => {
+      if (tool.type !== 'tool' || tool.name !== 'read' || !['running', 'completed'].includes(tool.state?.status) ||
+        typeof tool.state.input?.path !== 'string' || !Number.isFinite(tool.time?.ran) ||
+        !Number.isFinite(assistant.time?.created) || assistant.time.created > tool.time.ran ||
+        message.time.created < tool.time.ran) return false;
+      // Instruction injection happens inside read, before the tool's completed record.
+      if (tool.state.status === 'completed' ? !Number.isFinite(tool.time.completed) || message.time.created > tool.time.completed :
+        tool.time.completed !== undefined) return false;
+      const readPath = resolve(binding.workspace, tool.state.input.path);
+      return inside(binding.workspace, readPath) && paths.every(path =>
+        relative(path, readPath) !== '' && inside(dirname(path), readPath));
+    }));
+}
+
 export function inspectMessages(binding, messages, { adopting = false } = {}) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');
   const tail = messages.slice(1);
@@ -121,9 +148,14 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   const knownType = ['system', 'skill', 'shell', 'agent-switched', 'model-switched', 'location-switched'].includes(unsupported?.type) ? unsupported.type : 'unrecognized';
   need(!unsupported, 'Unsupported execution history type: ' + knownType + '; cannot transfer ownership');
   const inputs = tail.filter(message => message.type === 'synthetic');
-  // Prior input may be adopted after completion; new input cannot join our bound assignment.
-  need(adopting || inputs.length === 0, 'Synthetic input followed the bound assignment; no ownership transfer');
-  need(inputs.every(message => typeof message.text === 'string' && Number.isFinite(message.time?.created) && message.time.created >= 0), 'Invalid synthetic input metadata');
+  if (!inputs.every(message => typeof message.text === 'string' && Number.isFinite(message.time?.created) && message.time.created >= 0)) {
+    throw diagnosticError('Invalid synthetic input metadata; no ownership transfer', 'history-correlation', 'history',
+      { historyType: 'synthetic', errorCode: 'InvalidSyntheticInput' });
+  }
+  if (!adopting && inputs.some(message => !nativeInstructions(binding, messages, messages.indexOf(message)))) {
+    throw diagnosticError('Synthetic input is not correlated to this assignment read; no ownership transfer', 'history-correlation', 'history',
+      { historyType: 'synthetic', errorCode: 'UncorrelatedSyntheticInput' });
+  }
   const compactions = tail.filter(message => message.type === 'compaction');
   for (const message of compactions) {
     need(['running', 'completed', 'failed'].includes(message.status), 'Unknown compaction status');

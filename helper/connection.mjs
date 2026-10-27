@@ -10,14 +10,14 @@ const releaseVersion = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
   'event-open', 'event-handshake-timeout', 'event-http', 'event-content-type', 'event-eof', 'event-read',
   'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown', 'interrupted', 'deadline',
-  'state-locked', 'state-access', 'state-io', 'engine-version']);
-const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'state-directory', 'state-lock', 'state-write']);
+  'state-locked', 'state-access', 'state-io', 'engine-version', 'history-correlation']);
+const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'history', 'state-directory', 'state-lock', 'state-write']);
 const names = new Set(['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError']);
 const codes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ABORT_ERR',
   'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
   'EEXIST', 'EACCES', 'EPERM', 'EROFS', 'ERR_ACCESS_DENIED', 'ENOENT', 'ENOTDIR', 'EISDIR',
   'ENOSPC', 'EDQUOT', 'EIO', 'EMFILE', 'ENFILE', 'ELOOP', 'EBUSY', 'ENAMETOOLONG', 'UNKNOWN',
-  'InvalidCursorError', 'InvalidRequestError']);
+  'InvalidCursorError', 'InvalidRequestError', 'UncorrelatedSyntheticInput', 'InvalidSyntheticInput']);
 const operations = new Map([
   ['GET /api/info', 'server.info'], ['GET /api/model', 'model.list'],
   ['GET /api/session', 'session.list'], ['POST /api/session', 'session.create'],
@@ -59,7 +59,7 @@ const eventType = /^(?:(?:session\.)?(?:execution\.(?:started|running|succeeded|
 export function validateDiagnostic(value) {
   requireValue(value && categories.has(value.category) && stages.has(value.stage) &&
     Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0 &&
-    Object.keys(value).every(key => ['category', 'stage', 'elapsedMs', 'lastEvent', 'httpStatus', 'errorName', 'errorCode', 'operation', 'method', 'page', 'expectedVersions', 'observedVersion', 'versionSource'].includes(key)), 'Invalid diagnostic');
+    Object.keys(value).every(key => ['category', 'stage', 'elapsedMs', 'lastEvent', 'httpStatus', 'errorName', 'errorCode', 'operation', 'method', 'page', 'expectedVersions', 'observedVersion', 'versionSource', 'historyType'].includes(key)), 'Invalid diagnostic');
   requireValue(value.lastEvent === null || value.lastEvent && Object.keys(value.lastEvent).length === 2 &&
     Number.isSafeInteger(value.lastEvent.at) && value.lastEvent.at >= 0 && eventType.test(value.lastEvent.type), 'Invalid diagnostic event');
   if (value.httpStatus !== undefined) requireValue(Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599, 'Invalid diagnostic HTTP status');
@@ -68,6 +68,7 @@ export function validateDiagnostic(value) {
   if (value.operation !== undefined) requireValue(operationNames.has(value.operation), 'Invalid diagnostic operation');
   if (value.method !== undefined) requireValue(['GET', 'POST'].includes(value.method), 'Invalid diagnostic method');
   if (value.page !== undefined) requireValue(['first', 'cursor'].includes(value.page), 'Invalid diagnostic page');
+  if (value.historyType !== undefined) requireValue(value.category === 'history-correlation' && value.historyType === 'synthetic', 'Invalid diagnostic history type');
   if (value.category === 'engine-version' || ['expectedVersions', 'observedVersion', 'versionSource'].some(key => value[key] !== undefined)) {
     requireValue(value.category === 'engine-version' && Array.isArray(value.expectedVersions) &&
       value.expectedVersions.length >= 1 && value.expectedVersions.length <= 8 && value.expectedVersions.every(releaseVersion) &&

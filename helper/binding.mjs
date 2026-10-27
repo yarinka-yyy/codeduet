@@ -565,7 +565,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
             completion(history, liveSession, shells);
           } else need(liveSession.outcome === undefined && liveSession.time?.idle === undefined, 'Existing history/status mismatch');
           add('history', 'pass', 'Latest candidate history and completion boundary are valid');
-        } catch (error) { add('history', 'blocked', error.message); }
+        } catch (error) { add('history', 'blocked', error.message, false, diagnosticOf(error)); }
       }
     } else {
       const deferredNames = ['session', 'session-model', 'session-directory', 'session-options', 'forms', 'permissions', 'history'];
@@ -873,6 +873,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   function stoppedOutcome(expected, error, kind = 'stopped') {
     const diagnostic = error?.diagnostic ? validateDiagnostic(error.diagnostic) : diagnose(error, 'unknown', 'snapshot');
+    if (diagnostic.category === 'history-correlation' && ['stopped', 'connection-uncertain'].includes(kind)) kind = 'history-uncertain';
     const reason = error?.diagnostic || !error?.code ? error?.message ?? 'Operation stopped; inspect before continuing' :
       'Workspace or state I/O failed; inspect before continuing';
     try {

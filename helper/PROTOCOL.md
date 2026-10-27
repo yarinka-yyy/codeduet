@@ -171,8 +171,15 @@ a failed compaction remains a failure despite a later successful idle. Its
 summary never replaces the assignment's final response or earlier tool checks.
 Prior synthetic input is accepted only by existing-session adoption, with
 known text/time and a completed final after that input. The reader still goes
-back to the user prompt and checks every earlier tool. Synthetic input during
-a bound assignment stops coordination as external input. Unsupported history
+back to the user prompt and checks every earlier tool. During a bound assignment,
+only native AGENTS.md loading is recognized: exact instruction.paths metadata,
+nested workspace paths and the native text envelope must match a preceding read
+tool of this assignment and its running/completed time interval. A running read
+may inject instructions before its completion is recorded; it still cannot pass
+the final tool-completion gate. Other synthetic input stops coordination with
+history-uncertain/history-correlation, known historyType and errorCode, without
+private text, paths or metadata. This is correlation, not authenticated author
+identity: arbitrary API/plugin metadata is not proof of origin. Unsupported history
 diagnostics name only known API types; arbitrary type values are not echoed.
 Foreground shell checks distinguish numeric stream redirection (2>&1) and
 PowerShell call operators at statement/block starts from a trailing background
@@ -233,7 +240,7 @@ remains `EXECUTING` until the later completion/review gate accepts it.
 session. It holds the global state lock only for short reload/check/save steps;
 SSE and ordinary reconciliation requests run without it.
 It returns one compact outcome: `question`, `permission`, `completed-for-review`,
-`failed`, `interrupted`, `connection-uncertain`, or an already persisted `stopped`.
+`failed`, `interrupted`, `history-uncertain`, `connection-uncertain`, or an already persisted `stopped`.
 Token deltas and foreign events do not return to the advisor. Events wake
 ordinary HTTP reconciliation; old terminal events never prove a new outcome.
 Native nested `form.created` payloads are supported. Five-second supplementary

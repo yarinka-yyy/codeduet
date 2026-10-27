@@ -29,8 +29,8 @@ test('completed native compaction and prior synthetic preserve the final, all to
   assert.ok(!JSON.stringify(result).includes('PRIVATE_')); assert.deepEqual(messages, before);
 });
 
-test('a synthetic input during a bound assignment is external input, even with a later successful final', () => {
-  assert.throws(() => inspect(exchange(), false), /Synthetic input followed the bound assignment/);
+test('uncorrelated synthetic input stays blocked during a bound assignment, even with a later successful final', () => {
+  assert.throws(() => inspect(exchange(), false), error => error.diagnostic?.errorCode === 'UncorrelatedSyntheticInput');
 });
 
 for (const [name, mutate, error] of [

@@ -54,6 +54,9 @@ Keep the real CODEX_THREAD_ID and store. If approval is unavailable, stop and
 report the boundary. Never disable sandboxing, change ACLs, spoof HOME or move
 the store into a project or temporary directory. Approval does not clear a
 STOPPED or uncertain assignment. The protocol defines lock and failure behavior.
+A `history-uncertain` result with `history-correlation` identifies unverified
+synthetic input, not a connection failure. Do not resend a delivered assignment
+or clear STOPPED; preserve the assignment/message IDs for diagnosis.
 
 ## Build a folder without installing it
 
