@@ -2,10 +2,11 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
+import { processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
 const phases = ['PREPARING', 'EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING', 'STOPPED', 'FINISHED'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
@@ -13,6 +14,9 @@ const inside = (root, path) => { const rel = relative(root, path); return !isAbs
 const overlaps = (a, b) => inside(a, b) || inside(b, a);
 const identity = path => { const stat = statSync(path, { bigint: true }); return `${stat.dev}:${stat.ino}`; };
 const stateLockWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+const observationFingerprint = (binding, counter) => createHash('sha256').update(JSON.stringify([
+  ...['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID',
+    'sessionID', 'assignmentID', 'messageID', 'submittedAt'].map(key => binding[key]), counter])).digest('hex');
 
 function physicalContext(workspace, planPath) {
   need(isAbsolute(workspace) && isAbsolute(planPath), 'Use absolute workspace and plan paths');
@@ -110,13 +114,15 @@ function readOwnerships(root) {
     try { owner = JSON.parse(raw); }
     catch { invalid = true; continue; }
     const token = name.slice(6, -5);
-    if (!owner || owner.schema !== 1 || owner.token !== token || !text(owner.codexChat) ||
+    const fields = ['schema', 'token', 'codexChat', 'workspace', 'checkout', 'sessionID', 'assignmentID', 'operation'];
+    const modern = owner?.schema === 2 && ['wait', 'resume-watch'].includes(owner.operation) &&
+      validProcessOwner(owner.process) && /^msg_[a-zA-Z0-9]+$/.test(owner.messageID) && /^[a-f0-9]{64}$/.test(owner.fingerprint);
+    if (!owner || !(owner.schema === 1 || modern) || owner.token !== token || !text(owner.codexChat) ||
       !isAbsolute(owner.workspace) || !isAbsolute(owner.checkout) ||
       !(owner.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(owner.sessionID)) ||
       !(owner.assignmentID === null || text(owner.assignmentID)) ||
       !['bind', 'adopt', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(owner.operation) ||
-      Object.keys(owner).some(key => !['schema', 'token', 'codexChat', 'workspace', 'checkout',
-        'sessionID', 'assignmentID', 'operation'].includes(key))) invalid = true;
+      Object.keys(owner).some(key => ![...fields, ...(modern ? ['process', 'messageID', 'fingerprint'] : [])].includes(key))) invalid = true;
     else owners.push({ ...owner, path: join(root, name) });
   }
   return { owners, invalid };
@@ -685,7 +691,8 @@ function stateFailure(error, stage) {
     conflict ? 'state-locked' : denied ? 'state-access' : 'state-io', stage, {}, error);
 }
 
-export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID } = {}) {
+export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
+  probeOwner } = {}) {
   need(text(chatID), 'Actual CODEX_THREAD_ID is required');
   const statePath = join(stateRoot, 'state.json');
   function locked(operation) {
@@ -729,6 +736,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
 
   const ownershipRoot = join(stateRoot, 'ownership');
+  const stopRoot = join(stateRoot, 'observation-stop');
+  let observingProcess;
   function ownerships() {
     const result = readOwnerships(ownershipRoot);
     if (result.invalid) throw ownershipError();
@@ -741,6 +750,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     const token = randomUUID(), path = join(ownershipRoot, 'owner-' + token + '.lock');
     const value = { schema: 1, token, codexChat: chatID, workspace: ctx.workspace, checkout: ctx.checkout,
       sessionID: binding?.sessionID ?? null, assignmentID: binding?.assignmentID ?? null, operation };
+    if (['wait', 'resume-watch'].includes(operation)) Object.assign(value,
+      { schema: 2, process: observingProcess, messageID: binding.messageID,
+        fingerprint: observationFingerprint(binding, planCounter(state, binding).correctionCount) });
     let handle;
     try {
       handle = openSync(path, 'wx', 0o600);
@@ -981,6 +993,58 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   return {
     statePath,
+    async observationOwner(workspace, planPath, token, { action = 'inspect', nonGitBaseline } = {}) {
+      need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(token) &&
+        ['inspect', 'stop', 'recover'].includes(action), 'Invalid observation owner/action');
+      const ctx = context(workspace, planPath, nonGitBaseline);
+      function selection(state) {
+        const binding = state.bindings.find(value => value.codexChat === chatID);
+        need(binding && ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath'].every(key =>
+          binding[key] === ctx[key]), 'Observation belongs to another chat/workspace/plan');
+        const owner = ownerships().find(value => value.token === token);
+        need(owner && ['wait', 'resume-watch'].includes(owner.operation) &&
+          ['codexChat', 'workspace', 'checkout', 'sessionID', 'assignmentID'].every(key => owner[key] === binding[key]) &&
+          (owner.schema === 1 || owner.messageID === binding.messageID &&
+            owner.fingerprint === observationFingerprint(binding, planCounter(state, binding).correctionCount)),
+        'Lease is not this delivered observation; pins/count changed');
+        need(binding.assignmentID && binding.messageID, 'No delivered assignment');
+        return { owner, binding, counter: planCounter(state, binding).correctionCount };
+      }
+      const selected = selection(readState(statePath)), { owner, binding, counter } = selected;
+      const proof = ownerLiveness(owner.process, probeOwner);
+      const result = { kind: 'ownership-status', token, operation: owner.operation, ownerStatus: proof.status,
+        reason: proof.reason, recoveryAllowed: proof.status === 'dead', processID: owner.process?.pid ?? null,
+        sessionID: binding.sessionID, assignmentID: binding.assignmentID, messageID: binding.messageID,
+        correctionCount: counter, phase: binding.phase, taskSent: false, executorStopped: false, stateChange: 'unchanged' };
+      if (action === 'inspect') return result;
+      if (action === 'recover' && proof.status !== 'dead' || action === 'stop' && owner.schema !== 2)
+        return { ...result, kind: 'rejected' };
+      locked(state => {
+        const current = selection(state);
+        need(JSON.stringify(current) === JSON.stringify(selected), 'Lease/binding/count changed; no recovery');
+        try { if (action === 'stop') {
+          mkdirSync(stopRoot, { recursive: true, mode: 0o700 });
+          const path = join(stopRoot, token);
+          if (existsSync(path)) need(readFileSync(path, 'utf8') === token, 'Observation stop marker changed');
+          else writeFileSync(path, token, { flag: 'wx', mode: 0o600 });
+        } else {
+          const history = join(stateRoot, 'ownership-history');
+          mkdirSync(history, { recursive: true, mode: 0o700 });
+          const path = join(history, token + '.json');
+          const audit = { schema: 1, owner, proof, counter, messageID: binding.messageID };
+          if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(audit), 'Recovery evidence changed');
+          else writeFileSync(path, JSON.stringify(audit), { flag: 'wx', mode: 0o600 });
+          need(!existsSync(join(history, token + '.lock')), 'Lease archive already exists');
+          renameSync(owner.path, join(history, token + '.lock'));
+        }
+        } catch (error) { if (error?.code) throw stateFailure(error, 'state-write'); throw error; }
+      });
+      if (action === 'recover') return { ...result, kind: 'observation-released', leaseArchived: true };
+      const deadline = Date.now() + 15000;
+      while (existsSync(owner.path) && Date.now() < deadline) await new Promise(done => setTimeout(done, 100));
+      return { ...result, kind: existsSync(owner.path) ? 'observation-stop-pending' : 'observation-released',
+        stopRequested: true, snapshotOnly: true };
+    },
 
     async next(workspace, planPath, kind, nonGitBaseline) {
       need(['block', 'correction'].includes(kind), 'Next assignment kind must be block or correction');
@@ -1029,6 +1093,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal, resume, onReady, once = false } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000, 'Wait timeout must be 1..3600000 ms');
       const resuming = resume !== undefined;
+      observingProcess = processOwner(); // Capture outside the short state transaction.
       if (resuming) need(resume && Object.keys(resume).length === 3 &&
         ['sessionID', 'assignmentID', 'messageID'].every(key => typeof resume[key] === 'string') &&
         /^ses_[a-zA-Z0-9]+$/.test(resume.sessionID) && /^[a-zA-Z0-9._-]{1,120}$/.test(resume.assignmentID) &&
@@ -1041,6 +1106,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       if (begun.outcome) return begun.outcome;
       const outcome = await withOwnership(begun.lease, async () => {
         const startedAt = Date.now(), deadline = AbortSignal.timeout(timeoutMs);
+        const stopRequest = new AbortController(), outerSignal = signal;
+        signal = AbortSignal.any([outerSignal, stopRequest.signal]);
+        const stopping = setInterval(() => {
+          try {
+            if (existsSync(join(stopRoot, begun.lease.token)) &&
+              readFileSync(join(stopRoot, begun.lease.token), 'utf8') === begun.lease.token) stopRequest.abort();
+          } catch { stopRequest.abort(); }
+        }, 250);
         const combined = AbortSignal.any([signal, deadline]);
         let expected = begun.expected, stream;
         const record = (change, kind) => {
@@ -1139,7 +1212,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           return stopWait(signal.aborted ? 'interrupted' : 'connection-uncertain',
             resuming && error?.code && !error?.diagnostic ? 'Workspace or state I/O failed; inspect diagnostic' :
               error?.message ?? 'Wait observation failed; inspect before continuing', diagnostic);
-        } finally { await stream?.close(); }
+        } finally { clearInterval(stopping); await stream?.close(); }
       });
       return resuming ? { ...outcome, observationOnly: true, taskSent: false } : outcome;
     },

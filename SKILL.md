@@ -51,6 +51,8 @@ uncertain mutation is STOPPED; never resend it.
 Only on an explicit request to resume observation of an already delivered
 assignment, use [observer arm --resume](helper/OBSERVER.md). This is a
 separate route from dispatch preflight; inspect alone does not authorize it.
+A foreground lease blocking that transition uses the [owner diagnosis and
+migration route](helper/OBSERVER.md#migrate-a-foreground-wait); never delete a lock.
 Handle scoped questions and permission requests within the user's and runtime
 authority. Send source corrections to the executor; do not implement them yourself.
 

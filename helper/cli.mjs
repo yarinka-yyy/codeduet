@@ -6,13 +6,17 @@ import { context, helper, inspect, listSessions, preflight } from './binding.mjs
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
-  if (!['inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(command) ||
-    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3 })[command])) {
+  const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
+  if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
+  if (!['ownership', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3 })[command])) {
     throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>]; paths must be absolute');
   }
   if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch'].includes(command)) throw new Error('Assignment kind belongs to submit; correction-count to bind/adopt/preflight; session to preflight/resume-watch; cursor to sessions');
+  if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
+    !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
   if (command === 'resume-watch' && (!/^ses_[a-zA-Z0-9]+$/.test(values.session) ||
     !/^[a-zA-Z0-9._-]{1,120}$/.test(assignment) || !/^msg_[a-zA-Z0-9]+$/.test(packet)))
@@ -38,7 +42,9 @@ try {
     try { replyPayload = JSON.parse(readFileSync(args[5], 'utf8')); } catch { throw new Error('Invalid answer JSON file'); }
   }
   let connectionError, result;
-  try { client = await connect(); }
+  if (command === 'ownership') result = await helper(null).observationOwner(workspace, plan, assignment,
+    { action: values.action, nonGitBaseline: values['non-git-baseline'] });
+  try { if (command !== 'ownership') client = await connect(); }
   catch (error) {
     if (command === 'inspect' || command === 'preflight') connectionError = error;
     else {
@@ -67,11 +73,11 @@ try {
     else if (['wait', 'resume-watch'].includes(command)) {
       const abort = new AbortController();
       const interrupt = () => abort.abort();
-      process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
+      for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(name, interrupt);
       try { result = await adapter.wait(workspace, plan, { nonGitBaseline: baseline, signal: abort.signal,
         ...(timeoutMs ? { timeoutMs } : {}), ...(command === 'resume-watch' ? {
           resume: { sessionID: values.session, assignmentID: assignment, messageID: packet } } : {}) }); }
-      finally { process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); }
+      finally { for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.off(name, interrupt); }
     } else {
       result = await adapter.reply(workspace, plan, assignment, packet, replyPayload, baseline);
     }
@@ -79,7 +85,9 @@ try {
   if (client?.bootstrap && command !== 'preflight') result.bootstrap = { attempts: client.bootstrap.attempts, retried: client.bootstrap.retried };
   if (result.kind === 'stopped') console.error(JSON.stringify(result));
   else console.log(JSON.stringify(result));
-  if (result.phase === 'STOPPED' || ['stopped', 'connection-unavailable', 'correction-limit', 'rejected'].includes(result.kind) ||
+  if (command === 'ownership') {
+    if (['rejected', 'observation-stop-pending'].includes(result.kind)) process.exitCode = 1;
+  } else if (result.phase === 'STOPPED' || ['stopped', 'connection-unavailable', 'correction-limit', 'rejected'].includes(result.kind) ||
     result.kind === 'preflight' && result.status !== 'pass') process.exitCode = 1;
 } catch (error) {
   const outcome = error.stateOutcome ?? { kind: error.diagnostic ? 'stopped' : 'rejected',

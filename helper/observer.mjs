@@ -106,7 +106,9 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       const end = Date.now() + 90000;
       while (Date.now() < end) {
         if (existsSync(join(dir, 'ready.json')) || existsSync(join(dir, 'result.json'))) {
-          return { ...status(id), kind: 'observer-armed', endTurn: true };
+          const snapshot = status(id);
+          return { ...snapshot, kind: snapshot.result?.kind === 'observer-error' ? 'observer-start-failed' : 'observer-armed',
+            endTurn: snapshot.result?.kind !== 'observer-error' };
         }
         await delay(100);
       }
@@ -119,7 +121,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     put(join(dir, 'started.json'), { pid: process.pid, at: Date.now() });
     const abort = new AbortController();
     const interrupt = () => abort.abort();
-    process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
+    for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(name, interrupt);
     const timer = setInterval(() => { if (existsSync(join(dir, 'cancel.json'))) abort.abort(); }, 250);
     let result;
     try {
@@ -134,7 +136,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       // Do not persist exception bodies or executor transcripts in notification receipts.
       result = { kind: 'observer-error', diagnostic: diagnose(error, 'unknown', 'connection') };
     } finally {
-      clearInterval(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
+      clearInterval(timer); for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.off(name, interrupt);
     }
     try {
       put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(), ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
@@ -197,7 +199,8 @@ if (process.argv[1] && resolve(process.argv[1]) === here) {
       await instance[command](first);
     if (result) {
       console.log(JSON.stringify(result));
-      if (command === 'consume' && (result.phase === 'STOPPED' || result.kind === 'observer-error')) process.exitCode = 1;
+      if (result.kind === 'observer-start-failed' || command === 'consume' &&
+        (result.phase === 'STOPPED' || result.kind === 'observer-error')) process.exitCode = 1;
     }
   } catch (error) {
     console.error(JSON.stringify({ kind: 'observer-rejected', error: error.message, taskSent: false, retried: false }));

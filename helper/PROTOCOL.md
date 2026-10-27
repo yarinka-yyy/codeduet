@@ -101,6 +101,13 @@ Long operations hold a separate per-checkout ownership lease. The lease prevents
 a second observer/writer on the same binding or an overlapping checkout while
 unrelated workspaces can proceed. It is released only by its owner after the
 operation; a crash or unknown owner leaves it in place for explicit inspection.
+New observation leases use schema2 with process creation identity and immutable
+delivery/count fingerprint. The explicit [foreground migration](OBSERVER.md#migrate-a-foreground-wait)
+route can cooperatively stop them or archive a provably dead owner under the
+same short state lock, without changing state.json. Schema1 leases without
+identity remain unknown and cannot be automatically retired. A real terminal
+Ctrl+C can release a lease; Windows process termination may bypass all finally
+handlers, so interruption through the host is not proof of graceful cleanup.
 Every post-network save reloads the store under `state.lock` and validates the
 saved chat/session/assignment/message/phase before applying only its own change,
 so another workspace's binding and counter are retained. Schema-1 bindings and

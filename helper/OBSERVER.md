@@ -39,6 +39,47 @@ observation permits adding **--resume** to arm. It uses the existing resume-watc
 pin/history checks. Uncertain create/submit/reply is still rejected. No task,
 count reset, replacement binding, model or executor resume command is sent.
 
+## Migrate a foreground wait
+
+For a blocked foreground wait/resume-watch, use the current owner chat and exact
+lease token from ownership/owner-<token>.lock. Read-only diagnosis requires no
+engine connection:
+
+```text
+node helper/cli.mjs ownership <workspace> <plan> <token> --action inspect [--non-git-baseline <declaration>]
+node helper/cli.mjs ownership <workspace> <plan> <token> --action stop [--non-git-baseline <declaration>]
+node helper/cli.mjs ownership <workspace> <plan> <token> --action recover [--non-git-baseline <declaration>]
+```
+
+Stop requests cooperative cancellation of observation only and waits up to15s
+for lease release. It never sends an engine cancellation. A released foreground
+wait normally records STOPPED; only the user's explicit observation continuation
+permits arm --resume. Read the current phase before selecting arm or arm --resume.
+If stop remains pending, do not arm or kill an unrelated/unknown process.
+For an event observer use its existing cancel receipt instead of foreground stop.
+
+New observation leases record PID, a host fingerprint and OS creation identity.
+Recover is an explicit local operation: it checks the exact lease, current owner
+chat, physical workspace/checkout, plan, delivery and count; it archives only a
+provably dead observation owner under ownership-history while holding state.lock.
+Absent process or a different creation identity proves that original process
+ended. A live process, access denial or unknown identity refuses recovery.
+Neither age, PID reuse alone, nor an empty engine activity list grants ownership.
+No binding, state.json, counter, STOPPED or delivery-uncertainty field is changed.
+The original lease and proof remain as local evidence. No recovery is automatic.
+A second recovery/arm cannot replace a current owner. A retained observer slot is
+also not removed by lease recovery; diagnose its receipt separately.
+
+Schema1 legacy leases without process identity remain readable but unverifiable.
+Their inspect reports legacy-owner-unverifiable; stop/recover refuse unchanged.
+Do not infer death from missing PID or manufacture identity after the fact. Ask
+the owner for a separately reviewed recovery decision with trusted host exit
+evidence; this command has no force/legacy-unlock bypass. Do not delete locks,
+relocate shared state, spoof HOME or send the assignment again.
+
+A worker startup error returns observer-start-failed, never observer-armed. Keep
+the receipt for diagnosis; do not start a second worker to work around its slot.
+
 ## Handle a wake hint
 
 The fixed hint contains only the receipt UUID. It carries no executor transcript,

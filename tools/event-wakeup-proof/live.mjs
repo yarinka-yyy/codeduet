@@ -86,7 +86,7 @@ if (command === 'serve') {
       await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); }); child.unref();
     } });
   let result;
-  if (command === 'arm') {
+  if (command === 'arm' || command === 'migrate-arm') {
     const adapter = helper(await connectEngine(), { stateRoot: config.stateRoot, chatID });
     if (!existsSync(join(config.stateRoot, 'state.json'))) {
       await adapter.bind(config.workspace, config.plan, baseline, 8);
@@ -94,12 +94,47 @@ if (command === 'serve') {
       writeFileSync(join(evidence, 'chat.json'), JSON.stringify({ chatID }));
     }
     assert.equal(read(join(evidence, 'chat.json')).chatID, chatID, 'Wrong live test chat');
+    if (command === 'migrate-arm') {
+      assert.ok(!existsSync(join(evidence, 'migration.json')), 'Never repeat a migration test');
+      await adapter.connectionLost(new Error('Disposable pre-migration interruption'));
+      const saved = read(join(config.stateRoot, 'state.json')).bindings[0];
+      const child = spawn(process.execPath, [here, 'foreground', evidence],
+        { windowsHide: true, stdio: 'ignore' });
+      const done = new Promise((done, reject) => { child.once('error', reject); child.once('exit', done); });
+      const end = Date.now() + 15000;
+      while (!existsSync(join(evidence, 'foreground-ready.json')) && Date.now() < end) {
+        assert.equal(child.exitCode, null, 'Disposable foreground exited before readiness');
+        await new Promise(done => setTimeout(done, 100));
+      }
+      assert.ok(existsSync(join(evidence, 'foreground-ready.json')), 'Disposable foreground not ready');
+      const ownerDir = join(config.stateRoot, 'ownership');
+      const names = readdirSync(ownerDir); assert.equal(names.length, 1);
+      const owner = read(join(ownerDir, names[0]));
+      assert.equal(owner.codexChat, chatID); assert.equal(owner.process.pid, child.pid);
+      assert.equal(owner.assignmentID, saved.assignmentID); assert.equal(owner.messageID, saved.messageID);
+      const stopped = await adapter.observationOwner(config.workspace, config.plan, owner.token,
+        { action: 'stop', nonGitBaseline: baseline });
+      assert.equal(stopped.ownerStatus, 'live'); assert.equal(stopped.kind, 'observation-released');
+      await done;
+      const after = read(join(config.stateRoot, 'state.json'));
+      assert.equal(after.bindings[0].phase, 'STOPPED'); assert.equal(after.plans[0].correctionCount, 9);
+      for (const key of ['sessionID', 'assignmentID', 'messageID', 'submittedAt'])
+        assert.equal(after.bindings[0][key], saved[key]);
+      writeFileSync(join(evidence, 'migration.json'), JSON.stringify({ chatID, owner, stopped, deliveryUnchanged: true }));
+      log({ kind: 'foreground-migrated', chatID, stopped });
+    }
     result = await o.arm(config.workspace, config.plan, { nonGitBaseline: baseline, timeoutMs: 600000,
-      codexExe: 'C:/Users/Yarin/AppData/Local/OpenAI/Codex/bin/08d187884f2330d1/codex.exe' });
+      resume: command === 'migrate-arm', codexExe: 'C:/Users/Yarin/AppData/Local/OpenAI/Codex/bin/08d187884f2330d1/codex.exe' });
+  } else if (command === 'foreground') {
+    const adapter = helper(await connectEngine(), { stateRoot: config.stateRoot, chatID });
+    const saved = read(join(config.stateRoot, 'state.json')).bindings[0];
+    result = await adapter.wait(config.workspace, config.plan, { nonGitBaseline: baseline, timeoutMs: 600000,
+      resume: Object.fromEntries(['sessionID', 'assignmentID', 'messageID'].map(key => [key, saved[key]])),
+      onReady: () => writeFileSync(join(evidence, 'foreground-ready.json'), JSON.stringify({ pid: process.pid }), { flag: 'wx' }) });
   } else if (command === 'reply') {
     result = await helper(await connectEngine(), { stateRoot: config.stateRoot, chatID }).reply(config.workspace, config.plan,
       'question', 'frm_question', { answer: { answer: 'fixture' } }, baseline);
   } else if (['worker', 'consume', 'cancel', 'status'].includes(command)) result = await o[command](id);
-  else throw new Error('serve | arm | consume ID | reply | status | cancel ID | stop');
+  else throw new Error('serve | arm | migrate-arm | foreground | consume ID | reply | status | cancel ID | stop');
   if (result) { log({ kind: 'chat-operation', command, chatID, result }); console.log(JSON.stringify(result)); }
 }
