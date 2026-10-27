@@ -109,6 +109,19 @@ pagination. The shared completion gate must accept its final/idle/tools and
 known shells. Empty history requires never-executed status. Unknown, archived,
 failed/interrupted or changed state stops; no takeover or automatic recovery.
 
+Message history uses limit=100/order=desc only for the first page; subsequent
+requests retain limit=100 and pass the opaque cursor without order. OpenCode
+2.1.4 rejects combining message cursor and order with InvalidCursorError/400.
+The same reader serves adoption and current-assignment observation/review.
+
+An adopt failure inside the helper reports adoption.bindingState unchanged
+until the final binding save is attempted; afterwards it is unconfirmed.
+Both report adoption.engineMutation none: adoption never sends to the executor.
+This refers to this call's binding JSON, not directory/lock creation or a
+promise that other writers are idle. Inspect unconfirmed persistence before
+any explicit continuation; no retry/reset is automatic. Earlier CLI connection
+failure still follows connectionLost and may persist STOPPED on a prior binding.
+
 The cooperative lock encloses the checks and atomic local save; identity,
 execution and latest message are reconfirmed. No OpenCode create/prompt/rename
 or model/config mutation occurs. A different/STOPPED/uncertain current pair or
@@ -171,7 +184,12 @@ are rejected rather than silently copied.
 
 Fields: category, stage, elapsedMs, lastEvent (null or timestamp at plus a
 bounded event type). Optional httpStatus/errorName/errorCode use explicit
-allowlists. Categories distinguish HTTP request read/timeout/status/JSON,
+allowlists. Request diagnostics also include allowlisted operation/method and,
+for message lists, page first or cursor. Never include raw URLs, session IDs,
+query values or request bodies. HTTP 400 may retain a checked InvalidCursorError
+or InvalidRequestError tag from at most 8192 response bytes; other server text,
+unknown tags, malformed/oversized bodies are discarded. Categories distinguish
+HTTP request read/timeout/status/JSON,
 event opening/handshake/status/content-type, EOF/read/JSON/shape/frame limit,
 engine shutdown, user interruption, total deadline and unknown. Last event is
 for the bound session; unrecognized names become other, and foreign events do

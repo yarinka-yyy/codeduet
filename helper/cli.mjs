@@ -47,6 +47,8 @@ try {
   if (result.phase === 'STOPPED' || result.kind === 'stopped') process.exitCode = 1;
 } catch (error) {
   console.error(JSON.stringify({ kind: 'stopped', error: error.message, retried: false,
+    ...(['unchanged', 'unconfirmed'].includes(error.adoptionState) ?
+      { adoption: { bindingState: error.adoptionState, engineMutation: 'none' } } : {}),
     ...(error.diagnostic ? { diagnostic: diagnose(error, 'unknown', 'connection') } : {}) }));
   process.exitCode = 1;
 }

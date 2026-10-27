@@ -97,7 +97,7 @@ async function messagesSince(client, sessionID, boundary, allowEmpty = false) {
     if (allowEmpty && result.length === 0 && page.data.length === 0) return [];
     need(page.data.length > 0 && typeof page.cursor?.next === 'string' && !cursors.has(page.cursor.next), 'Assignment absent from message history');
     cursors.add(page.cursor.next);
-    route = `/api/session/${sessionID}/message?limit=100&order=desc&cursor=${encodeURIComponent(page.cursor.next)}`;
+    route = `/api/session/${sessionID}/message?limit=100&cursor=${encodeURIComponent(page.cursor.next)}`;
   }
   throw new Error('Assignment history exceeds bounded read');
 }

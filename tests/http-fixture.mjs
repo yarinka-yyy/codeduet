@@ -34,6 +34,8 @@ export async function fixture(t, cli = defaultCli) {
       calls.push({ method: request.method, route });
       await f.onRequest?.(route);
       const send = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
+      const rejection = f.rejectRequest?.(request.method, route);
+      if (rejection) { response.statusCode = 400; return send(rejection); }
       if (route === '/api/info') { if (f.fault === 'info-timeout') return; return send({ version: '2.1.4' }); }
       if (route === '/api/model') return send({ data: f.models });
       if (route === '/api/event') {
@@ -69,8 +71,11 @@ export async function fixture(t, cli = defaultCli) {
         return send({ data: { id: body.id, sessionID } });
       }
       if (route.includes('/message?')) {
-        if (f.messagePage) return send(f.messagePage);
         const query = new URL(route, 'http://localhost').searchParams;
+        if (query.has('cursor') && query.has('order')) {
+          response.statusCode = 400; return send({ _tag: 'InvalidCursorError', message: secret });
+        }
+        if (f.messagePage) return send(f.messagePage);
         const reversed = [...(messages.get(sessionID) ?? [])].reverse();
         const offset = Number(query.get('cursor') ?? 0), limit = Number(query.get('limit') ?? 100);
         return send({ data: reversed.slice(offset, offset + limit), cursor: { next: String(offset + limit) } });

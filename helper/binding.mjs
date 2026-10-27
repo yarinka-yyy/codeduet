@@ -462,31 +462,40 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     },
 
     async adopt(workspace, planPath, sessionID, nonGitBaseline, importedCount) {
-      need(/^ses_[a-zA-Z0-9]+$/.test(sessionID), 'Use an exact existing session ID');
-      return locked(async state => {
-        const ctx = context(workspace, planPath, nonGitBaseline);
-        const existing = state.bindings.find(binding => binding.codexChat === chatID);
-        need(importedCount !== undefined || state.plans.some(plan => plan.planPath === ctx.planPath), 'Established correction count required for adoption; do not guess zero');
-        if (existing) {
-          savedContext(existing, ctx);
-          need(existing.sessionID === sessionID, 'Another session is already bound to this Codex chat');
-          need(['PREPARING', 'FINISHED'].includes(existing.phase), 'Existing binding still owns an assignment');
-          planCounter(state, ctx, importedCount);
-          if (existing.phase === 'FINISHED') await reviewedResult(existing);
-          else {
-            const current = await idleExisting(state, existing);
-            if (existing.adoption) need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === existing.adoption[key]), 'Existing session changed since preparation; no dispatch');
+      let saving = false;
+      try {
+        need(/^ses_[a-zA-Z0-9]+$/.test(sessionID), 'Use an exact existing session ID');
+        return await locked(async state => {
+          const ctx = context(workspace, planPath, nonGitBaseline);
+          const existing = state.bindings.find(binding => binding.codexChat === chatID);
+          need(importedCount !== undefined || state.plans.some(plan => plan.planPath === ctx.planPath), 'Established correction count required for adoption; do not guess zero');
+          if (existing) {
+            savedContext(existing, ctx);
+            need(existing.sessionID === sessionID, 'Another session is already bound to this Codex chat');
+            need(['PREPARING', 'FINISHED'].includes(existing.phase), 'Existing binding still owns an assignment');
+            planCounter(state, ctx, importedCount);
+            if (existing.phase === 'FINISHED') await reviewedResult(existing);
+            else {
+              const current = await idleExisting(state, existing);
+              if (existing.adoption) need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === existing.adoption[key]), 'Existing session changed since preparation; no dispatch');
+            }
+            return summary(state, existing, 'reused');
           }
-          return summary(state, existing, 'reused');
-        }
-        need(!state.bindings.some(binding => binding.engineID === client.engineID && binding.sessionID === sessionID), 'Session is already bound to another Codex chat; no takeover');
-        const binding = { codexChat: chatID, ...ctx, engineID: client.engineID, sessionID, phase: 'PREPARING' };
-        binding.adoption = await idleExisting(state, binding);
-        planCounter(state, ctx, importedCount);
-        state.bindings.push(binding);
-        saveState(statePath, state);
-        return summary(state, binding, 'adopted');
-      });
+          need(!state.bindings.some(binding => binding.engineID === client.engineID && binding.sessionID === sessionID), 'Session is already bound to another Codex chat; no takeover');
+          const binding = { codexChat: chatID, ...ctx, engineID: client.engineID, sessionID, phase: 'PREPARING' };
+          binding.adoption = await idleExisting(state, binding);
+          planCounter(state, ctx, importedCount);
+          state.bindings.push(binding);
+          saving = true;
+          saveState(statePath, state);
+          return summary(state, binding, 'adopted');
+        });
+      } catch (error) {
+        if (saving) error = diagnosticError('Adoption state persistence/lock release unconfirmed; inspect store, no automatic retry',
+          'state-io', 'state-write', {}, error);
+        error.adoptionState = saving ? 'unconfirmed' : 'unchanged';
+        throw error;
+      }
     },
     async bind(workspace, planPath, nonGitBaseline, importedCount) {
       return locked(async state => {

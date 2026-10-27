@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { connect } from '../helper/connection.mjs';
+import { helper } from '../helper/binding.mjs';
 import { fixture, baseline, model } from './http-fixture.mjs';
 
 function seed(f, id = 'ses_existing', title = 'Existing fixture', empty = false) {
@@ -249,7 +253,8 @@ test('long prior exchange uses bounded pagination without importing older tasks'
   messages.splice(1, 0, ...Array.from({ length: 105 }, (_, index) => ({ id: 'msg_step' + index,
     type: 'assistant', model, finish: 'stop', time: { completed: ended - 1 }, content: [] })));
   assert.equal((await f.call(adoptArgs(f))).status, 0);
-  assert.ok(f.calls.some(call => call.route.includes('/message?limit=100&order=desc&cursor=')));
+  assert.ok(f.calls.some(call => call.route.includes('/message?limit=100&cursor=')));
+  assert.ok(!f.calls.some(call => call.route.includes('/message?') && call.route.includes('cursor=') && call.route.includes('order=')));
   assert.equal(f.state().bindings[0].adoption.lastMessageID, 'msg_priorIdle');
   assert.ok(!readFileSync(f.statePath, 'utf8').includes('PRIVATE_PRIOR_'));
 });
@@ -271,5 +276,120 @@ test('a request that appears during adopted-submit validation prevents dispatch 
   f.onRequest = route => { if (route.includes('/message?limit=1&')) f.permissions = [{ id: 'per_racing' }]; };
   assert.equal((await f.call(submitArgs(f))).status, 1);
   assert.deepEqual(readFileSync(f.statePath), before);
+  assert.ok(f.calls.every(call => call.method === 'GET'));
+});
+
+const adoptFailures = [
+  ['initial active check', '/api/session/active', 1, 'session.active'],
+  ['session identity', '/api/session/ses_existing', 1, 'session.get'],
+  ['forms', '/api/session/ses_existing/form', 1, 'session.form.list'],
+  ['permissions', '/api/session/ses_existing/permission', 1, 'session.permission.list'],
+  ['first history page', '/message?limit=100&order=desc', 1, 'session.message.list', 'first'],
+  ['cursor history page', '/message?limit=100&cursor=', 1, 'session.message.list', 'cursor'],
+  ['shell check', '/api/shell?', 1, 'shell.list'],
+  ['latest head', '/message?limit=1&order=desc', 1, 'session.message.list', 'first'],
+  ['confirmed identity', '/api/session/ses_existing', 2, 'session.get'],
+  ['last active check', '/api/session/active', 4, 'session.active'],
+];
+for (const [name, routePart, occurrence, operation, page] of adoptFailures) {
+  test('adopt HTTP 400 at ' + name + ' preserves binding state/counter and sends no POST', async t => {
+    const f = await fixture(t), session = seed(f);
+    if (page === 'cursor') {
+      f.messages.get(session.id).splice(1, 0, ...Array.from({ length: 105 }, (_, index) => ({
+        id: 'msg_priorStep' + index, type: 'assistant', model, finish: 'stop',
+        time: { completed: session.time.idle - 1 }, content: [],
+      })));
+    }
+    // Keep an existing record/count to prove failures don't replace the store.
+    assert.equal((await f.call(f.bindArgs(7))).status, 0);
+    const before = readFileSync(f.statePath), start = f.calls.length;
+    let matches = 0, rejected = 0;
+    f.rejectRequest = (_method, route) => {
+      const match = routePart.startsWith('/api/session/ses_existing') || routePart === '/api/session/active' ?
+        route === routePart : route.includes(routePart);
+      if (match && ++matches === occurrence) {
+        rejected++;
+        return { _tag: page === 'cursor' ? 'InvalidCursorError' : 'InvalidRequestError',
+          message: 'OFFLINE_HTTP_CANARY_007', path: 'PRIVATE_SERVER_PATH' };
+      }
+    };
+    const outcome = await f.call(adoptArgs(f, session.id, 7), 'offline-http-chat-B');
+    assert.equal(outcome.status, 1); assert.equal(rejected, 1);
+    assert.equal(outcome.result.diagnostic.httpStatus, 400);
+    assert.equal(outcome.result.diagnostic.operation, operation);
+    assert.equal(outcome.result.diagnostic.method, 'GET');
+    assert.equal(outcome.result.diagnostic.page, page);
+    assert.equal(outcome.result.diagnostic.errorCode, page === 'cursor' ? 'InvalidCursorError' : 'InvalidRequestError');
+    assert.deepEqual(outcome.result.adoption, { bindingState: 'unchanged', engineMutation: 'none' });
+    assert.equal(outcome.result.retried, false);
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.ok(!existsSync(join(dirname(f.statePath), 'state.lock')));
+    assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+    assert.ok(!JSON.stringify(outcome.result).includes(session.id) && !JSON.stringify(outcome.result).includes('PRIVATE_'));
+  });
+}
+
+test('adopt HTTP 400 before its first save leaves no binding file', async t => {
+  const f = await fixture(t); seed(f);
+  f.rejectRequest = (_method, route) => route.includes('/message?') ?
+    { _tag: 'InvalidRequestError', message: 'OFFLINE_HTTP_CANARY_007' } : undefined;
+  const result = await f.call(adoptArgs(f));
+  assert.equal(result.status, 1);
+  assert.deepEqual(result.result.adoption, { bindingState: 'unchanged', engineMutation: 'none' });
+  assert.ok(!existsSync(f.statePath)); assert.ok(f.calls.every(call => call.method === 'GET'));
+});
+
+for (const variant of ['unknown-tag', 'oversized-body']) test('HTTP diagnostic drops ' + variant + ' and private server text', async t => {
+  const f = await fixture(t); seed(f);
+  f.rejectRequest = (_method, route) => route.includes('/message?') ?
+    { _tag: variant === 'unknown-tag' ? 'PRIVATE_SERVER_TAG' : 'InvalidCursorError',
+      message: 'OFFLINE_HTTP_CANARY_007'.repeat(variant === 'oversized-body' ? 1000 : 1) } : undefined;
+  const outcome = await f.call(adoptArgs(f));
+  assert.equal(outcome.status, 1); assert.equal(outcome.result.diagnostic.operation, 'session.message.list');
+  assert.equal(outcome.result.diagnostic.errorCode, undefined);
+  assert.ok(!JSON.stringify(outcome.result).includes('PRIVATE_'));
+  assert.ok(!existsSync(f.statePath)); assert.ok(f.calls.every(call => call.method === 'GET'));
+});
+
+test('HTTP 400 on adopted prompt keeps one uncertain correction and refuses resubmission/adoption', async t => {
+  const f = await fixture(t); seed(f); assert.equal((await f.call(adoptArgs(f))).status, 0);
+  f.rejectRequest = (method, route) => method === 'POST' && route.endsWith('/prompt') ?
+    { _tag: 'InvalidRequestError', message: 'OFFLINE_HTTP_CANARY_007' } : undefined;
+  const failed = await f.call(submitArgs(f));
+  assert.equal(failed.status, 1); assert.equal(failed.result.diagnostic.operation, 'session.prompt');
+  assert.equal(failed.result.diagnostic.method, 'POST');
+  assert.equal(failed.result.diagnostic.errorCode, 'InvalidRequestError');
+  assert.equal(failed.result.adoption, undefined);
+  const before = readFileSync(f.statePath);
+  assert.equal(f.state().bindings[0].phase, 'STOPPED'); assert.equal(f.state().bindings[0].uncertain, 'submit');
+  assert.equal(f.state().plans[0].correctionCount, 20);
+  assert.equal((await f.call(submitArgs(f))).status, 1);
+  assert.equal((await f.call(adoptArgs(f, 'ses_existing', 20))).status, 1);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  assert.equal(f.posts('/api/session/ses_existing/prompt'), 1);
+});
+
+for (const written of [false, true]) test('adopt persistence failure reports unconfirmed binding even when rename ' + (written ? 'completed' : 'did not run'), async t => {
+  const f = await fixture(t), session = seed(f);
+  const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+  const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (...args) => {
+    if (args[1] !== f.statePath) return rename(...args);
+    if (written) rename(...args);
+    throw Object.assign(new Error('PRIVATE_SERVER_PATH'), { code: 'EIO' });
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(adapter.adopt(f.workspace, f.plan, session.id, baseline, 7), error => {
+      assert.equal(error.adoptionState, 'unconfirmed');
+      assert.equal(error.diagnostic.stage, 'state-write');
+      assert.equal(error.diagnostic.errorCode, 'EIO');
+      assert.ok(!error.message.includes('PRIVATE_')); return true;
+    });
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+  assert.equal(existsSync(f.statePath), written);
+  if (written) { assert.equal(f.state().bindings[0].phase, 'PREPARING'); assert.equal(f.state().plans[0].correctionCount, 7); }
+  assert.ok(!existsSync(join(dirname(f.statePath), 'state.lock')));
   assert.ok(f.calls.every(call => call.method === 'GET'));
 });
