@@ -4,6 +4,16 @@ This is the operating contract for the advisor, not an automatic Markdown
 orchestrator. Use the existing helper; do not invoke Improve Codex, install a
 skill or start an executor merely because a plan exists.
 
+This file is the single source for authorization, route, baseline, assignment,
+ownership, waiting, review, corrections, handoff and checkpoints. The helper's
+API, state and error behavior live in [the protocol](../helper/PROTOCOL.md).
+Use its command index and only the technical sections needed for the operation.
+The [runtime check](runtime.md#check-an-installed-helper) is for an unknown
+Node/helper path or connection; package procedures are for assigned packaging
+work. Read [existing-session routing](existing-session.md) only when the user
+explicitly selected an existing recipient, and the assignment template only
+when preparing a packet.
+
 ## Select the canonical files
 
 1. Read the user's execution authorization, project AGENTS.md, the existing
@@ -41,13 +51,22 @@ For non-Git work, record an explicit alternative baseline; never initialize Git
 for the product. Ordinary source inspection and evidence collection are advisor
 work before dispatch; capture enough to detect changes outside assignment.
 
-Reuse the actual current Codex chat's valid pair. Without one, bind a new
-OpenCode session unless the user explicitly selected an existing recipient;
-for that case alone use [existing-session routing](existing-session.md).
+Run the helper's read-only preflight <workspace> <plan> after selecting the
+canonical plan and physical workspace. It checks the actual current Codex chat,
+the saved pair or proposed new-bind route, plan/count/baseline and available live
+state in one result. With no pair it proposes a new OpenCode session unless the
+user explicitly selected an existing recipient; for that case pass the exact ID
+with --session and follow [existing-session routing](existing-session.md).
 Beginning in an already-used Codex chat is supported. Only opencode-go/deepseek-v4.1-flash with the
 existing/default options. No model/billing fallback, automatic chat rotation,
 subagents, new service or global agent configuration. The user creates a new
 Codex chat manually; it does not reset the plan's correction count.
+
+Preflight is read-only and reports pass, blocked and unknown checks plus the
+exact next step. It does not create a recipient, change helper state, test
+writability or send a task. A pass is a snapshot, not authority: bind/adopt and
+submit recheck current state. An explicit exact recipient needs no second
+confirmation.
 
 Use assignment-template.md for the next connected block. Fill all placeholders
 and preserve the canonical plan path; the plan is reference, not permission for
@@ -73,8 +92,15 @@ their exact reply route. Do not use OpenCode to bypass a sandbox/approval rule.
 
 Keep wait in the same active tool turn with bounded host waits and required user
 updates. Token deltas, submit admission, silence, timeout and final text alone
-do not transfer ownership. Errors/limits/uncertain delivery stop; no automatic
-reconnect, resubmit, service restart, model switch or rollback.
+do not transfer ownership. Bootstrap retries only the safe registration/info/model
+GETs described in the [protocol](../helper/PROTOCOL.md#connection). If they
+exhaust before dispatch, PREPARING/FINISHED remain unchanged; active/review phases
+stop with a diagnostic. POST delivery is never retried, and an established SSE
+wait never reconnects. Do not restart services, switch models or roll back.
+Continue the same helper process through host yields; do not relaunch it after
+a yield. A host yield may return to GPT, and quiet chat does not prove zero GPT
+requests. Background hooks do not wake an idle turn; strict event-only wakeup is
+not established.
 
 REVIEWING starts only with completed-for-review from gate 003: identified current
 assignment final, ended bound execution, no pending tool/form/permission and all

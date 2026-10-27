@@ -96,61 +96,124 @@ export function localEndpoint(value) {
   return url.origin;
 }
 
-export async function connect({ registrationPath = resolve(homedir(), '.local/state/opencode/service.json'), fetchImpl = fetch } = {}) {
-  let registration;
-  try { registration = JSON.parse(readFileSync(registrationPath, 'utf8')); } catch { throw new Error('Missing or invalid engine registration'); }
-  requireValue(registration && typeof registration.id === 'string' && registration.id.length > 0 && typeof registration.password === 'string' && registration.password.length > 0, 'Invalid engine registration fields');
-  requireValue(registration.version === '2.1.4', 'Unsupported engine version; revalidate API');
-  const base = localEndpoint(registration.url);
-  const auth = 'Basic ' + Buffer.from('opencode:' + registration.password).toString('base64');
-  async function request(route, body) {
-    requireValue(typeof route === 'string' && route.startsWith('/api/') && !route.startsWith('//'), 'Invalid API route');
-    let response;
-    const startedAt = Date.now(), signal = AbortSignal.timeout(20_000), details = requestDetails(route, body);
-    try {
-      response = await fetchImpl(base + route, {
-        method: body === undefined ? 'GET' : 'POST',
-        headers: { Authorization: auth, 'Content-Type': 'application/json' },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal, redirect: 'error',
-      });
-    } catch (error) {
-      // Never echo response bodies, auth headers or exceptions containing them.
-      throw diagnosticError(body === undefined ? 'Engine read failed' : 'Engine mutation uncertain; do not retry',
-        signal.aborted ? 'request-timeout' : 'request-read', 'request', { ...details, elapsedMs: Date.now() - startedAt }, error);
-    }
-    if (!response.ok) {
-      const errorCode = await apiErrorCode(response);
-      throw diagnosticError(`Engine HTTP ${response.status}` + (body === undefined ? '' : '; mutation uncertain, do not retry'),
-        'request-http', 'request', { ...details, elapsedMs: Date.now() - startedAt, httpStatus: response.status,
-          ...(errorCode ? { errorCode } : {}) });
-    }
-    if (response.status === 204) return undefined;
-    try { return await response.json(); }
-    catch (error) { throw diagnosticError(body === undefined ? 'Invalid engine JSON' : 'Mutation response invalid; do not retry',
-        signal.aborted ? 'request-timeout' : 'request-json', 'request', { ...details, elapsedMs: Date.now() - startedAt }, error); }
-  }
-  const [info, models] = await Promise.all([request('/api/info'), request('/api/model')]);
-  requireValue(info?.version === registration.version && Array.isArray(models?.data), 'Invalid engine info/model response');
-  requireValue(models.data.some(model => model.providerID === MODEL.providerID && model.id === MODEL.id && model.enabled === true && model.status === 'active'), 'Required Go model unavailable; no fallback');
-  return {
-    engineID: registration.id, version: info.version, request,
-    async events(signal) {
-      try {
-        // SSE lifetime belongs to wait, not fetch's implicit body-idle deadline.
-        return await new Promise((resolve, reject) => {
-          const streamRequest = httpRequest(base + '/api/event', {
-            agent: false, signal, headers: { Authorization: auth, Accept: 'text/event-stream' },
-          }, response => {
-            response.setTimeout(0);
-            resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode,
-              headers: new Headers({ 'content-type': response.headers['content-type'] ?? '' }),
-              body: Readable.toWeb(response) });
-          });
-          streamRequest.on('error', reject);
-          streamRequest.end();
-        });
-      } catch (error) { throw diagnosticError('Event connection uncertain', 'event-open', 'handshake', {}, error); }
-    },
+export async function connect({ registrationPath = resolve(homedir(), '.local/state/opencode/service.json'),
+  fetchImpl = fetch, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  const startedAt = now();
+  let attempts = 0, lastError;
+  const finishError = error => {
+    const lastDiagnostic = error?.diagnostic ? validateDiagnostic(error.diagnostic) : diagnose(error, 'unknown', 'connection');
+    return Object.assign(error instanceof Error ? error : new Error('Engine connection failed'), {
+      bootstrap: { attempts, retried: attempts > 1, lastDiagnostic },
+    });
   };
+  const retryable = error => {
+    const diagnostic = error?.diagnostic;
+    return diagnostic && ([502, 503, 504].includes(diagnostic.httpStatus) ||
+      diagnostic.category === 'request-timeout' ||
+      diagnostic.category === 'request-read' &&
+        ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
+          'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(diagnostic.errorCode));
+  };
+  while (attempts < 3) {
+    const remaining = 30_000 - (now() - startedAt);
+    if (remaining <= 0) break;
+    attempts++;
+    try {
+      let registration;
+      try { registration = JSON.parse(readFileSync(registrationPath, 'utf8')); }
+      catch { throw new Error('Missing or invalid engine registration'); }
+      requireValue(registration && typeof registration.id === 'string' && registration.id.length > 0 &&
+        typeof registration.password === 'string' && registration.password.length > 0, 'Invalid engine registration fields');
+      requireValue(registration.version === '2.1.4', 'Unsupported engine version; revalidate API');
+      const base = localEndpoint(registration.url);
+      const auth = 'Basic ' + Buffer.from('opencode:' + registration.password).toString('base64');
+      async function request(route, body, parentSignal, timeoutMs = 20_000) {
+        requireValue(typeof route === 'string' && route.startsWith('/api/') && !route.startsWith('//'), 'Invalid API route');
+        const details = requestDetails(route, body), requestStarted = now();
+        const controller = new AbortController();
+        let timedOut = false;
+        const abortFromParent = () => controller.abort(parentSignal.reason);
+        parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+        const timer = setTimer(() => {
+          timedOut = true;
+          controller.abort(new DOMException('Request timed out', 'TimeoutError'));
+        }, timeoutMs);
+        try {
+          const response = await fetchImpl(base + route, {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { Authorization: auth, 'Content-Type': 'application/json' },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            signal: controller.signal, redirect: 'error',
+          });
+          if (!response.ok) {
+            const errorCode = await apiErrorCode(response);
+            if (response.status !== 400) await response.body?.cancel().catch(() => {});
+            throw diagnosticError('Engine HTTP ' + response.status + (body === undefined ? '' : '; mutation uncertain, do not retry'),
+              'request-http', 'request', { ...details, elapsedMs: Math.max(0, now() - requestStarted), httpStatus: response.status,
+                ...(errorCode ? { errorCode } : {}) });
+          }
+          if (response.status === 204) return undefined;
+          try { return await response.json(); }
+          catch (error) {
+            throw diagnosticError(body === undefined ? 'Invalid engine JSON' : 'Mutation response invalid; do not retry',
+              timedOut ? 'request-timeout' : 'request-json', 'request',
+              { ...details, elapsedMs: Math.max(0, now() - requestStarted) }, error);
+          }
+        } catch (error) {
+          if (error?.diagnostic) throw error;
+          throw diagnosticError(body === undefined ? 'Engine read failed' : 'Engine mutation uncertain; do not retry',
+            timedOut ? 'request-timeout' : 'request-read', 'request',
+            { ...details, elapsedMs: Math.max(0, now() - requestStarted) }, error);
+        } finally {
+          clearTimer(timer);
+          parentSignal?.removeEventListener('abort', abortFromParent);
+        }
+      }
+      const attemptController = new AbortController();
+      const requestTimeout = Math.max(1, Math.min(20_000, 30_000 - (now() - startedAt)));
+      const bootstrapRequests = [
+        request('/api/info', undefined, attemptController.signal, requestTimeout),
+        request('/api/model', undefined, attemptController.signal, requestTimeout),
+      ];
+      let info, models;
+      try { [info, models] = await Promise.all(bootstrapRequests); }
+      catch (error) {
+        attemptController.abort();
+        await Promise.allSettled(bootstrapRequests);
+        throw error;
+      }
+      requireValue(info?.version === registration.version && Array.isArray(models?.data), 'Invalid engine info/model response');
+      requireValue(models.data.some(model => model.providerID === MODEL.providerID && model.id === MODEL.id &&
+        model.enabled === true && model.status === 'active'), 'Required Go model unavailable; no fallback');
+      const bootstrap = { attempts, retried: attempts > 1 };
+      return {
+        engineID: registration.id, version: info.version, request, bootstrap,
+        async events(signal) {
+          try {
+            // SSE lifetime belongs to wait, not fetch's implicit body-idle deadline.
+            return await new Promise((resolve, reject) => {
+              const streamRequest = httpRequest(base + '/api/event', {
+                agent: false, signal, headers: { Authorization: auth, Accept: 'text/event-stream' },
+              }, response => {
+                response.setTimeout(0);
+                resolve({ ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode,
+                  headers: new Headers({ 'content-type': response.headers['content-type'] ?? '' }),
+                  body: Readable.toWeb(response) });
+              });
+              streamRequest.on('error', reject);
+              streamRequest.end();
+            });
+          } catch (error) { throw diagnosticError('Event connection uncertain', 'event-open', 'handshake', {}, error); }
+        },
+      };
+    } catch (error) {
+      lastError = error;
+      if (!retryable(error) || attempts >= 3) throw finishError(error);
+      const delay = attempts === 1 ? 500 : 1_000;
+      if (30_000 - (now() - startedAt) <= delay) throw finishError(error);
+      await sleep(delay);
+    }
+  }
+  throw finishError(lastError ?? new Error('Engine connection budget exhausted'));
 }

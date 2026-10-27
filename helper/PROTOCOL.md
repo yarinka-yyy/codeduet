@@ -1,5 +1,17 @@
 # Helper — connection, binding, interaction, inspection and review
 
+## Command reference
+
+Use only the operation sections needed: [connection](#connection),
+[binding and reuse](#binding-and-reuse),
+[preflight](#preflight),
+[explicit adoption](#explicit-existing-session-adoption),
+[submit intent](#submit-intent), [wait](#wait), [reply](#reply),
+[completion](#completion), [inspection](#inspect-and-sessions) and
+[plan transitions](#plan-review-transitions). Read
+[diagnostics](#diagnostics) when interpreting a failure. Existing-session
+discovery/adoption is conditional on the user's explicit recipient selection.
+
 Node 24, built-in APIs only. The packaged skill still needs full live acceptance. All
 commands emit one JSON outcome; STOPPED outcomes exit nonzero. The specific
 kind distinguishes executor failure, interruption and connection uncertainty.
@@ -9,6 +21,7 @@ kind distinguishes executor failure, interruption and connection uncertainty.
 node helper/cli.mjs inspect
 node helper/cli.mjs inspect <absolute-workspace>
 node helper/cli.mjs sessions <absolute-workspace> [--cursor <cursor>]
+node helper/cli.mjs preflight <absolute-workspace> <absolute-plan.md> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>]
 node helper/cli.mjs adopt <absolute-workspace> <absolute-plan.md> <exact-session-id> [--correction-count <0..20>]
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-count <0..20>
@@ -24,10 +37,14 @@ Workspace, plan and packet arguments are passed as data; no shell interpolation
 is used. Quote paths containing spaces/`&` when invoking the CLI. Plan and packet
 must resolve to regular files inside the selected physical workspace. The
 actual `CODEX_THREAD_ID` is required; there is no CLI override for chat identity.
-Read-only inspect and sessions are exceptions: inspect reports binding unknown
-without that variable; sessions returns directory-scoped candidates only.
+Read-only inspect, sessions and preflight are exceptions: inspect reports binding
+unknown without that variable; sessions returns directory-scoped candidates only.
+Preflight uses the real current chat ID when available and never accepts an ID
+that substitutes for it.
 This helper sends packet contents only after an authorized caller chooses them;
 it does not infer execution authorization from the mere existence of a plan.
+
+## Connection
 
 The shared `connection.mjs` also serves the original transport probe. It reads
 the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
@@ -42,6 +59,15 @@ a dedicated node:http connection and a web-readable body; it does not inherit
 fetch/Undici's body-idle timeout. The wait owns its handshake/total lifetime.
 No SSE redirects, automatic reconnects or extra dependency are introduced.
 
+Bootstrap retries are limited to registration plus parallel GET `/api/info` and
+`/api/model`: at most three attempts total, with 500/1000 ms delays and a
+30-second budget. The 20-second request timeout is clipped to that budget.
+Only explicit timeout/reset/refused transport codes and HTTP 502/503/504 retry;
+each attempt rereads registration. Access, malformed registration, 400/401/403/
+429, schema/version/model/identity errors and unknown transport errors are
+single-attempt failures. A failed parallel GET aborts its sibling. These retries
+never replay create/prompt/reply POSTs and do not reconnect SSE.
+
 ## Identity and persistence
 
 One technical file: `~/.local/state/code-duet/state.json`, schema 1. It stores
@@ -53,10 +79,23 @@ Existing counter values are validated and preserved. The advisor imports an
 established count when first adopting a plan; conflicting imports stop without
 overwriting saved history. Count policy and operating contract are below.
 
-Writes use a same-directory temporary file and atomic rename. A cooperative
-`state.lock` serializes helper operations and is removed only by its owner.
-A stale lock/corrupt file stops work; it is never automatically replaced or
-unlocked. This does not lock the OS or prevent user edits to the project.
+Writes use a same-directory temporary file and atomic rename. The global
+`state.lock` covers only synchronous store reload, validation and atomic update;
+it never covers HTTP or SSE. Acquisition gets at most 7 exclusive-open attempts
+under a 120 ms monotonic deadline, with nominal 1 ms waits between attempts, and only
+retries `EEXIST` while acquiring this short lock. A persistent or crash-left lock
+remains untouched and fails busy. Access and other filesystem errors are
+single-attempt failures.
+This does not lock the OS or prevent user edits to the project.
+
+Long operations hold a separate per-checkout ownership lease. The lease prevents
+a second observer/writer on the same binding or an overlapping checkout while
+unrelated workspaces can proceed. It is released only by its owner after the
+operation; a crash or unknown owner leaves it in place for explicit inspection.
+Every post-network save reloads the store under `state.lock` and validates the
+saved chat/session/assignment/message/phase before applying only its own change,
+so another workspace's binding and counter are retained. Schema-1 bindings and
+counters remain readable.
 
 Lock acquisition fails before reading/changing state or any engine mutation.
 Only EEXIST from exclusive lock creation means state-locked. Access failures
@@ -66,7 +105,9 @@ state-lock and an allowlisted errorCode, never raw paths, exception text or
 credentials. An unknown code is omitted rather than echoed. These are local
 stopped outcomes, not a replacement/reset of a saved STOPPED/uncertain binding.
 A later stateLocked=false snapshot proves neither past lock ownership nor
-current writability. No automatic retry, unlock or alternate store is introduced.
+current writability. No command/network retry, automatic unlock or alternate
+store is introduced; the bounded state-lock acquisition above does not repeat an
+operation.
 See [runtime](../references/runtime.md) for host-approved access to the same shared store.
 
 Git root discovery is read-only (`git rev-parse --show-toplevel`). Different
@@ -75,6 +116,8 @@ replacement. For a non-Git project add `--non-git-baseline <declaration>` to
 bind/submit: that exact, explicit baseline declaration must already occur in
 the selected plan. The advisor owns its correctness and acceptance; the helper
 does not initialize Git or treat declaration text as proof of file contents.
+
+### Binding and reuse
 
 First bind creates a new OpenCode session at the physical workspace. Explicit
 existing-recipient selection instead uses adopt; see the conditional
@@ -92,7 +135,7 @@ and all active session directory metadata. An active session anywhere within
 the same Git checkout (including sibling subdirectories) blocks another writer;
 unrelated projects are not touched. It reads their directory metadata only.
 
-### Explicit existing-session adoption
+## Explicit existing-session adoption
 
 sessions reads one page (limit 50) for the physical directory, returning bounded
 ID/title/model metadata, nextCursor and exhausted. A truncated title is marked;
@@ -134,11 +177,17 @@ until the final binding save is attempted; afterwards it is unconfirmed.
 Both report adoption.engineMutation none: adoption never sends to the executor.
 This refers to this call's binding JSON, not directory/lock creation or a
 promise that other writers are idle. Inspect unconfirmed persistence before
-any explicit continuation; no retry/reset is automatic. Earlier CLI connection
-failure still follows connectionLost and may persist STOPPED on a prior binding.
+any explicit continuation; no retry/reset is automatic. Exhausted bootstrap
+failure leaves PREPARING/FINISHED unchanged, stops an active/review assignment
+with its diagnostic, and never overwrites an existing STOPPED diagnostic.
+If releasing the operation lease fails after the checks, the result keeps the
+same adoption annotation: a new binding is unconfirmed, while reuse is
+unchanged. The separate `ownershipReleaseFailure` does not replace the operation
+outcome, and the lease remains for explicit inspection.
 
-The cooperative lock encloses the checks and atomic local save; identity,
-execution and latest message are reconfirmed. No OpenCode create/prompt/rename
+The short store lock encloses checks and atomic local saves; the ownership lease
+spans the network checks. Identity, execution and latest message are reconfirmed.
+No OpenCode create/prompt/rename
 or model/config mutation occurs. A different/STOPPED/uncertain current pair or
 another chat's binding to the selected session cannot be replaced. Repeating
 the same valid prepared/finished adoption returns reused without rewriting it.
@@ -158,16 +207,24 @@ Count reservation, STOP, next/finish and completion policy are shared unchanged.
 The remaining check-to-POST race against manual OpenCode actions is outside the
 cooperative lock guarantee; there is no engine-wide session reservation.
 
+### Submit intent
+
 Create/submit intent is persisted as `STOPPED` with an uncertainty marker
 **before** HTTP mutation. A lost response, crash, invalid ID or failed state
 write cannot silently allow a duplicate. Only a confirmed response advances to
 `PREPARING` (bind) or `EXECUTING` (submit). No automatic retries or recovery.
+If the intent write was attempted but cannot be confirmed, the result is
+`unconfirmed` and no POST is sent. If a POST succeeds but its final state save
+fails, the result stays STOPPED/unconfirmed with the reserved IDs/count; later
+calls cannot resend it.
 An idle engine alone cannot authorize another submit: a recorded assignment
 remains `EXECUTING` until the later completion/review gate accepts it.
 
-## Waiting, replies and completion
+## Wait
 
-`wait` holds the cooperative state lock and subscribes to the bound session.
+`wait` holds the per-checkout ownership lease and subscribes to the bound
+session. It holds the global state lock only for short reload/check/save steps;
+SSE and ordinary reconciliation requests run without it.
 It returns one compact outcome: `question`, `permission`, `completed-for-review`,
 `failed`, `interrupted`, `connection-uncertain`, or an already persisted `stopped`.
 Token deltas and foreign events do not return to the advisor. Events wake
@@ -185,17 +242,30 @@ bounded host waits. The helper emits no heartbeat/token/tool progress output.
 A host yield does not reconnect or send another DeepSeek prompt; it may still
 return control to GPT. Do not add advisor history reads or narrate progress.
 A received stream gap stops coordination without reconnect/resubmit.
-CLI connection/discovery failure between calls also persists STOPPED for the
-current chat binding. Library callers use connectionLost(error) on discovery failure;
-that state-only operation never calls the engine or releases project ownership.
+Exhausted CLI bootstrap between calls leaves PREPARING/FINISHED byte-for-byte
+unchanged. In EXECUTING, WAITING_FOR_ANSWER or REVIEWING it records STOPPED with
+the connection diagnostic; an existing STOPPED binding remains sticky. Library
+callers use `connectionLost(error)` for the same state-only transition; it never
+sends a mutation or releases a persisted uncertainty marker.
 
-### Sanitized diagnostics
+## Diagnostics
 
 A failed wait includes diagnostic alongside its existing kind/phase/error,
 executorStopped false and retried false. The same optional diagnostic is saved
 on its schema-1 STOPPED binding and appears on later stopped outcomes/inspection.
 Older schema-1 records without it remain valid; invalid/extra diagnostic fields
 are rejected rather than silently copied.
+
+Outcomes report `stateChange` as `saved`, `unchanged` or `unconfirmed`. Bootstrap
+failures include bounded attempt count and the last validated typed diagnostic.
+If a STOPPED diagnostic cannot be saved, the result keeps the original operation
+diagnostic and reports a separate `persistenceFailure`; it never claims `saved`.
+An operation-lease release failure is reported separately as
+`ownershipReleaseFailure`; it does not replace an earlier operation result or
+diagnostic. For a completed operation it produces a stopped outcome while
+retaining the known state-change result. The lease is never auto-cleared.
+Pre-intent local rejections preserve the current phase, pending request and
+counter. A correction-limit result at 20 is unchanged and sends no prompt.
 
 Fields: category, stage, elapsedMs, lastEvent (null or timestamp at plus a
 bounded event type). Optional httpStatus/errorName/errorCode use explicit
@@ -215,7 +285,46 @@ A transport code identifies an observation, not the root cause of an old failure
 Later discovery failures do not overwrite an already STOPPED binding's first
 diagnostic/stop reason.
 
-### Read-only inspection
+## Preflight
+
+preflight <workspace> <plan> [--session <exact-id>] [--correction-count N]
+[--non-git-baseline <declaration>] is the ordinary read-only gate after the
+advisor has selected a canonical plan and physical workspace. Without an
+explicit session it checks the current chat's saved pair or proposes new-bind.
+--session is only for an exact existing recipient the user selected; it checks
+that candidate before adoption and needs no additional confirmation. If the ID
+already matches this chat's saved pair, preflight validates the saved physical
+workspace/plan identity and uses the supported reuse or released plan-switch
+route; it does not recommend adopting that binding again. A selected ID cannot
+authorize adoption into a different physical workspace/plan or transfer
+ownership. Preflight never
+searches titles or selects a session.
+
+It returns one JSON result with connection/bootstrap attempts, proposed route,
+physical workspace/plan, effective count and checks marked pass, blocked or
+unknown. It collects independent blockers; checks that depend on an unavailable
+connection or uncreated recipient remain unknown. The result includes blockers,
+an exact next step, a structured nextCommand with command/argument values when a
+safe bind/adopt step is ready, taskSent: false, snapshotOnly: true and
+stateChange: unchanged. The helper does not claim that every possible issue was
+found.
+
+Per-check API/IO failures retain only validated bounded diagnostics. A permanent
+HTTP 4xx includes the checked operation, method, page and allowlisted error code;
+preflight blocks the unchanged request and tells the user to correct it before
+rerunning, rather than encouraging a retry loop.
+
+Preflight performs only reads and engine GETs. It does not mkdir, acquire or
+release locks, save/repair state, probe writability or send POSTs, even when
+offline or invalid state is observed. Store write access remains unknown until an
+authorized write command; use normal host approval if the existing store is
+outside writable roots. A pass is not an adoption token or dispatch permission:
+adopt and submit repeat their own fresh identity, history, execution and
+ownership checks. Inspect remains a read-only diagnostic when a plan is not
+ready or after an error; do not require it redundantly when preflight covers the
+ordinary route.
+
+## Inspect and sessions
 
 inspect [absolute-workspace] reports connection/version/required model, binding
 for the actual current Codex chat, and a live snapshot of that exact session
@@ -231,12 +340,16 @@ remain unobserved. Blockers are advisory; snapshotOnly never grants ownership
 or replaces assignment correlation/completion before review.
 
 This path reads the existing store without mkdir, lock acquisition, cleanup
-or save. An active wait's lock is only reported. A failed engine connection
+or save. `stateLocked` reports only a current short store transaction;
+`ownershipLocked` reports a retained per-checkout lease, including an active wait.
+A failed engine connection
 retains readable saved binding/diagnostic while marking live state unverified;
 inspect exits nonzero for an unavailable engine or invalid snapshot. A valid
 snapshot of a STOPPED binding can succeed, but cannot clear STOPPED/uncertainty,
 retry delivery, resume events or authorize implementation. Use it after an
 error only when the user requests that read-only diagnosis.
+
+## Reply
 
 Questions preserve the full form, keys, values, descriptions, custom allowance
 and single/multiselect rules. The answer file contains, for example,
@@ -258,6 +371,11 @@ Reply intent is persisted STOPPED/uncertain before POST, just as create/submit.
 A lost reply response cannot authorize a duplicate. State stores only request
 kind/ID/fingerprint, not a form transcript or answer. STOPPED persists across
 late successful idle observations; explicit recovery belongs to later work.
+If the reply POST succeeds but its final state write fails, the result is
+STOPPED/unconfirmed and retains the pending request; a later call cannot resend
+the reply. This also applies to permission rejection finalization.
+
+## Completion
 
 `completed-for-review` means REVIEWING, not accepted/FINISHED. It requires:
 the current identified prompt with no later user prompt; the fixed model;
@@ -298,8 +416,9 @@ Only corrective submission increments the count. Reservation is atomic with
 STOPPED/uncertain submit intent immediately before its one POST; local invalid
 arguments, preparing a task, questions/replies and independent checks spend no
 cycle. Uncertain delivery retains the one possible cycle; no automatic refund
-or resubmit. At 20, review is still allowed; a further correction produces
-correction-limit / STOPPED before any prompt. Do not disguise fixes as a block.
+or resubmit. At 20, review is still allowed; a further correction produces an
+unchanged `correction-limit` result before intent or prompt. Do not disguise
+fixes as a block.
 
 finish rechecks ended execution and releases this adapter assignment as
 FINISHED; it sends no engine prompt and changes no plan/index. The advisor may

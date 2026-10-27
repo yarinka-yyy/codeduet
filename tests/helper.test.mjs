@@ -119,7 +119,10 @@ test('an unrelated active project does not redirect or block the bound no-op ass
   const prompt = mutations(client).at(-1); assert.equal(prompt.route, `/api/session/${pair.sessionID}/prompt`);
   assert.ok(prompt.body.text.includes(f.plan.replaceAll('\\', '\\\\')) || prompt.body.text.includes(f.plan));
   assert.equal(stored(f).bindings[0].messageID, result.messageID);
-  await assert.rejects(submit(a, f), /Previous assignment/);
+  const beforeReject = stored(f);
+  const rejected = await submit(a, f);
+  assert.equal(rejected.kind, 'rejected'); assert.equal(rejected.phase, 'EXECUTING');
+  assert.equal(rejected.stateChange, 'unchanged'); assert.deepEqual(stored(f), beforeReject);
 });
 
 test('uncertain or mismatched submit is retained before POST and never retried', async t => {

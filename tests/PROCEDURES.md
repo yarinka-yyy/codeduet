@@ -51,6 +51,33 @@ These checks supplement the helper/workflow regressions; they do not prove
 live skill invocation, model implementation/correction, Desktop behavior or
 user-created chat pairing. Those remain manual acceptance with the owner.
 
+## Plan 012 concurrency, bootstrap and diagnostics
+
+tests/concurrency.test.mjs starts separate helper child processes against one
+temporary store and the disposable local HTTP/SSE fixture. It covers an active
+wait interleaved with an unrelated workspace's bind/adopt/submit/wait, concurrent
+correction counters, same-binding wait/submit exclusion, overlapping nested
+Git/non-Git paths, and crash-retained submit intent/ownership leases. No real
+registration, store or OpenCode conversation is used.
+
+tests/retry.test.mjs injects controlled clocks, timers and transport results to
+check the three-attempt/30-second bootstrap budget, explicit retry allowlist,
+registration refresh, sibling cancellation and cleanup. tests/diagnostics.test.mjs
+uses the local fixture to check PREPARING/FINISHED preservation, active STOPPED
+behavior, HTTP 400 metadata through next/finish/reply and primary diagnostics
+when the STOPPED save fails. These checks do not exercise live engine reliability.
+
+tests/preflight.test.mjs runs the actual CLI against disposable HTTP/SSE fixtures.
+It checks combined baseline/count/recipient blockers, repeat-run immutability,
+new/reused/explicit routes, offline-to-online recovery, invalid history, pending
+forms, background work, old STOPPED state, post-preflight races, rename identity,
+finished-pair plan switches, explicit saved-pair identity conflicts, external
+history boundary changes, typed HTTP/IO diagnostics, capability-limited
+read-only/denied-write access, and a two-project question/reply/correction/finish
+cycle. Every preflight request is GET-only and asserts that task POST count,
+saved bytes and protected files stay unchanged. No real registration, helper
+store, OpenCode chat or model call is used.
+
 ## Plan 007 diagnostics and quiet waiting
 
 tests/http-fixture.mjs is shared disposable CLI/HTTP/SSE infrastructure for

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -89,6 +89,46 @@ test('native adoption preserves existing history/title/model and is idempotent w
   assert.equal(inspected.result.session.model.variant, 'default');
 });
 
+for (const existing of [false, true]) test('adoption ' + (existing ? 'reuse' : 'save') + ' keeps state annotation when owner lease release fails', async t => {
+  const f = await fixture(t), session = seed(f), chat = 'offline-adopt-release-' + existing;
+  const client = await connect({ registrationPath: join(f.home, '.local', 'state', 'opencode', 'service.json') });
+  const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: chat });
+  if (existing) {
+    const first = await adapter.adopt(f.workspace, f.plan, session.id, baseline, 7);
+    assert.equal(first.kind, 'adopted');
+  }
+  const before = existing ? readFileSync(f.statePath) : null;
+  const ownerRoot = join(dirname(f.statePath), 'ownership'), originalUnlink = fs.unlinkSync;
+  t.mock.method(fs, 'unlinkSync', function (path, ...rest) {
+    if (String(path).startsWith(ownerRoot + sep)) throw Object.assign(new Error('PRIVATE_RELEASE_CANARY'), { code: 'EPERM' });
+    return originalUnlink(path, ...rest);
+  });
+  syncBuiltinESMExports();
+  let outcome;
+  try { outcome = await adapter.adopt(f.workspace, f.plan, session.id, baseline, 7); }
+  finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+  assert.equal(outcome.kind, 'stopped');
+  assert.equal(outcome.stateChange, existing ? 'unchanged' : 'saved');
+  assert.deepEqual(outcome.adoption, { bindingState: existing ? 'unchanged' : 'unconfirmed', engineMutation: 'none' });
+  assert.equal(outcome.ownershipReleaseFailure.category, 'state-access');
+  assert.equal(outcome.ownershipReleaseFailure.errorCode, 'EPERM');
+  assert.ok(!JSON.stringify(outcome).includes('PRIVATE_RELEASE_CANARY'));
+  assert.ok(readdirSync(ownerRoot).length > 0);
+  if (existing) assert.deepEqual(readFileSync(f.statePath), before);
+  else {
+    assert.equal(f.state().bindings[0].phase, 'PREPARING');
+    assert.equal(f.state().plans[0].correctionCount, 7);
+  }
+  const saved = readFileSync(f.statePath);
+  await assert.rejects(adapter.adopt(f.workspace, f.plan, session.id, baseline, 7), error => {
+    assert.equal(error.adoptionState, 'unchanged');
+    assert.equal(error.diagnostic.category, 'state-locked'); return true;
+  });
+  assert.deepEqual(readFileSync(f.statePath), saved);
+  assert.ok(f.calls.every(call => call.method === 'GET'));
+  assert.equal(f.calls.some(call => call.method === 'POST'), false);
+});
+
 test('long native history with prior synthetic input and post-final compaction adopts without POST or transcript storage', async t => {
   const f = await fixture(t), session = seed(f), ended = session.time.idle;
   session.model.variant = 'high';
@@ -152,8 +192,8 @@ test('adoption refuses missing/invalid/conflicting correction counts without inv
 
 const unsafe = {
   running: (f, s) => { f.active[s.id] = { type: 'running' }; },
-  form: f => { f.forms = [{ id: 'frm_old' }]; },
-  permission: f => { f.permissions = [{ id: 'per_old' }]; },
+  form: (f, s) => { f.forms = [{ id: 'frm_old', sessionID: s.id }]; },
+  permission: (f, s) => { f.permissions = [{ id: 'per_old', sessionID: s.id }]; },
   shell: f => { f.shells = [{ status: 'running' }]; },
   unknownShell: f => { f.shells = [{ status: 'unknown' }]; },
   model: (f, s) => { s.model.providerID = 'opencode'; },
@@ -279,8 +319,11 @@ test('an uncertain adopted correction spends cycle 20 exactly once and cannot be
 
 test('an adopted plan already at 20 refuses corrective submission without a 21st prompt', async t => {
   const f = await fixture(t); seed(f); await f.call(adoptArgs(f, 'ses_existing', 20));
+  const before = readFileSync(f.statePath);
   const stopped = await f.call(submitArgs(f));
-  assert.equal(stopped.result.kind, 'correction-limit'); assert.equal(stopped.result.correctionCount, 20);
+  assert.equal(stopped.result.kind, 'correction-limit'); assert.equal(stopped.result.phase, 'PREPARING');
+  assert.equal(stopped.result.stateChange, 'unchanged'); assert.equal(stopped.result.correctionCount, 20);
+  assert.deepEqual(readFileSync(f.statePath), before);
   assert.ok(f.calls.every(call => call.method === 'GET'));
 });
 
@@ -310,7 +353,7 @@ test('truncated discovery titles are marked and invalid exact IDs never reach th
 test('a request that appears during adopted-submit validation prevents dispatch and count reservation', async t => {
   const f = await fixture(t); seed(f); await f.call(adoptArgs(f));
   const before = readFileSync(f.statePath);
-  f.onRequest = route => { if (route.includes('/message?limit=1&')) f.permissions = [{ id: 'per_racing' }]; };
+  f.onRequest = route => { if (route.includes('/message?limit=1&')) f.permissions = [{ id: 'per_racing', sessionID: 'ses_existing' }]; };
   assert.equal((await f.call(submitArgs(f))).status, 1);
   assert.deepEqual(readFileSync(f.statePath), before);
   assert.ok(f.calls.every(call => call.method === 'GET'));

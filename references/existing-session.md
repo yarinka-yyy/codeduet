@@ -16,7 +16,13 @@ The age of the current Codex chat does not select a route. Use its actual ID.
   candidates, never a selection. Keep directory identity separate from titles.
 
 Use the [helper protocol](../helper/PROTOCOL.md) for exact commands. With a
-selected ID, adopt that ID directly. With an explicit title, use sessions for
+selected ID, run preflight with --session <exact-id> and follow its proposed
+route; the user's explicit choice needs no second confirmation. Adopt only
+when preflight reports adopt-existing. If the selected ID already matches
+this chat's saved pair, preflight validates its physical workspace/plan and
+reports the supported reuse route, including bind for a released plan switch.
+A saved ID cannot authorize adoption in another workspace or plan. With an
+explicit title, use sessions for
 the physical workspace, matching an exact untruncated title across pages.
 Continue with --cursor while nextCursor is present; retain the directory on
 every request. A short page can still have a position cursor. Stop on repeated
@@ -31,6 +37,8 @@ Recover this plan's actual correction count from its saved record and accepted
 checkpoint/history. Import with --correction-count N if no record exists;
 unknown is not zero. Zero needs a genuinely new plan or established zero count.
 A disagreement stops before dispatch. Do not sum unrelated messages/plans.
+Preflight can check an exact candidate while the current Codex chat is unbound;
+it never chooses from the session list or saves an adoption.
 
 adopt <workspace> <plan> <session-id> [--correction-count N] uses the same
 physical directory/checkout, engine, fixed model and local store as bind.

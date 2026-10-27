@@ -36,6 +36,7 @@ test('native CLI with imported count 20 stops before a correction POST and prese
   const f = await fixture(t); assert.equal((await f.call(f.bindArgs(20))).status, 0);
   const result = await f.call(f.submitArgs);
   assert.equal(result.status, 1); assert.equal(result.result.kind, 'correction-limit');
-  assert.equal(result.result.phase, 'STOPPED'); assert.equal(f.state().plans[0].correctionCount, 20);
+  assert.equal(result.result.phase, 'PREPARING'); assert.equal(result.result.stateChange, 'unchanged');
+  assert.equal(f.state().bindings[0].phase, 'PREPARING'); assert.equal(f.state().plans[0].correctionCount, 20);
   assert.ok(!f.calls.some(call => call.route.endsWith('/prompt')));
 });

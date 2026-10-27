@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { helper } from '../helper/binding.mjs';
 import { diagnose } from '../helper/connection.mjs';
-import { fixture } from './http-fixture.mjs';
+import { baseline, fixture } from './http-fixture.mjs';
 
 function store(t) {
   const parent = fs.realpathSync(tmpdir()), root = fs.mkdtempSync(join(parent, 'duet-lock-'));
@@ -40,7 +40,7 @@ test('native EEXIST preserves a foreign lock and state without engine access', a
 
 for (const stage of ['state-directory', 'state-lock']) {
   for (const code of ['EACCES', 'EPERM', 'EROFS', 'ERR_ACCESS_DENIED', 'ENOSPC', 'ENOTDIR', 'EEXIST', 'PRIVATE_PATH_CANARY']) {
-    test(stage + ' classifies ' + code + ' without leaks, unlock, mutation or retry', async t => {
+    test(stage + ' classifies ' + code + ' without leaks or state mutation', async t => {
       const f = store(t), method = stage === 'state-directory' ? 'mkdirSync' : 'openSync';
       const original = fs[method]; let attempts = 0;
       t.mock.method(fs, method, function (path, ...args) {
@@ -51,6 +51,7 @@ for (const stage of ['state-directory', 'state-lock']) {
         return original(path, ...args);
       });
       syncBuiltinESMExports();
+      const startedAt = Date.now();
       try {
         await assert.rejects(f.adapter.adopt('unused', 'unused', 'ses_unused'), error => {
           const conflict = stage === 'state-lock' && code === 'EEXIST';
@@ -66,7 +67,10 @@ for (const stage of ['state-directory', 'state-lock']) {
           return true;
         });
       } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
-      assert.equal(attempts, 1); assert.equal(f.calls.length, 0);
+      if (stage === 'state-lock' && code === 'EEXIST') {
+        assert.ok(attempts > 1 && attempts <= 7); assert.ok(Date.now() - startedAt < 120);
+      } else assert.equal(attempts, 1);
+      assert.equal(f.calls.length, 0);
       assert.equal(fs.readFileSync(f.statePath, 'utf8'), f.original);
       assert.ok(!fs.existsSync(f.lockPath));
     });
@@ -83,7 +87,7 @@ async function deniedCLI(f, args) {
       });
   assert.equal(result.stdout, '');
   const outcome = JSON.parse(result.stderr.trim());
-  assert.equal(outcome.kind, 'stopped'); assert.equal(outcome.retried, false);
+  assert.equal(outcome.kind, 'stopped', JSON.stringify(outcome)); assert.equal(outcome.retried, false);
   assert.equal(outcome.diagnostic.category, 'state-access');
   assert.equal(outcome.diagnostic.errorCode, 'ERR_ACCESS_DENIED');
   assert.ok(!result.stderr.includes(f.home));
@@ -94,7 +98,7 @@ test('native CLI access denial during adoption has a diagnostic, no binding and 
   const f = await fixture(t);
   fs.mkdirSync(dirname(f.statePath), { recursive: true });
   const before = fs.readdirSync(dirname(f.statePath));
-  await deniedCLI(f, ['adopt', f.workspace, f.plan, 'ses_unused', '--correction-count', '0']);
+  await deniedCLI(f, ['adopt', f.workspace, f.plan, 'ses_unused', '--correction-count', '0', '--non-git-baseline', baseline]);
   assert.deepEqual(fs.readdirSync(dirname(f.statePath)), before);
   assert.ok(!fs.existsSync(f.statePath));
   assert.ok(f.calls.length >= 2 && f.calls.every(call => call.method === 'GET'));

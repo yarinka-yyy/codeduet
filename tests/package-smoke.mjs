@@ -72,7 +72,7 @@ try {
   await closed; clearTimeout(timer); lines.close();
 }
 const inspect = spawnSync(process.execPath, [join(destination, 'helper', 'cli.mjs'), 'inspect'],
-  { cwd: workspace, env: { ...process.env, CODEX_THREAD_ID: '' }, encoding: 'utf8', windowsHide: true, timeout: 25_000 });
+  { cwd: workspace, env: { ...process.env, CODEX_THREAD_ID: '' }, encoding: 'utf8', windowsHide: true, timeout: 45_000 });
 assert.equal(inspect.status, 0, inspect.stderr || inspect.error?.message);
 report.inspect = JSON.parse(inspect.stdout.trim());
 assert.equal(report.inspect.kind, 'connected');

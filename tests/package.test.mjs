@@ -14,6 +14,17 @@ function fixture(t) {
   return { root, destination: join(parent, 'code-duet') };
 }
 
+function markdownAnchors(content) {
+  const counts = new Map(), anchors = [];
+  for (const [, heading] of content.matchAll(/^#{1,6}\s+(.+?)\s*#*\s*$/gm)) {
+    const base = heading.toLowerCase().replace(/[^a-z0-9 _-]/g, '').trim()
+      .replace(/\s+/g, '-').replace(/-+/g, '-');
+    const count = counts.get(base) ?? 0; counts.set(base, count + 1);
+    anchors.push(count ? base + '-' + count : base);
+  }
+  return anchors;
+}
+
 test('portable copy contains only allowed files and all local Markdown links resolve inside it', t => {
   const f = fixture(t); assert.equal(packageSkill(f.destination).kind, 'packaged');
   const copied = readdirSync(f.destination, { recursive: true, withFileTypes: true })
@@ -24,10 +35,15 @@ test('portable copy contains only allowed files and all local Markdown links res
     const content = readFileSync(join(f.destination, file), 'utf8');
     for (const [, target] of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
       if (/^https?:/.test(target)) continue;
-      const resolved = resolve(f.destination, file, '..', target);
+      const [fileTarget, fragment] = target.split('#', 2);
+      const resolved = fileTarget ? resolve(f.destination, file, '..', fileTarget) : join(f.destination, file);
       const rel = relative(f.destination, resolved);
       assert.ok(!isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep), target);
       assert.ok(existsSync(resolved), file + ': ' + target);
+      if (fragment !== undefined) {
+        const referenced = readFileSync(resolved, 'utf8');
+        assert.ok(markdownAnchors(referenced).includes(decodeURIComponent(fragment)), file + ': missing anchor ' + target);
+      }
     }
   }
 });

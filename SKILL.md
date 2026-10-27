@@ -5,75 +5,48 @@ description: Coordinate authorized implementation through DeepSeek in the local 
 
 # Code Duet
 
-Act as the advisor; DeepSeek is the sole implementation executor. Investigate,
-prepare shared plans/assignments, answer scoped questions and independently
-review actual changes. Return source corrections to DeepSeek rather than
-implementing them yourself. Do not create subagents or invoke Improve Codex.
+Use this route only after an explicit $code-duet invocation. The invocation
+selects a route; it does not authorize an old plan, installation or publication.
+Codex is the advisor and DeepSeek is the sole implementation executor. Do not
+invoke Improve Codex or create Codex subagents; keep OpenCode/DeepSeek as the
+sole implementation executor.
 
-Use this route only after an explicit `$code-duet` invocation. Discovery or
-loading instructions starts no work. The invocation selects a route, not
-permission to execute an old plan, install software or publish a project.
+## Choose the route
 
-## Prepare
+Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
+pair, bind a new OpenCode session in the selected workspace unless the user
+explicitly selected an existing recipient; only then read
+[existing-session routing](references/existing-session.md). Late entry in an
+already-used Codex chat is supported. The user creates fresh Codex chats
+manually; never spoof identity, rotate chats or reset a plan count.
+Before the ordinary helper route, run [read-only preflight](helper/PROTOCOL.md#preflight)
+for the selected workspace and plan. It uses the current chat's saved pair, or
+proposes a new bind; pass --session only when the user explicitly selected that
+exact existing recipient. A preflight snapshot does not grant dispatch authority;
+adopt and submit repeat their own fresh checks. Use inspect for diagnosis when no
+plan is ready or after an error; do not require it in addition to a complete preflight.
 
-Read [workflow](references/workflow.md), applicable project AGENTS.md, the user's
-authorization and the same canonical index/plan/checkpoint used by ordinary
-Improve Codex. Preserve accepted history, protected changes and missing gates.
-For authorized new planning, use the bundled [plan template](references/plan-template.md);
-do not duplicate an established directory or dispatch without one ACTIVE plan.
+Use only opencode-go/deepseek-v4.1-flash with existing/default options. Never
+start another engine, switch models or change global settings.
 
-Before first use, read [runtime and package setup](references/runtime.md). Use
-Node 24 and the existing registered OpenCode engine, never launch another service
-or change global agent settings. Resolve this skill's physical directory; run
-its helper by absolute path while keeping the target workspace explicit.
+## Assign and review
 
-Read the [helper protocol](helper/PROTOCOL.md) before helper operations. Inspect
-connection, saved binding and live recipient using inspect [absolute-workspace]
-without dispatch. Unbound means no recipient is assigned; unknown/offline is
-not permission to send. Reuse a valid pair for the real current CODEX_THREAD_ID.
-With no pair, bind a new OpenCode session unless the user explicitly selected
-an existing recipient: only then read [existing-session routing](references/existing-session.md)
-and use its discovery/adoption checks. Code Duet can start in an already-used
-Codex chat. The user creates fresh Codex chats manually; never spoof identity,
-guess a recipient, replace a conflicting pair, rotate chats or reset a plan count.
-Only opencode-go/deepseek-v4.1-flash with existing/default options is supported.
+Read [workflow](references/workflow.md) as the single source for authorization,
+baseline, assignment, ownership, waiting, review, corrections, handoff and
+checkpoints. Use the [assignment packet](references/assignment-template.md)
+only when preparing a packet.
+For authorized new planning, use the [plan template](references/plan-template.md)
+and reuse the established canonical directory.
 
-## Assign, wait and review
+Before a helper operation, read the [command reference](helper/PROTOCOL.md#command-reference)
+and only its relevant technical sections. Submit one identified assignment
+once. While execution or a question is active, DeepSeek owns project edits and
+checks; Codex waits. Start review only after completed-for-review, inspect the
+actual changes, then send at most one consolidated correction at a time. An
+uncertain mutation is STOPPED; never resend it.
+Handle scoped questions and permission requests within the user's and runtime
+authority. Send source corrections to the executor; do not implement them yourself.
 
-Record the protected pre-dispatch baseline and actual route in the canonical
-checkpoint. Fill the [assignment packet](references/assignment-template.md)
-with the exact plan/workspace, accepted prerequisites, connected block, allowed
-files, checks and remaining gates. Submit once; send no raw GPT transcript.
-
-While EXECUTING or WAITING_FOR_ANSWER, keep the active tool wait and follow its
-bounded host continuations. Do not edit shared files/plans or run interfering
-checks. Do not separately poll message history/inspect or narrate token/tool
-progress; the helper already observes execution. Return to reasoning for a
-result, real request, failure or user input. Host-required continuations/updates
-may still wake GPT; do not claim zero inference from a quiet chat.
-Handle real forms/permissions using exact request IDs within user and
-runtime authority; an ordinary question is not another correction cycle.
-
-Only completed-for-review permits actual-diff review: current assignment final,
-ended execution, no pending tools/forms/permissions or known changing operations.
-Final text, idle alone, timeouts and host yields do not prove completion.
-Independently verify behavior and protected state; a passing build does not
-replace required runtime, visual, interaction or owner acceptance.
-
-Send one consolidated corrective assignment through next correction and submit
---kind correction. At most 20 corrections per plan across blocks/chats;
-uncertain delivery keeps its one reserved cycle. Review cycle 20 normally,
-then accept or stop incomplete without cycle 21. Never relabel fixes as blocks.
-Checkpoint accepted blocks before next block or finish; FINISHED releases an
-assignment and does not mark the MD plan DONE. Follow workflow for handoff.
-
-Stop on unknown ownership/state, failed connection, limits, scope or permission
-conflicts. No automatic retry, recovery, model/provider fallback or watcher.
-Preserve the helper's sanitized diagnostic. A later user-requested inspect is
-a read-only snapshot, never recovery or proof that an uncertain writer stopped.
-Report accepted work, meaningful corrections, exact checks and missing gates.
-Do not commit/push/merge/switch branches without separate user authority.
-
-This package is ready for isolated loading and inspection. Full live skill
-invocation, implementation/correction/handoff and Desktop navigation acceptance
-remain to be established; packaging alone is not proof of autonomous operation.
+If the Node runtime or helper location is unknown, use the short
+[installed-helper check](references/runtime.md#check-an-installed-helper).
+Package/build/discovery sections are for explicitly assigned packaging work.

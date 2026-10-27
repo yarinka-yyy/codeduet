@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fixture, baseline } from './http-fixture.mjs';
 
@@ -43,14 +43,17 @@ for (const fault of ['http', 'redirect', 'content-type']) test('native SSE rejec
   assert.ok(!f.calls.some(call => call.route === '/must-not-follow'));
 });
 
-test('native HTTP request deadline is distinct from long SSE lifetime and preserves no bootstrap', async t => {
-  const f = await fixture(t); f.fault = 'info-timeout';
-  const outcome = await f.call(['inspect'], undefined, 25_000);
+test('native JSON request deadline stays separate from bootstrap retry and long SSE lifetime', async t => {
+  const f = await fixture(t); await f.call(f.bindArgs(0));
+  const before = readFileSync(f.statePath), callsBefore = f.calls.length;
+  f.fault = 'active-timeout';
+  const outcome = await f.call(['inspect', f.workspace], undefined, 25_000);
   assert.equal(outcome.status, 1); assert.equal(outcome.result.diagnostic.category, 'request-timeout');
   assert.equal(outcome.result.diagnostic.stage, 'request');
   assert.ok(outcome.result.diagnostic.elapsedMs >= 19_900);
-  assert.ok(!existsSync(dirname(f.statePath)));
-  assert.ok(f.calls.every(call => call.method === 'GET'));
+  assert.equal(outcome.result.bootstrap.attempts, 1); assert.equal(outcome.result.bootstrap.retried, false);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  assert.ok(f.calls.slice(callsBefore).every(call => call.method === 'GET'));
 });
 
 test('native inspect supports no thread ID and unbound workspace without bootstrap/POST', async t => {
@@ -158,10 +161,12 @@ test('inspect during a real CLI wait does not steal its lock or poll history', a
     const before = readFileSync(f.statePath), historyBefore = f.calls.filter(call => call.route.includes('/message?')).length;
     assert.equal(historyBefore, 1);
     const outcome = await f.call(['inspect', f.workspace]);
-    assert.equal(outcome.result.live.active, true); assert.equal(outcome.result.stateLocked, true);
+    assert.equal(outcome.result.live.active, true); assert.equal(outcome.result.stateLocked, false);
+    assert.equal(outcome.result.ownershipLocked, true);
     assert.ok(outcome.result.blockers.includes('Bound session is running'));
     assert.deepEqual(readFileSync(f.statePath), before);
-    assert.ok(existsSync(join(dirname(f.statePath), 'state.lock')));
+    assert.ok(!existsSync(join(dirname(f.statePath), 'state.lock')));
+    assert.ok(readdirSync(join(dirname(f.statePath), 'ownership')).length > 0);
     assert.equal(f.calls.filter(call => call.route.includes('/message?')).length, historyBefore);
   } finally {
     f.finish(bound.result.sessionID);

@@ -169,7 +169,9 @@ test('ordinary plan walkthrough: initial -> independent review -> one correction
   writeFileSync(f.plan, before.plan + '\n### Advisor review of initial-1\n- OpenCode offline session ' + f.pair.sessionID +
     ', Go/Flash/default. Source claim checked: padded input FAIL; accepted trim regressed.\n- One consolidated correction assigned. Runtime/owner NOT_RUN; plan ACTIVE.\n');
   await f.next('correction'); assert.equal(f.state().plans[0].correctionCount, 0);
-  await assert.rejects(f.submit('initial-1', 'correction'), /fresh assignment ID/);
+  const reusedID = await f.submit('initial-1', 'correction');
+  assert.equal(reusedID.kind, 'rejected'); assert.equal(reusedID.phase, 'PREPARING');
+  assert.equal(reusedID.stateChange, 'unchanged');
   await f.submit('correction-1', 'correction'); assert.equal(f.state().plans[0].correctionCount, 1);
   writeFileSync(modulePath, 'export function label(value) { return String(value).trim().toUpperCase(); }\n');
   await complete(f);
@@ -215,14 +217,19 @@ test('fresh offline chat and explicit same-pair continuation preserve count', as
   assert.equal((await other.finish(f.workspace, f.plan, baseline)).correctionCount, 20);
 });
 
-for (const accept of [true, false]) test('correction 20 may be reviewed and ' + (accept ? 'accepted' : 'stopped without 21'), async t => {
+for (const accept of [true, false]) test('correction 20 may be reviewed and ' + (accept ? 'accepted' : 'remain in review without 21'), async t => {
   const f = await setup(t, { count: 19 }); await f.submit('fix-20', 'correction'); await complete(f);
   assert.equal(f.state().plans[0].correctionCount, 20);
   const result = accept ? await f.finish() : await f.next('correction');
-  assert.equal(result.phase, accept ? 'FINISHED' : 'STOPPED');
+  assert.equal(result.phase, accept ? 'FINISHED' : 'REVIEWING');
   assert.equal(result.kind, accept ? 'released' : 'correction-limit');
+  if (!accept) assert.equal(result.stateChange, 'unchanged');
   assert.equal(f.promptCount(), 1); assert.equal(f.state().plans[0].correctionCount, 20);
-  if (!accept) await assert.rejects(f.submit('fix-21', 'correction'), /stopped or mutation uncertain/);
+  if (!accept) {
+    const rejected = await f.submit('fix-21', 'correction');
+    assert.equal(rejected.kind, 'rejected'); assert.equal(rejected.phase, 'REVIEWING');
+    assert.equal(rejected.stateChange, 'unchanged');
+  }
 });
 
 test('fresh pair already at 20 stops before any corrective prompt', async t => {
@@ -245,7 +252,9 @@ test('lost corrective admission reserves one possible delivery and never retries
 
 test('kind mismatch and out-of-workspace packet do not spend a correction', async t => {
   const f = await setup(t); await f.submit(); await complete(f); await f.next('correction');
-  await assert.rejects(f.submit('wrong-kind', 'block'), /Previous assignment/);
+  const mismatch = await f.submit('wrong-kind', 'block');
+  assert.equal(mismatch.kind, 'rejected'); assert.equal(mismatch.phase, 'PREPARING');
+  assert.equal(mismatch.stateChange, 'unchanged');
   const outside = join(f.root, 'outside.txt'); writeFileSync(outside, 'not authorized');
   await assert.rejects(f.adapter.submit(f.workspace, f.plan, 'fix-1', outside, baseline, 'correction'), /Packet outside/);
   assert.equal(f.state().plans[0].correctionCount, 0); assert.equal(f.promptCount(), 1);
@@ -285,7 +294,9 @@ for (const action of ['next', 'finish']) {
   test(action + ' cannot release an active assignment or accept an executor final alone', async t => {
     const f = await setup(t); await f.submit();
     const result = action === 'next' ? await f.next('block') : await f.finish();
-    assert.equal(result.phase, 'STOPPED'); assert.equal(f.promptCount(), 1);
+    assert.equal(result.kind, 'rejected'); assert.equal(result.phase, 'EXECUTING');
+    assert.equal(result.stateChange, 'unchanged'); assert.equal(f.state().bindings[0].phase, 'EXECUTING');
+    assert.equal(f.promptCount(), 1);
   });
   test(action + ' rechecks pending/active state even after REVIEWING', async t => {
     const f = await setup(t); await f.submit(); await complete(f);

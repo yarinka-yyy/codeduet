@@ -66,7 +66,10 @@ test('invalid multi/custom choices fail without an API mutation', async t => {
   for (const value of [['Alpha', 'Alpha'], ['Unoffered'], 'Alpha']) {
     const f = await setup(t); f.client.question('multiselect'); f.client.forms[0].fields[0].custom = false;
     await f.wait();
-    assert.equal((await f.reply('question', 'frm_question', { answer: { q0: value } })).phase, 'STOPPED');
+    const before = structuredClone(f.state());
+    const rejected = await f.reply('question', 'frm_question', { answer: { q0: value } });
+    assert.equal(rejected.kind, 'rejected'); assert.equal(rejected.phase, 'WAITING_FOR_ANSWER');
+    assert.equal(rejected.stateChange, 'unchanged'); assert.deepEqual(f.state(), before);
     assert.equal(f.posts().length, 2);
   }
 });
@@ -262,8 +265,15 @@ for (const decision of ['always', 'reject']) test('permission ' + decision + ' s
   const f = await setup(t); f.client.question(); f.client.forms = [];
   f.client.permissions = [{ id: 'per_test', sessionID: 'ses_test', action: 'exec', resources: ['proof'], source: { type: 'tool', messageID: 'msg_tool', id: 'call_question' } }];
   await f.wait();
+  const before = structuredClone(f.state());
+  if (decision === 'always') {
+    const rejected = await f.reply('permission', 'per_test', { decision });
+    assert.equal(rejected.kind, 'rejected'); assert.equal(rejected.phase, 'WAITING_FOR_ANSWER');
+    assert.equal(rejected.stateChange, 'unchanged'); assert.deepEqual(f.state(), before); assert.equal(f.posts().length, 2);
+    return;
+  }
   const result = await f.reply('permission', 'per_test', { decision });
-  assert.equal(result.phase, 'STOPPED'); assert.equal(f.posts().length, decision === 'always' ? 2 : 3);
+  assert.equal(result.phase, 'STOPPED'); assert.equal(f.posts().length, 3);
 });
 
 test('uncertain reply is written ahead and is never retried', async t => {

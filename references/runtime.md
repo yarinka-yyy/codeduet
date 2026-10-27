@@ -1,126 +1,88 @@
 # Local runtime and portable package
 
-Requires Windows, Node.js 24 available to the calling shell, Git for an existing
-Git checkout, and a running OpenCode Desktop engine 2.1.4 with enabled
-opencode-go/deepseek-v4.1-flash. The helper uses Node built-ins; no npm install.
-If prerequisites/access are absent, report them; do not install, launch a
-service, change a model or edit global settings automatically.
+## Check an installed helper
 
-The helper reads the current user's ~/.local/state/opencode/service.json at
-execution time. Credentials stay on that machine inside the HTTP client; never
-copy registration, helper state, transcripts or private session IDs into a package.
-Bindings/counts live separately in ~/.local/state/code-duet/state.json.
-This shared store is intentionally outside individual projects. Write commands
-(including adopt and wait) must create its directory/lock and update its state.
-Read-only inspect/sessions working does not establish that write access exists.
-If the host sandbox excludes this directory, request its normal approval for
-the exact authorized helper command; keep the real CODEX_THREAD_ID and store.
-If approval is unavailable/denied, stop and report that boundary. Do not disable
-sandboxing, change ACLs/config automatically, spoof HOME/USERPROFILE, or relocate
-the store into a project/temp directory: separate stores lose shared writer and
-correction-count protection. Access approval never clears STOPPED or permits
-resending an uncertain assignment. Recheck ownership/checkpoint before an
-explicit continuation; a lock-acquisition failure itself sends no engine mutation.
-Only the real host CODEX_THREAD_ID is accepted for binding. Inspect without it
-still checks connection, but reports binding unknown rather than unbound.
+Routine use requires Windows, Node.js 24 and the already-running OpenCode
+Desktop engine 2.1.4 with the enabled opencode-go/deepseek-v4.1-flash model.
+The helper uses Node built-ins; no npm install is needed. If access is missing,
+report it; do not install software, start a service or change global settings.
+
+When the Node or helper path is unknown, resolve Node from the configured host
+runtime and set duetRoot to the absolute folder containing SKILL.md:
+Set duetNode to Get-Command's path when Node is on PATH; otherwise use the
+configured runtime's absolute executable path.
+
+    $duetNode = (Get-Command node -ErrorAction Stop).Source
+    $duetRoot = "C:\path\to\code-duet"
+    $duetCli = Join-Path $duetRoot 'helper\cli.mjs'
+    & $duetNode $duetCli inspect
+
+Expected: JSON kind connected, version 2.1.4 and the exact Go/Flash model.
+Missing registration or connection produces a sanitized nonzero result without
+starting OpenCode, creating helper state or sending a task. To inspect the
+saved pair and live snapshot for a workspace, append its quoted absolute path;
+see [inspect](../helper/PROTOCOL.md#inspect-and-sessions). This check does not
+select a session or authorize dispatch.
+
+Once the physical workspace and plan are known, use the single read-only
+preflight <workspace> <plan> result as the ordinary route check. Add
+--correction-count N when importing an established count, --session <exact-id>
+only for a user-selected existing recipient, and --non-git-baseline <declaration>
+for a non-Git workspace. Preflight reports connection attempts and all available
+blockers; it does not prove store writability or authorize a later mutation.
+
+Only bootstrap registration and the safe `/api/info` and `/api/model` GETs have
+bounded retry rules; POSTs and an established SSE wait do not reconnect. An
+exhausted bootstrap leaves a PREPARING/FINISHED pair unchanged and stops an
+active assignment conservatively. See the [connection protocol](../helper/PROTOCOL.md#connection).
+
+For routine assignments, consult only this check when the runtime/helper path
+or connection needs verification. The remaining sections apply to explicit
+package work or a shared-store access blocker.
+
+## Shared-store access
+
+Bindings and correction counts use the same external store at
+~/.local/state/code-duet/state.json across projects. Write commands need its
+directory and short state lock; acquisition can wait up to about 120 ms for a
+concurrent store update. Read-only inspection does not prove write access. If the host
+excludes it, request normal approval for the exact authorized helper command.
+Keep the real CODEX_THREAD_ID and store. If approval is unavailable, stop and
+report the boundary. Never disable sandboxing, change ACLs, spoof HOME or move
+the store into a project or temporary directory. Approval does not clear a
+STOPPED or uncertain assignment. The protocol defines lock and failure behavior.
 
 ## Build a folder without installing it
 
 From the source checkout, using Node 24 in PowerShell:
 
-```powershell
-node .\tools\package.mjs "C:\temporary package space & test\code-duet"
-```
+    node .\tools\package.mjs "C:\temporary package space & test\code-duet"
 
 The destination must be an absolute, new folder named code-duet whose parent
-already exists. No overwrite, runtime registration or dispatch occurs.
-The allowlist in tools/package.mjs copies only SKILL.md, agents/openai.yaml,
-helper modules/protocol, focused references and that packager. Source tests,
-development docs/Git, fixture sessions and local state are excluded. The same
-command can copy an existing portable folder to another new destination.
+already exists. No overwrite, runtime registration or dispatch occurs. The
+allowlist in tools/package.mjs copies only the skill metadata, helper, protocol,
+focused references and packager. Source tests, development docs, Git, fixtures
+and local state are excluded. The same command can copy an existing portable
+folder to another new destination.
 
-## Inspect from the copied package
+## Verify a copied package
 
-Resolve Node through the host's configured runtime; if it is not on PATH, use
-its actual absolute executable path. Resolve the selected skill location too:
+Use the [installed-helper check](#check-an-installed-helper) with the copied
+folder as duetRoot. An optional workspace path checks its saved binding and live
+snapshot but does not authorize dispatch.
 
-```powershell
-$duetNode = (Get-Command node -ErrorAction Stop).Source
-$duetRoot = "C:\temporary package space & test\code-duet"
-$duetCli = Join-Path $duetRoot 'helper\cli.mjs'
-& $duetNode $duetCli inspect
-```
+Isolated discovery verification uses the installed Codex app-server skills/list
+against a test workspace and temporary CODEX_HOME. It sends no thread/start or
+turn/start and performs no model call. This proves metadata discovery only:
+the installed schema does not expose invocation policy. Full live invocation
+and behavior require separate acceptance.
 
-Expected: JSON kind connected, version 2.1.4 and the exact Go/Flash model.
-Missing engine registration yields kind stopped with a sanitized explanation
-and nonzero exit; it does not launch OpenCode or create helper state.
+## Repository-local installation
 
-To check the intended workspace as well, append its quoted absolute path:
+A copied skill folder is a portable artifact, not a global installation. The
+conventional repository-local location is
+<project>/.agents/skills/code-duet/. Do not install it automatically; metadata
+requests explicit-only invocation.
 
-```powershell
-& $duetNode $duetCli inspect "C:\target project"
-```
-
-The snapshot separates connection, saved binding and verified live session
-(title/ID/directory/model/variant, execution and pending counts). The top-level
-model is the required model; session.model is the observed one. Unbound means
-no recipient was assigned; a discovered/visible chat is not selected. Offline
-inspection preserves local binding information but marks live state unverified.
-Inspect never creates the store, takes its lock, repairs a binding or resumes
-STOPPED. Its blockers and snapshotOnly flag do not authorize submission or
-replace the completion gate. Use the same source/installed package version for
-execution against one store; an older package may reject newer diagnostic fields.
-
-For an explicitly selected existing recipient, read
-[existing-session routing](existing-session.md). sessions <absolute-workspace>
-[--cursor <cursor>] lists one page of metadata without selecting or sending.
-adopt <workspace> <plan> <exact-session-id> [--correction-count N] validates
-and saves only a local association; ordinary submit is still separate. Neither
-the Codex chat's age nor the currently visible OpenCode tab chooses the route.
-Use the same package version for a store containing adoption/diagnostic fields.
-
-For execution commands use that absolute CLI path, separately quoted absolute
-target workspace/plan/packet paths, and the [protocol](../helper/PROTOCOL.md).
-Do not change the target project just to locate the helper.
-For non-Git targets, every operation requiring context must pass the recorded
---non-git-baseline declaration; the helper never initializes their Git.
-
-## Load only in the intended scope
-
-A copied skill folder alone is a portable artifact, not a global installation.
-For an explicitly authorized repository-local installation the conventional
-location is <project>/.agents/skills/code-duet/. Do not install it automatically.
-Metadata requests explicit-only invocation; select $code-duet explicitly.
-
-Isolated verification uses the installed Codex app-server's skills/list against
-a test workspace and a temporary CODEX_HOME. It sends no thread/start or
-turn/start and performs no model call. That demonstrates metadata discovery;
-actual skill invocation and full behavior need separate live acceptance.
-The installed skills/list schema does not expose invocation policy; do not
-claim its effective filtering was tested by metadata discovery alone.
-
-During a real helper wait, allow its process to stay alive through host yields
-and continue the same returned process/session handle. Use the longest bounded
-wait permitted by the host and its interruption/update rules; do not impose a
-separate short progress cadence. Do not interrupt/relaunch the helper at a
-yield or treat that yield as execution completion. Do not add separate history
-reads, inspect calls or step-by-step commentary merely because control returned.
-If a host update is required, use the already known waiting state.
-
-The helper produces one meaningful outcome, without routine heartbeat output.
-Its Node SSE/metadata checks do not call GPT. A host yield can nevertheless
-return control to GPT; silence in stdout/chat does not prove zero model requests.
-Background hooks do not start an idle turn, so they are not a substitute for
-this active wait. Strict event-only model wakeup is not established in this host.
-
-Default total wait deadline is one hour, with --timeout-ms selectable from 1
-to 3600000. Initial HTTP requests and the event handshake retain 20-second
-limits. Host yields, request timeouts, total deadline and stream EOF are
-different events. Choose a shorter deadline explicitly for a bounded task;
-unchanged execution alone is not a failure. A real deadline, connection loss
-or interruption is STOPPED with sanitized diagnostics, no reconnect/resubmit.
-Stopping coordination does not guarantee stopping DeepSeek or OS processes.
-
-The SSE connection uses node:http rather than fetch so a silent event body is
-not cut off by Undici's separate idle timer. It still stops on real EOF/read
-failure or the explicit wait deadline. No server heartbeat is assumed.
+Wait timing, ownership and host-yield behavior are defined once in the
+[workflow](workflow.md) and [helper protocol](../helper/PROTOCOL.md#wait).

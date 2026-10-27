@@ -30,13 +30,17 @@ export async function fixture(t, cli = defaultCli) {
     if (request.headers.authorization !== expectedAuth) { response.writeHead(401); response.end(); return; }
     try {
       let raw = ''; for await (const chunk of request) raw += chunk;
-      const body = raw ? JSON.parse(raw) : undefined, route = request.url;
+      const body = raw ? JSON.parse(raw) : undefined, route = request.url, sessionID = route.split('/')[3];
       calls.push({ method: request.method, route });
       await f.onRequest?.(route);
       const send = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
       const rejection = f.rejectRequest?.(request.method, route);
       if (rejection) { response.statusCode = 400; return send(rejection); }
-      if (route === '/api/info') { if (f.fault === 'info-timeout') return; return send({ version: '2.1.4' }); }
+      if (route === '/api/info') {
+        if (f.fault === 'info-timeout') return;
+        if (f.fault === 'bootstrap-offline') { response.writeHead(503); response.end(); return; }
+        return send({ version: '2.1.4' });
+      }
       if (route === '/api/model') return send({ data: f.models });
       if (route === '/api/event') {
         if (f.eventFault) {
@@ -47,9 +51,9 @@ export async function fixture(t, cli = defaultCli) {
         response.writeHead(200, { 'Content-Type': 'text/event-stream' }); response.write(': connected\n\n');
         f.streamOpens++; streams.add(response); response.on('close', () => streams.delete(response)); return;
       }
-      if (route === '/api/session/active') return send({ data: f.active });
-      if (route.endsWith('/form')) return send({ data: f.forms });
-      if (route.endsWith('/permission')) return send({ data: f.permissions });
+      if (route === '/api/session/active') { if (f.fault === 'active-timeout') return; return send({ data: f.active }); }
+      if (route.endsWith('/form')) return send({ data: f.forms.filter(item => item.sessionID === sessionID) });
+      if (route.endsWith('/permission')) return send({ data: f.permissions.filter(item => item.sessionID === sessionID) });
       if (route.startsWith('/api/shell?')) return send({ data: f.shells });
       if (route.startsWith('/api/session?')) {
         if (f.sessionPage) return send(f.sessionPage);
@@ -62,13 +66,29 @@ export async function fixture(t, cli = defaultCli) {
         const session = { id: 'ses_http' + (sessions.size + 1), title: body.title, location: body.location, model: body.model, time: {} };
         sessions.set(session.id, session); return send({ data: session });
       }
-      const sessionID = route.split('/')[3];
       if (route.endsWith('/prompt') && request.method === 'POST') {
         if (f.fault === 'drop') { response.destroy(); return; }
         if (f.fault === 'http429') { response.writeHead(429); response.end(secret); return; }
         messages.set(sessionID, [...(messages.get(sessionID) ?? []), { id: body.id, type: 'user', text: body.text }]);
         f.active[sessionID] = { type: 'running' };
         return send({ data: { id: body.id, sessionID } });
+      }
+      if (route.endsWith('/reply') && request.method === 'POST') {
+        const [, , , , kind, requestID] = route.split('/');
+        const pending = kind === 'form' ? f.forms : f.permissions;
+        const requestRecord = pending.find(item => item.id === requestID);
+        if (requestRecord?.metadata?.tool) {
+          const message = (messages.get(sessionID) ?? []).find(item => item.id === requestRecord.metadata.tool.messageID);
+          const tool = message?.content?.find(item => item.id === requestRecord.metadata.tool.id);
+          if (tool?.state?.status === 'running') {
+            tool.state = { ...tool.state, status: 'completed' };
+            tool.time = { completed: Date.now() };
+            message.time = { ...(message.time ?? {}), completed: tool.time.completed };
+          }
+        }
+        if (kind === 'form') f.forms = f.forms.filter(item => item.id !== requestID);
+        else f.permissions = f.permissions.filter(item => item.id !== requestID);
+        return send({ data: { id: requestID, sessionID } });
       }
       if (route.includes('/message?')) {
         const query = new URL(route, 'http://localhost').searchParams;
@@ -93,9 +113,9 @@ export async function fixture(t, cli = defaultCli) {
   writeFileSync(registration, JSON.stringify({ id: 'offline-http-engine', version: '2.1.4',
     url: 'http://127.0.0.1:' + server.address().port, password: secret }));
   const registrationBefore = readFileSync(registration);
-  f.call = (args, chatID = 'offline-http-chat-A', timeoutMs = 10_000) => new Promise((resolve, reject) => {
+  f.call = (args, chatID = 'offline-http-chat-A', timeoutMs = 10_000, extraEnv = {}) => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, windowsHide: true,
-      env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_THREAD_ID: chatID },
+      env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_THREAD_ID: chatID, ...extraEnv },
       signal: AbortSignal.timeout(timeoutMs), stdio: ['ignore', 'pipe', 'pipe'] });
     const running = f.running = { pid: child.pid, stdoutBytes: 0, stderrBytes: 0 };
     let stdout = '', stderr = '';
