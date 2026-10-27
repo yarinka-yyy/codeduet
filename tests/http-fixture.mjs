@@ -12,7 +12,7 @@ const defaultCli = fileURLToPath(new URL('../helper/cli.mjs', import.meta.url));
 export const baseline = 'Baseline: disposable native HTTP acceptance fixture';
 export const model = { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', enabled: true, status: 'active' };
 
-export async function fixture(t, cli = defaultCli) {
+export async function fixture(t, cli = defaultCli, version = '2.1.4') {
   const temporary = realpathSync(tmpdir()), root = mkdtempSync(join(temporary, 'duet-http-'));
   const home = join(root, 'empty-user'), workspace = join(root, 'workspace space & test');
   mkdirSync(join(home, '.local', 'state', 'opencode'), { recursive: true });
@@ -39,7 +39,7 @@ export async function fixture(t, cli = defaultCli) {
       if (route === '/api/info') {
         if (f.fault === 'info-timeout') return;
         if (f.fault === 'bootstrap-offline') { response.writeHead(503); response.end(); return; }
-        return send({ version: '2.1.4' });
+        return send({ version, hostname: 'isolated-fixture' });
       }
       if (route === '/api/model') return send({ data: f.models });
       if (route === '/api/event') {
@@ -110,7 +110,7 @@ export async function fixture(t, cli = defaultCli) {
     assert.ok(resolve(root).startsWith(temporary + sep)); rmSync(root, { recursive: true });
   });
   const registration = join(home, '.local', 'state', 'opencode', 'service.json');
-  writeFileSync(registration, JSON.stringify({ id: 'offline-http-engine', version: '2.1.4',
+  writeFileSync(registration, JSON.stringify({ id: 'offline-http-engine', version,
     url: 'http://127.0.0.1:' + server.address().port, password: secret }));
   const registrationBefore = readFileSync(registration);
   f.call = (args, chatID = 'offline-http-chat-A', timeoutMs = 10_000, extraEnv = {}) => new Promise((resolve, reject) => {

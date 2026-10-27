@@ -48,7 +48,7 @@ it does not infer execution authorization from the mere existence of a plan.
 
 The shared `connection.mjs` also serves the original transport probe. It reads
 the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
-only, rejects redirects, validates installed/API version 2.1.4 and the enabled
+only, rejects redirects, validates installed/API version 2.1.4 or 2.2.0 and the enabled
 `opencode-go/deepseek-v4.1-flash` model. Credentials stay inside HTTP closures;
 the exposed client, state, results and errors contain no auth/response-body data.
 The default model variant is left unchanged. No second engine or fallback is
@@ -67,6 +67,13 @@ each attempt rereads registration. Access, malformed registration, 400/401/403/
 429, schema/version/model/identity errors and unknown transport errors are
 single-attempt failures. A failed parallel GET aborts its sibling. These retries
 never replay create/prompt/reply POSTs and do not reconnect SSE.
+
+Only the exact validated releases 2.1.4 and 2.2.0 are accepted; registration and
+GET info versions must agree. A mismatch is a single-attempt `engine-version`
+diagnostic with expectedVersions, observedVersion (numeric release or unknown)
+and versionSource (registration or server-info). Inspect and preflight expose
+the same safe fields; preflight names the mismatch and requires API revalidation,
+rather than suggesting a connection retry. Untrusted version text is not echoed.
 
 ## Identity and persistence
 

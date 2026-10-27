@@ -127,3 +127,21 @@ can receive test messages. tests/fixtures/adoption space & test/ defines its
 no-edit scope. Preserve default bindings, registration/config/global install
 and product file hashes; never substitute P4 or another user conversation.
 Direct API/helper component proof does not establish actual skill-entry routing.
+
+## Engine release compatibility
+
+`node --test tests/version.test.mjs` checks exact releases 2.1.4 and 2.2.0,
+including multi-page completed native synthetic/compaction history, explicit
+adoption, variant/count preservation, SSE review/correction and safe version
+mismatches before any dispatch. New releases are not accepted by a version range.
+Compare the tagged upstream `packages/protocol/openapi.json` for all14 helper
+operations and their referenced schemas before extending ENGINE_VERSIONS.
+
+A separately authorized native compatibility probe must create its own empty
+project/session. Check info/model, filtered session discovery, exact session,
+message/form/permission/shell GETs and SSE. A manually created form and its reply
+test events without a model. Prompt admission may be checked only with explicit
+`resume:false`, verifying the exact returned ID, no active execution and immediate
+cancellation of that probe's own queued inbox item. Never send to a working chat.
+This is not proof of running-model completion or owner live acceptance; preserve
+and compare production state/registration/config hashes separately.

@@ -3,7 +3,7 @@
 ## Check an installed helper
 
 Routine use requires Windows, Node.js 24 and the already-running OpenCode
-Desktop engine 2.1.4 with the enabled opencode-go/deepseek-v4.1-flash model.
+Desktop engine 2.1.4 or 2.2.0 with the enabled opencode-go/deepseek-v4.1-flash model.
 The helper uses Node built-ins; no npm install is needed. If access is missing,
 report it; do not install software, start a service or change global settings.
 
@@ -17,7 +17,10 @@ configured runtime's absolute executable path.
     $duetCli = Join-Path $duetRoot 'helper\cli.mjs'
     & $duetNode $duetCli inspect
 
-Expected: JSON kind connected, version 2.1.4 and the exact Go/Flash model.
+Expected: JSON kind connected, version 2.1.4 or 2.2.0 and the exact Go/Flash model.
+Only these validated releases are accepted. A version mismatch reports safe
+expected/observed versions and registration versus server-info origin; revalidate
+a later release before using it, without disabling the guard or retrying dispatch.
 Missing registration or connection produces a sanitized nonzero result without
 starting OpenCode, creating helper state or sending a task. To inspect the
 saved pair and live snapshot for a workspace, append its quoted absolute path;

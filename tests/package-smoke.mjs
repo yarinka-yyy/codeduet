@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { packageSkill } from '../tools/package.mjs';
+import { ENGINE_VERSIONS } from '../helper/connection.mjs';
 
 const [codex, evidenceRoot] = process.argv.slice(2);
 assert.ok(process.argv.length === 4 && isAbsolute(codex) && isAbsolute(evidenceRoot),
@@ -76,7 +77,7 @@ const inspect = spawnSync(process.execPath, [join(destination, 'helper', 'cli.mj
 assert.equal(inspect.status, 0, inspect.stderr || inspect.error?.message);
 report.inspect = JSON.parse(inspect.stdout.trim());
 assert.equal(report.inspect.kind, 'connected');
-assert.equal(report.inspect.version, '2.1.4');
+assert.ok(ENGINE_VERSIONS.includes(report.inspect.version), 'Unvalidated engine version');
 assert.deepEqual(report.inspect.model, { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 assert.equal(report.inspect.binding.status, 'unknown');
 assert.equal(report.inspect.snapshotOnly, true);

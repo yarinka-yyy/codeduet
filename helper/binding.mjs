@@ -266,6 +266,8 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     diagnostic.errorCode ?? '',
     diagnostic.method && diagnostic.operation ? diagnostic.method + ' ' + diagnostic.operation : diagnostic.operation ?? '',
     diagnostic.page ? diagnostic.page + ' page' : '',
+    diagnostic.category === 'engine-version' ? 'expected ' + diagnostic.expectedVersions.join(' or ') +
+      ', observed ' + diagnostic.observedVersion + ' (' + diagnostic.versionSource + ')' : '',
   ].filter(Boolean).join(' ');
   const add = (name, status, reason, deferred = false, diagnostic) => {
     let checkedDiagnostic;
@@ -287,9 +289,11 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   };
   const connected = !!client;
   const attempts = client?.bootstrap?.attempts ?? connectionError?.bootstrap?.attempts ?? null;
+  const connectionDiagnostic = connectionError ? diagnose(connectionError, 'unknown', 'connection') : undefined;
   add('connection', connected ? 'pass' : 'blocked',
     connected ? 'Connected to engine ' + client.engineID + '; ' + (attempts ?? 'unknown') + ' bootstrap attempt(s)' :
-      'OpenCode connection unavailable; restore access and rerun preflight');
+      'OpenCode connection unavailable' + (connectionDiagnostic ? ': ' + diagnosticReason(connectionDiagnostic) : ''),
+    false, connectionDiagnostic);
   add('required-model', connected ? 'pass' : connectionError?.message === 'Required Go model unavailable; no fallback' ?
     'blocked' : 'unknown', connected ? 'Required model verified: ' + MODEL.providerID + '/' + MODEL.id :
       'Required model cannot be verified without a successful connection');
@@ -614,7 +618,11 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   const permanentRequest = checks.find(item => item.diagnostic?.category === 'request-http' &&
     item.diagnostic.httpStatus >= 400 && item.diagnostic.httpStatus < 500);
   let nextStep, nextCommand = null;
-  if (!connected) nextStep = 'Restore the OpenCode connection and rerun preflight; this call sent no task.';
+  if (!connected && connectionDiagnostic?.category === 'engine-version') nextStep =
+    'OpenCode version mismatch: expected ' + connectionDiagnostic.expectedVersions.join(' or ') + ', observed ' +
+    connectionDiagnostic.observedVersion + ' (' + connectionDiagnostic.versionSource +
+    '). Use a validated matching engine/helper or revalidate API compatibility before rerunning preflight; no task was sent.';
+  else if (!connected) nextStep = 'Restore the OpenCode connection and rerun preflight; this call sent no task.';
   else if (blockers.length && permanentRequest) {
     const diagnostic = permanentRequest.diagnostic;
     const operation = [diagnostic.method, diagnostic.operation].filter(Boolean).join(' ');
@@ -653,8 +661,9 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
 
   return {
     kind: 'preflight', status, connection: { verified: connected, engineID: client?.engineID ?? null,
+      ...(client ? { version: client.version } : {}),
       attempts, retried: !!(client?.bootstrap?.retried ?? connectionError?.bootstrap?.retried),
-      ...(connectionError ? { diagnostic: diagnose(connectionError, 'unknown', 'connection') } : {}) },
+      ...(connectionDiagnostic ? { diagnostic: connectionDiagnostic } : {}) },
     proposedRoute, workspace: { requested: workspace ?? null, directory: workspacePath ?? null, checkout: ctx?.checkout ?? null },
     plan: { requested: planPath ?? null, path: planRealPath ?? null },
     correctionCount: { requested: correctionCount ?? null, saved: savedPlan?.correctionCount ?? null,

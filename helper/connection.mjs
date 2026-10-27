@@ -5,10 +5,12 @@ import { request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
+export const ENGINE_VERSIONS = Object.freeze(['2.1.4', '2.2.0']);
+const releaseVersion = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value);
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
   'event-open', 'event-handshake-timeout', 'event-http', 'event-content-type', 'event-eof', 'event-read',
   'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown', 'interrupted', 'deadline',
-  'state-locked', 'state-access', 'state-io']);
+  'state-locked', 'state-access', 'state-io', 'engine-version']);
 const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'state-directory', 'state-lock', 'state-write']);
 const names = new Set(['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError']);
 const codes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ABORT_ERR',
@@ -57,7 +59,7 @@ const eventType = /^(?:(?:session\.)?(?:execution\.(?:started|running|succeeded|
 export function validateDiagnostic(value) {
   requireValue(value && categories.has(value.category) && stages.has(value.stage) &&
     Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0 &&
-    Object.keys(value).every(key => ['category', 'stage', 'elapsedMs', 'lastEvent', 'httpStatus', 'errorName', 'errorCode', 'operation', 'method', 'page'].includes(key)), 'Invalid diagnostic');
+    Object.keys(value).every(key => ['category', 'stage', 'elapsedMs', 'lastEvent', 'httpStatus', 'errorName', 'errorCode', 'operation', 'method', 'page', 'expectedVersions', 'observedVersion', 'versionSource'].includes(key)), 'Invalid diagnostic');
   requireValue(value.lastEvent === null || value.lastEvent && Object.keys(value.lastEvent).length === 2 &&
     Number.isSafeInteger(value.lastEvent.at) && value.lastEvent.at >= 0 && eventType.test(value.lastEvent.type), 'Invalid diagnostic event');
   if (value.httpStatus !== undefined) requireValue(Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599, 'Invalid diagnostic HTTP status');
@@ -66,7 +68,19 @@ export function validateDiagnostic(value) {
   if (value.operation !== undefined) requireValue(operationNames.has(value.operation), 'Invalid diagnostic operation');
   if (value.method !== undefined) requireValue(['GET', 'POST'].includes(value.method), 'Invalid diagnostic method');
   if (value.page !== undefined) requireValue(['first', 'cursor'].includes(value.page), 'Invalid diagnostic page');
+  if (value.category === 'engine-version' || ['expectedVersions', 'observedVersion', 'versionSource'].some(key => value[key] !== undefined)) {
+    requireValue(value.category === 'engine-version' && Array.isArray(value.expectedVersions) &&
+      value.expectedVersions.length >= 1 && value.expectedVersions.length <= 8 && value.expectedVersions.every(releaseVersion) &&
+      (value.observedVersion === 'unknown' || releaseVersion(value.observedVersion)) &&
+      ['registration', 'server-info'].includes(value.versionSource), 'Invalid diagnostic engine version');
+  }
   return value;
+}
+
+function versionMismatch(observed, expectedVersions, versionSource) {
+  return diagnosticError('Unsupported engine version; revalidate API', 'engine-version', 'connection', {
+    expectedVersions: [...expectedVersions], observedVersion: releaseVersion(observed) ? observed : 'unknown', versionSource,
+  });
 }
 
 export function diagnose(error, category, stage, details = {}) {
@@ -125,7 +139,7 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
       catch { throw new Error('Missing or invalid engine registration'); }
       requireValue(registration && typeof registration.id === 'string' && registration.id.length > 0 &&
         typeof registration.password === 'string' && registration.password.length > 0, 'Invalid engine registration fields');
-      requireValue(registration.version === '2.1.4', 'Unsupported engine version; revalidate API');
+      if (!ENGINE_VERSIONS.includes(registration.version)) throw versionMismatch(registration.version, ENGINE_VERSIONS, 'registration');
       const base = localEndpoint(registration.url);
       const auth = 'Basic ' + Buffer.from('opencode:' + registration.password).toString('base64');
       async function request(route, body, parentSignal, timeoutMs = 20_000) {
@@ -183,7 +197,8 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
         await Promise.allSettled(bootstrapRequests);
         throw error;
       }
-      requireValue(info?.version === registration.version && Array.isArray(models?.data), 'Invalid engine info/model response');
+      requireValue(typeof info?.version === 'string' && Array.isArray(models?.data), 'Invalid engine info/model response');
+      if (info.version !== registration.version) throw versionMismatch(info.version, [registration.version], 'server-info');
       requireValue(models.data.some(model => model.providerID === MODEL.providerID && model.id === MODEL.id &&
         model.enabled === true && model.status === 'active'), 'Required Go model unavailable; no fallback');
       const bootstrap = { attempts, retried: attempts > 1 };
