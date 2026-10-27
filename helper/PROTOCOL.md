@@ -114,6 +114,21 @@ requests retain limit=100 and pass the opaque cursor without order. OpenCode
 2.1.4 rejects combining message cursor and order with InvalidCursorError/400.
 The same reader serves adoption and current-assignment observation/review.
 
+Native compaction records remain in that exchange: completed status, known
+reason/time, fixed model/summary shape and a later successful terminal idle
+are required before ownership transfer. A running compaction cannot complete;
+a failed compaction remains a failure despite a later successful idle. Its
+summary never replaces the assignment's final response or earlier tool checks.
+Prior synthetic input is accepted only by existing-session adoption, with
+known text/time and a completed final after that input. The reader still goes
+back to the user prompt and checks every earlier tool. Synthetic input during
+a bound assignment stops coordination as external input. Unsupported history
+diagnostics name only known API types; arbitrary type values are not echoed.
+Foreground shell checks distinguish numeric stream redirection (2>&1) and
+PowerShell call operators at statement/block starts from a trailing background
+ampersand. Detached launchers, including Start-Process with an unverified wait/
+kill branch, remain blocked; no general shell parser or process monitor is added.
+
 An adopt failure inside the helper reports adoption.bindingState unchanged
 until the final binding save is attempted; afterwards it is unconfirmed.
 Both report adoption.engineMutation none: adoption never sends to the executor.

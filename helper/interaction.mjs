@@ -113,16 +113,30 @@ export function assignmentMessages(client, binding) {
 // Adoption examines only the latest exchange, never the whole prior transcript.
 export const recentSessionMessages = (client, sessionID) => messagesSince(client, sessionID, message => message.type === 'user', true);
 
-export function inspectMessages(binding, messages) {
+export function inspectMessages(binding, messages, { adopting = false } = {}) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');
   const tail = messages.slice(1);
   need(!tail.some(message => message.type === 'user'), 'Another user prompt followed the bound assignment');
-  need(tail.every(message => ['assistant', 'idle'].includes(message.type)), 'Unknown execution history; cannot transfer ownership');
+  const unsupported = tail.find(message => !['assistant', 'idle', 'synthetic', 'compaction'].includes(message.type));
+  const knownType = ['system', 'skill', 'shell', 'agent-switched', 'model-switched', 'location-switched'].includes(unsupported?.type) ? unsupported.type : 'unrecognized';
+  need(!unsupported, 'Unsupported execution history type: ' + knownType + '; cannot transfer ownership');
+  const inputs = tail.filter(message => message.type === 'synthetic');
+  // Prior input may be adopted after completion; new input cannot join our bound assignment.
+  need(adopting || inputs.length === 0, 'Synthetic input followed the bound assignment; no ownership transfer');
+  need(inputs.every(message => typeof message.text === 'string' && Number.isFinite(message.time?.created) && message.time.created >= 0), 'Invalid synthetic input metadata');
+  const compactions = tail.filter(message => message.type === 'compaction');
+  for (const message of compactions) {
+    need(['running', 'completed', 'failed'].includes(message.status), 'Unknown compaction status');
+    need(['auto', 'manual'].includes(message.reason) && Number.isFinite(message.time?.created) && message.time.created >= 0, 'Invalid compaction metadata');
+    if (message.status === 'completed') need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID &&
+      typeof message.summary === 'string', 'Compaction model/summary changed');
+  }
   const assistants = tail.filter(message => message.type === 'assistant');
   for (const message of assistants) {
     need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID && Array.isArray(message.content), 'Executor model/history changed');
   }
   if (tail.some(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
+    message.type === 'compaction' && message.status === 'failed' ||
     message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish) ||
     message.content?.some(part => part.type === 'tool' && part.state?.status === 'error'))) return { kind: 'failed' };
   if (tail.some(message => message.type === 'idle' && message.outcome === 'interrupted')) return { kind: 'interrupted' };
@@ -169,6 +183,15 @@ export function completion(history, session, shells) {
   need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
   need(history.tail.filter(message => message.type === 'assistant').every(message => Number.isFinite(message.time?.completed)), 'Unfinished assistant step');
   need(idle?.type === 'idle' && idle.outcome === 'succeeded' && idle.time?.created >= final.time.completed && session.time.idle >= idle.time.created, 'No correlated terminal idle');
+  const finalIndex = history.tail.indexOf(final);
+  for (const [index, message] of history.tail.entries()) {
+    if (message.type === 'synthetic') need(index < finalIndex &&
+      message.time.created <= final.time.completed, 'No completed final after synthetic input');
+    if (message.type === 'compaction') {
+      need(message.status === 'completed', 'Compaction has not completed');
+      need(idle.time.created >= message.time.created, 'No terminal idle after compaction');
+    }
+  }
   need(tools.every(tool => tool.state?.status === 'completed' && Number.isFinite(tool.time?.completed)), 'Outstanding/unknown tool operation');
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
   need(shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
@@ -182,7 +205,9 @@ export function completion(history, session, shells) {
       need(typeof input.command === 'string', 'Unknown shell command');
       need(tool.state.metadata?.status === 'completed' || typeof shellID === 'string' && shells.data.some(shell => shell.id === shellID), 'Unknown shell/background completion status');
       const command = input.command;
-      const unquoted = command.replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted').replace(/^\s*&\s*(?=quoted)/, '');
+      const unquoted = command.replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
+        .replace(/\b\d+>&\d+\b/g, 'redirect')
+        .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
       need(!/Start-Process|Start-Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\b(?:cmd\s+\/c\s+)?start\s/i.test(command) &&
         !/(^|[^&])&([^&]|$)/.test(unquoted), 'Detached command status unknown; no ownership transfer');
     }

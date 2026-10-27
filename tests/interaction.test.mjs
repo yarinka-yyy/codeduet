@@ -156,6 +156,33 @@ test('correlated final, terminal idle, ended tools and shells transfer ownership
   assert.equal(f.posts().length, 2); assert.equal(f.state().phase, 'REVIEWING');
 });
 
+test('running native compaction waits with active execution, then completed compaction permits review', async t => {
+  const f = await setup(t); f.client.finish();
+  const created = f.client.messages.at(-1).time.created;
+  const compaction = { id: 'msg_compact', type: 'compaction', status: 'running', reason: 'auto', time: { created } };
+  f.client.messages.splice(-1, 0, compaction); f.client.active = { ses_test: { type: 'running' } };
+  let observed; const seen = new Promise(resolve => { observed = resolve; });
+  const request = f.client.request.bind(f.client);
+  f.client.request = async (route, body) => { const result = await request(route, body); if (route.includes('/message?')) observed(); return result; };
+  const waiting = f.wait({ timeoutMs: 3000 }); await seen;
+  assert.equal(f.state().phase, 'EXECUTING');
+  Object.assign(compaction, { status: 'completed', model: MODEL, summary: 'PRIVATE_SUMMARY_011' });
+  f.client.active = {}; f.client.event('execution.succeeded');
+  const result = await waiting; assert.equal(result.kind, 'completed-for-review');
+  assert.ok(!JSON.stringify(result).includes('PRIVATE_')); assert.equal(f.posts().length, 2);
+});
+
+for (const unsafe of ['synthetic', 'failed-compaction', 'idle-with-running-compaction']) {
+  test(unsafe + ' persists STOP and never resends after a late successful observation', async t => {
+    const f = await setup(t); f.client.finish(); const created = f.client.messages.at(-1).time.created;
+    const extra = unsafe === 'synthetic' ? { id: 'msg_external', type: 'synthetic', text: 'PRIVATE_INPUT_011', time: { created } } :
+      { id: 'msg_compact', type: 'compaction', status: unsafe === 'failed-compaction' ? 'failed' : 'running', reason: 'auto', time: { created } };
+    f.client.messages.splice(-1, 0, extra);
+    assert.equal((await f.wait()).phase, 'STOPPED');
+    f.client.messages.splice(-2, 1); assert.equal((await f.wait()).kind, 'stopped'); assert.equal(f.posts().length, 2);
+  });
+}
+
 test('final text while engine still active never transfers ownership; deadline persists STOP', async t => {
   const f = await setup(t); f.client.finish(); f.client.active = { ses_test: { type: 'running' } };
   const result = await f.wait({ timeoutMs: 40 });

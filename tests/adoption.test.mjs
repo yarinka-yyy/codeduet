@@ -89,6 +89,43 @@ test('native adoption preserves existing history/title/model and is idempotent w
   assert.equal(inspected.result.session.model.variant, 'default');
 });
 
+test('long native history with prior synthetic input and post-final compaction adopts without POST or transcript storage', async t => {
+  const f = await fixture(t), session = seed(f), ended = session.time.idle;
+  session.model.variant = 'high';
+  const messages = f.messages.get(session.id);
+  messages.splice(1, 0, ...Array.from({ length: 212 }, (_, i) => ({ id: 'msg_step' + i, type: 'assistant', model,
+    finish: 'tool-calls', time: { completed: ended - 20 }, content: [] })));
+  messages.splice(3, 0, { id: 'msg_priorSynthetic', type: 'synthetic', text: 'PRIVATE_SYNTHETIC_011', time: { created: ended - 10 } });
+  messages.push({ id: 'msg_manualCompact', type: 'compaction', status: 'completed', reason: 'manual', model: session.model,
+    summary: 'PRIVATE_SUMMARY_011', time: { created: ended + 1 } },
+  { id: 'msg_compactIdle', type: 'idle', outcome: 'succeeded', time: { created: ended + 2 } });
+  session.time.idle = ended + 2;
+  const before = structuredClone(messages), adopted = await f.call(adoptArgs(f, session.id, 7));
+  assert.equal(adopted.status, 0); assert.equal(adopted.result.kind, 'adopted');
+  assert.equal(adopted.result.correctionCount, 7); assert.equal(messages.length, 218);
+  assert.deepEqual(messages, before); assert.ok(f.calls.every(call => call.method === 'GET'));
+  const saved = readFileSync(f.statePath, 'utf8'); assert.ok(!saved.includes('PRIVATE_'));
+  assert.deepEqual(f.state().bindings[0].adoption, { variant: 'high', lastMessageID: 'msg_compactIdle', idleAt: ended + 2 });
+  assert.equal((await f.call(submitArgs(f))).status, 0);
+  assert.equal(f.state().plans[0].correctionCount, 8); assert.equal(f.calls.filter(call => call.method === 'POST').length, 1);
+});
+
+for (const unsafe of ['running', 'failed', 'unknown', 'late-synthetic', 'earlier-running-tool']) {
+  test('unsafe ' + unsafe + ' history refuses adoption without a binding or engine POST', async t => {
+    const f = await fixture(t), session = seed(f), ended = session.time.idle, messages = f.messages.get(session.id);
+    messages.splice(2, 0, { id: 'msg_compact', type: 'compaction', status: 'completed', reason: 'auto', model,
+      summary: 'PRIVATE_SUMMARY_011', time: { created: ended } });
+    if (['running', 'failed', 'unknown'].includes(unsafe)) messages[2].status = unsafe;
+    if (unsafe === 'late-synthetic') messages.splice(3, 0, { id: 'msg_synthetic', type: 'synthetic', text: 'PRIVATE_INPUT_011', time: { created: ended } });
+    if (unsafe === 'earlier-running-tool') messages[1].content.push({ id: 'call_old', type: 'tool', name: 'edit',
+      state: { status: 'running' }, time: { created: ended - 1 } });
+    const result = await f.call(adoptArgs(f));
+    assert.equal(result.status, 1); assert.equal(result.result.adoption.bindingState, 'unchanged');
+    assert.equal(result.result.adoption.engineMutation, 'none'); assert.ok(!existsSync(f.statePath));
+    assert.ok(!result.stdout.includes('PRIVATE_')); assert.ok(f.calls.every(call => call.method === 'GET'));
+  });
+}
+
 test('an empty explicitly selected existing fixture can be adopted with an explicit new-plan zero', async t => {
   const f = await fixture(t); seed(f, 'ses_empty', 'Empty', true);
   const result = await f.call(adoptArgs(f, 'ses_empty', 0));

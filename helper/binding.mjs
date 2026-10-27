@@ -327,7 +327,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
     if (messages.length) {
       need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
-      const history = inspectMessages({ messageID: messages[0].id }, messages);
+      const history = inspectMessages({ messageID: messages[0].id }, messages, { adopting: true });
       need(!history.kind, 'Existing session failed/interrupted; no automatic recovery');
       completion(history, session, shells);
     } else need(session.outcome === undefined && session.time.idle === undefined, 'Existing history/status mismatch');
