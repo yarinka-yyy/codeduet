@@ -6,7 +6,8 @@ Use only the operation sections needed: [connection](#connection),
 [binding and reuse](#binding-and-reuse),
 [preflight](#preflight),
 [explicit adoption](#explicit-existing-session-adoption),
-[submit intent](#submit-intent), [wait](#wait), [resume observation](#resume-observation), [reply](#reply),
+[submit intent](#submit-intent), [event observer](OBSERVER.md),
+[foreground wait](#wait), [manual resume observation](#resume-observation), [reply](#reply),
 [completion](#completion), [inspection](#inspect-and-sessions) and
 [plan transitions](#plan-review-transitions). Read
 [diagnostics](#diagnostics) when interpreting a failure. Existing-session
@@ -251,9 +252,10 @@ as the identified prompt. It is not fetched on each ordinary timer tick.
 
 Default total deadline is one hour, selectable with --timeout-ms from 1 to
 3600000 milliseconds. The request/initial event-handshake limits remain twenty
-seconds. A deadline is STOPPED/uncertain, never completed. Keep the CLI process
-inside an active Codex tool turn, continuing the same process handle through
-bounded host waits. The helper emits no heartbeat/token/tool progress output.
+seconds. A deadline is STOPPED/uncertain, never completed. Ordinary skill use
+runs this wait inside the detached [event observer](OBSERVER.md) and ends the
+Codex turn. Only an explicitly selected manual/diagnostic foreground wait keeps
+the same process handle through host yields. The helper emits no progress output.
 A host yield does not reconnect or send another DeepSeek prompt; it may still
 return control to GPT. Do not add advisor history reads or narrate progress.
 A received stream gap stops coordination without reconnect/resubmit.

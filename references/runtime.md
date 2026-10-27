@@ -39,9 +39,9 @@ bounded retry rules; POSTs and an established SSE wait do not reconnect. An
 exhausted bootstrap leaves a PREPARING/FINISHED pair unchanged and stops an
 active assignment conservatively. See the [connection protocol](../helper/PROTOCOL.md#connection).
 
-For routine assignments, consult only this check when the runtime/helper path
-or connection needs verification. The remaining sections apply to explicit
-package work or a shared-store access blocker.
+For routine assignments, consult this check only when the runtime/helper path
+or connection needs verification. Event waiting uses the [observer](../helper/OBSERVER.md).
+Package sections apply only to explicit packaging work.
 
 ## Shared-store access
 
@@ -58,8 +58,16 @@ A `history-uncertain` result with `history-correlation` identifies unverified
 synthetic input, not a connection failure. Do not resend a delivered assignment
 or manually clear STOPPED; preserve the assignment/message IDs for diagnosis.
 After explicit user authorization to continue observation, use
-[resume-watch](../helper/PROTOCOL.md#resume-observation) in the original owner
+[observer arm --resume](../helper/OBSERVER.md) in the original owner
 Codex chat with those exact IDs. No count import, new pair or replacement store.
+
+## Event runtime
+
+The [event observer](../helper/OBSERVER.md) also needs the Desktop-bundled Codex
+CLI with a verified queue command. Pass its absolute executable via --codex-exe;
+do not assume the unversioned launcher is the same binary. The observer checks
+version/help before launch and its binary hash before notification. It is an
+ordinary per-assignment process; no installation, service or autostart is needed.
 
 ## Build a folder without installing it
 
@@ -93,5 +101,5 @@ conventional repository-local location is
 <project>/.agents/skills/code-duet/. Do not install it automatically; metadata
 requests explicit-only invocation.
 
-Wait timing, ownership and host-yield behavior are defined once in the
-[workflow](workflow.md) and [helper protocol](../helper/PROTOCOL.md#wait).
+Event waiting and lifecycle are defined in the [observer](../helper/OBSERVER.md);
+manual foreground wait timing remains in the [helper protocol](../helper/PROTOCOL.md#wait).

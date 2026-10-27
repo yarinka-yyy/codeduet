@@ -43,7 +43,7 @@ Confirm that the prior writer and known project-changing operations ended.
 Runtime STOPPED or uncertain delivery is a blocker, not a reason to start a
 fresh chat or another executor. On an explicit continuation request, first read
 the checkpoint and inspect old execution. For observation of a delivered
-assignment, use explicitly authorized [resume-watch](../helper/PROTOCOL.md#resume-observation).
+assignment, use explicitly authorized [observer arm --resume](../helper/OBSERVER.md).
 It does not retry delivery or permit project edits during execution. No automatic recovery is supplied.
 
 Record the pre-dispatch baseline in the plan: physical workspace/checkout, Git
@@ -92,17 +92,23 @@ Answer ordinary questions autonomously within scope; assess permissions against
 the actual operation and governing approvals. Recheck pending requests and use
 their exact reply route. Do not use OpenCode to bypass a sandbox/approval rule.
 
-Keep wait in the same active tool turn with bounded host waits and required user
-updates. Token deltas, submit admission, silence, timeout and final text alone
+After delivery arm the [event observer](../helper/OBSERVER.md) in this same chat.
+Once it confirms readiness, finish with a short waiting notice and end the turn.
+Do not keep a tool wait or schedule model heartbeats/status polls. The ordinary
+Node process waits; only a result, question, permission request or failure queues
+one wake hint. Consume its receipt, recheck live state and handle the actual
+outcome. After a scoped answer/reply, rearm and end the turn again. A stale event
+may return observing: rearm the unchanged assignment without resending it.
+A failed startup or uncertain queue result requires diagnosis, not another launch.
+Token deltas, submit admission, silence, timeout and final text alone
 do not transfer ownership. Bootstrap retries only the safe registration/info/model
 GETs described in the [protocol](../helper/PROTOCOL.md#connection). If they
 exhaust before dispatch, PREPARING/FINISHED remain unchanged; active/review phases
 stop with a diagnostic. POST delivery is never retried, and an established SSE
 wait never reconnects. Do not restart services, switch models or roll back.
-Continue the same helper process through host yields; do not relaunch it after
-a yield. A host yield may return to GPT, and quiet chat does not prove zero GPT
-requests. Background hooks do not wake an idle turn; strict event-only wakeup is
-not established.
+The foreground wait/resume-watch commands remain diagnostic/manual alternatives;
+do not silently use them when event waiting is unavailable. No Windows service,
+autostart, recurring automation or changes to Codex settings are required.
 
 REVIEWING starts only with completed-for-review from gate 003: identified current
 assignment final, ended bound execution, no pending tool/form/permission and all

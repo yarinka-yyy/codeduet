@@ -80,7 +80,7 @@ export function validateState(state) {
   return state;
 }
 
-function readState(path) {
+export function readState(path) {
   if (!existsSync(path)) return { schema: 1, bindings: [], plans: [] };
   let raw;
   try { raw = readFileSync(path, 'utf8'); }
@@ -1026,7 +1026,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return { ...result, diagnostic, retried, bootstrap: error?.bootstrap };
       });
     },
-    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal, resume } = {}) {
+    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal, resume, onReady, once = false } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000, 'Wait timeout must be 1..3600000 ms');
       const resuming = resume !== undefined;
       if (resuming) need(resume && Object.keys(resume).length === 3 &&
@@ -1127,6 +1127,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               need(confirmed.active.type === 'running' && Object.keys(confirmed.active).length === 1, 'Unknown active execution status');
               record((state, binding) => { delete binding.pending; binding.phase = 'EXECUTING'; }, 'observing');
             }
+            onReady?.(); onReady = undefined;
+            if (once) return { kind: 'observing', phase: expected.phase, sessionID: expected.sessionID,
+              assignmentID: expected.assignmentID, messageID: expected.messageID, correctionCount: expected.correctionCount };
             await stream.next(Math.min(5_000, timeoutMs));
           }
         } catch (error) {

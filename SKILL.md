@@ -40,12 +40,16 @@ and reuse the established canonical directory.
 
 Before a helper operation, read the [command reference](helper/PROTOCOL.md#command-reference)
 and only its relevant technical sections. Submit one identified assignment
-once. While execution or a question is active, DeepSeek owns project edits and
-checks; Codex waits. Start review only after completed-for-review, inspect the
+once. After delivery use the [event observer](helper/OBSERVER.md): arm it for
+this actual chat, confirm observer-armed, report briefly and **end the turn**.
+Do not loop on wait/status tools or narrate unchanged progress. On its wake hint,
+consume that receipt once and revalidate the live assignment before acting.
+While execution or a question is active, DeepSeek owns project edits and
+checks. Start review only after completed-for-review, inspect the
 actual changes, then send at most one consolidated correction at a time. An
 uncertain mutation is STOPPED; never resend it.
 Only on an explicit request to resume observation of an already delivered
-assignment, use [resume-watch](helper/PROTOCOL.md#resume-observation). This is a
+assignment, use [observer arm --resume](helper/OBSERVER.md). This is a
 separate route from dispatch preflight; inspect alone does not authorize it.
 Handle scoped questions and permission requests within the user's and runtime
 authority. Send source corrections to the executor; do not implement them yourself.

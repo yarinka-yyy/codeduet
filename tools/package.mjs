@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export const packageFiles = Object.freeze([
   'SKILL.md', 'agents/openai.yaml',
   'helper/cli.mjs', 'helper/connection.mjs', 'helper/binding.mjs',
-  'helper/interaction.mjs', 'helper/PROTOCOL.md',
+  'helper/interaction.mjs', 'helper/PROTOCOL.md', 'helper/observer.mjs', 'helper/OBSERVER.md',
   'references/workflow.md', 'references/assignment-template.md',
   'references/plan-template.md', 'references/runtime.md', 'references/existing-session.md', 'tools/package.mjs',
 ]);

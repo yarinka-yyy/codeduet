@@ -70,8 +70,9 @@ and saved boundary, forms/permissions, shells and other writers before its
 single POST. A changed session stops dispatch. The new prompt/message ID
 separates old answers and questions from the current assignment.
 
-Then follow the same wait/reply/completion/independent-review/next/finish route.
+Then follow the same event-observer/reply/completion/independent-review/next/finish route.
 There is no separate correction loop, completion rule or recovery mode.
 After accepted blocks the boundary advances through the same review gate;
 each physical plan keeps its count, including an uncertain reserved correction.
-Waiting retains the documented host/GPT-wakeup limitation from 007.
+Use the [event observer](../helper/OBSERVER.md) and end the Codex turn after arm.
+The foreground diagnostic wait still has the documented host/GPT-yield limitation.
