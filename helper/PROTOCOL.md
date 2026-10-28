@@ -186,8 +186,8 @@ OpenCode2.2.0 projects session.instructions.updated to these notices in
 session/message-updater.ts. This is a local-engine trust boundary, not a signature:
 compromised plugins or edited engine storage are not authenticated by metadata.
 
-Only edit tool.execution rejections with the exact native missing-oldString or
-multiple-match error, valid ran/completed times and a resolvable target inside the
+Among write operations, only edit tool.execution rejections with the exact native
+missing-oldString or multiple-match error, valid ran/completed times and a resolvable target inside the
 workspace can be recoverable. These errors occur before fileMutation.write.
 A later completed edit of that same physical file, with valid input/timestamps,
 records recoveredToolErrors (original message/call and later call IDs). The
@@ -199,10 +199,35 @@ still mandatory. This grants review only, never automatic task acceptance.
 
 Without a later successful edit the rejection remains failed at terminal idle.
 While the executor is still running it is pending; software observation and a
-correlated question/permission remain possible. Other tool errors, provider errors,
+correlated question/permission remain possible. Unclassified tool errors, provider errors,
 failed/interrupted execution and failed compaction remain failures, even after a
 later successful idle. A success on a different file or before the rejection
 cannot clear it. Error records and receipts are never rewritten or deleted.
+
+The shared history/completion gate also recognizes two read-only warnings:
+read's exact `Cannot read binary file: <path>` rejection with a nonempty path input,
+and webfetch's exact `StatusCode: non 2xx status code (429 GET <url>)` for the same
+HTTP(S) input URL. Both require native unknown/tool.execution error type and
+finite ordered ran/completed timestamps. A generic read error, shell command,
+POST429, mismatched URL or unknown variant remains blocking. Successful searches
+with no matches are ordinary completed operations, not tool failures.
+
+These warnings need no inferred fallback to permit independent read-only review.
+They remain error operations with semanticRecoveryVerified:false, even when a
+later shell returns exit0 or alternative research succeeds. The advisor must
+verify whether missing/corrupt evidence affects the task before acceptance or
+preparing a correction. No decoding success is inferred from shell status.
+The final must follow every completed tool, with successful correlated idle,
+no pending requests, known ended shells and an unchanged assignment boundary.
+
+toolErrors lists every tool error with sanitized message/call/tool IDs,
+classification (read-only-warning, recovered-edit or blocking), known warning
+category and semanticRecoveryVerified:false. It never includes raw errors,
+URLs, commands or paths. exchangeFailure retains the first blocking reason for
+compatibility; inspect the complete toolErrors list, including warnings when a
+provider/history failure also blocks. Both observation routes and completion
+results retain this evidence. Neither warnings nor reviewAllowed grant dispatch;
+ordinary authorization, next/adopt/submit and uncertain-mutation guards remain.
 
 Native compaction records remain in that exchange: completed status, known
 reason/time, fixed model/summary shape and a later successful terminal idle
@@ -478,11 +503,11 @@ permission handling still uses this exchange's tools. Once inactive, unresolved
 failure/interruption stops; next/finish/adopt/dispatch gates remain unchanged.
 Terminal failure requires a second unchanged activity/request/history snapshot;
 a concurrent restart or request keeps observation active and is reconciled again.
-The narrow recoverable-edit rule above still controls which errors can pass
-completion; arbitrary tool errors are not erased or declared recovered.
+The narrow recoverable-edit and read-only-warning rules above control which
+errors can pass completion; arbitrary tool errors are not erased or declared recovered.
 Observation results expose executorActivity, exchangeOutcome and sanitized
-exchangeFailure independently. Ordinary wait, resume and state commits recheck
-the pinned correction count, preserving a concurrent change rather than writing
+exchangeFailure and all toolErrors independently. Ordinary wait, resume and
+state commits recheck the pinned correction count, preserving a concurrent change rather than writing
 a stale phase. A stale observer error still sends one receipt hint to its original
 chat; consume must refuse the changed pins before any action.
 

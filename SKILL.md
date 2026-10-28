@@ -53,7 +53,11 @@ observer. Passive completion grants read-only review, never correction dispatch;
 use the [guarded transition](references/existing-session.md#from-passive-observation-to-a-new-correction).
 Historical exchange errors do not end observation while the selected executor is
 running or suppress a fresh correlated question/permission. Keep their failure
-evidence; they still block successful completion.
+evidence. Only the documented binary-read and webfetch GET429 rejections can
+permit review with read-only warnings; unknown errors and uncertain writes still
+block completion. Inspect every toolErrors entry and independently verify missing
+evidence; a warning, fallback exit0 or successful idle does not prove recovery or
+acceptance. Review permission never authorizes another dispatch.
 While execution or a question is active, DeepSeek owns project edits and
 checks. Start review only after completed-for-review, inspect the
 actual changes, then send at most one consolidated correction at a time. An

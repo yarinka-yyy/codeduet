@@ -52,6 +52,9 @@ Failed/interrupted/unknown history is a stop, not an automatic recovery route.
 Known no-write edit rejections can pass only the shared
 [recoverable-edit gate](../helper/PROTOCOL.md#execution-history-and-recoverable-edits);
 the retained recovery evidence still requires independent semantic review.
+The same shared gate permits documented binary-read/GET429 warnings. Read every
+toolErrors entry and independently assess missing evidence before using this
+transition; neither a warning nor external-completed grants correction authority.
 
 Adoption takes the cooperative store lock, rechecks identity/idle/history and
 saves the binding atomically. It makes no create, prompt, rename, model or
@@ -90,8 +93,9 @@ The foreground diagnostic wait still has the documented host/GPT-yield limitatio
    invalidates the old observation boundary: inspect the explicitly selected
    session again, never resend or silently retarget the original assignment.
 2. A fresh external-completed permits independent read-only review of actual
-   changes, including recoveredToolErrors. Confirm the remaining correction scope
-   under the user's authorization; it is not automatic acceptance or dispatch.
+   changes, including recoveredToolErrors and every toolErrors warning. Confirm
+   the remaining correction scope under the user's authorization; it is not
+   automatic acceptance or dispatch.
 3. Inspect every overlapping helper binding/lease/observer. Resolve each through
    its original owner and supported commands. A schema2 dead observer can use
    ownership recover; that archives only its lease, never releases an unfinished

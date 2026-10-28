@@ -1183,6 +1183,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               'Saved assignment/count changed during wait; no stale state write'));
             const progress = { executorActivity: current.active ? 'running' : 'idle',
               exchangeOutcome: history.kind ?? 'in-progress', reviewAllowed: false, dispatchAllowed: false,
+              ...(history.toolErrors.length ? { toolErrors: history.toolErrors } : {}),
               ...(history.exchangeFailure ? { exchangeFailure: history.exchangeFailure } : {}) };
             const failure = history.kind ?? (current.session.time?.idle >= expected.submittedAt &&
               ['failed', 'interrupted'].includes(current.session.outcome) ? current.session.outcome : null);
@@ -1216,7 +1217,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
                 JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during completion confirmation');
               if (stream.fault || combined.aborted) continue;
-              return { ...record((state, binding) => { delete binding.pending; binding.phase = 'REVIEWING'; }, result.kind), result: result.result };
+              return { ...record((state, binding) => { delete binding.pending; binding.phase = 'REVIEWING'; }, result.kind),
+                ...progress, exchangeOutcome: result.kind, reviewAllowed: true, result: result.result };
             }
             if (resuming && expected.phase === 'STOPPED') {
               need(current.active?.type === 'running', 'No correlated active execution, request or completed result');

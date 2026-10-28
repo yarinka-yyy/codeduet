@@ -181,6 +181,20 @@ function rejectedEdit(tool, workspace) {
   } catch { return null; }
 }
 
+function readOnlyToolError(tool) {
+  const { input, error } = tool.state ?? {};
+  if (!['unknown', 'tool.execution'].includes(error?.type) ||
+    !Number.isFinite(tool.time?.ran) || !Number.isFinite(tool.time?.completed) || tool.time.completed < tool.time.ran) return null;
+  if (tool.name === 'read' && typeof input?.path === 'string' && input.path &&
+    /^Cannot read binary file: [^\r\n\0]+$/.test(error.message)) return 'binary-read-rejected';
+  if (tool.name === 'webfetch' && typeof input?.url === 'string' &&
+    error.message === `StatusCode: non 2xx status code (429 GET ${input.url})`) {
+    try { if (['http:', 'https:'].includes(new URL(input.url).protocol)) return 'http-rate-limit'; }
+    catch { /* Unknown URLs do not establish a read-only request. */ }
+  }
+  return null;
+}
+
 export function inspectMessages(binding, messages, { adopting = false } = {}) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');
   const tail = messages.slice(1);
@@ -219,9 +233,19 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   const tools = assistants.flatMap(message => message.content.filter(part => part.type === 'tool').map(part => ({ ...part, messageID: message.id })));
   const final = assistants.at(-1);
   const idle = tail.at(-1);
-  const recoveredToolErrors = [], unresolved = [];
+  const evidence = (reason, messageID, tool) => ({ reason,
+    ...(/^msg_[a-zA-Z0-9]{1,160}$/.test(messageID) ? { messageID } : {}),
+    ...(tool && /^[a-zA-Z0-9_-]{1,160}$/.test(tool.id) ? { toolID: tool.id } : {}),
+    ...(tool && /^[a-zA-Z0-9_-]{1,80}$/.test(tool.name) ? { toolName: tool.name } : {}) });
+  const recoveredToolErrors = [], unresolved = [], toolErrors = [];
   for (const [index, tool] of tools.entries()) {
     if (tool.state?.status !== 'error') continue;
+    const category = readOnlyToolError(tool);
+    if (category) {
+      toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: 'read-only-warning', category,
+        semanticRecoveryVerified: false });
+      continue;
+    }
     const path = rejectedEdit(tool, binding.workspace);
     const repair = path && tools.slice(index + 1).find(candidate => {
       if (candidate.name !== 'edit' || candidate.state?.status !== 'completed' ||
@@ -236,13 +260,11 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     if (repair) recoveredToolErrors.push({ messageID: tool.messageID, id: tool.id, recoveredBy: repair.id,
       evidence: 'later-edit-same-file', semanticRecoveryVerified: false });
     else unresolved.push({ tool, recoverable: !!path });
+    toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: repair ? 'recovered-edit' : 'blocking',
+      ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
-  const history = { tools, final, idle, tail, recoveredToolErrors };
+  const history = { tools, final, idle, tail, recoveredToolErrors, toolErrors };
   // Keep history failure separate from current executor activity; preserve tools for questions.
-  const evidence = (reason, messageID, tool) => ({ reason,
-    ...(/^msg_[a-zA-Z0-9]{1,160}$/.test(messageID) ? { messageID } : {}),
-    ...(tool && /^[a-zA-Z0-9_-]{1,160}$/.test(tool.id) ? { toolID: tool.id } : {}),
-    ...(tool && /^[a-zA-Z0-9_-]{1,80}$/.test(tool.name) ? { toolName: tool.name } : {}) });
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
     failed.error ? 'message-error' : failed.retry ? 'retry-record' : failed.type === 'idle' ? 'failed-idle' :
       failed.type === 'compaction' ? 'failed-compaction' : 'assistant-finish', failed.id) };
@@ -302,8 +324,9 @@ export function completion(history, session, shells) {
   const recovered = history.recoveredToolErrors ?? [];
   need(recovered.every(value => tools.some(tool => tool.id === value.recoveredBy &&
     tool.time?.completed <= final.time.completed)), 'No completed final after recovered edit');
-  need(tools.every(tool => (tool.state?.status === 'completed' || recovered.some(value => value.id === tool.id &&
-    value.messageID === tool.messageID)) && Number.isFinite(tool.time?.completed)), 'Outstanding/unknown tool operation');
+  need(tools.every(tool => (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
+    (readOnlyToolError(tool) || recovered.some(value => value.id === tool.id && value.messageID === tool.messageID))) &&
+    Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed), 'Outstanding/unknown tool operation');
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
   need(shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
   // Detached processes cannot be certified by a completed launcher. Stop instead of supervising the OS.
@@ -326,5 +349,6 @@ export function completion(history, session, shells) {
   const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   need(output.trim(), 'Empty final response');
   return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })),
+    ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
     ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
 }

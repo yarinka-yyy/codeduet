@@ -121,7 +121,10 @@ test('once recheck returns observing for a stale question without waiting or sto
 });
 
 test('hints carry only a validated receipt, never private question/result/commands', () => {
-  assert.ok(wakeHint(chatID).includes('$code-duet'));
+  const hint = wakeHint(chatID);
+  assert.ok(hint.includes('$code-duet')); assert.ok(hint.includes('consume ' + chatID));
+  assert.ok(hint.includes('grants no new authority'));
+  assert.ok(!hint.includes('updated skill')); assert.ok(!hint.includes('authorized notification'));
   assert.throws(() => wakeHint('x; private payload'), /Invalid/);
 });
 

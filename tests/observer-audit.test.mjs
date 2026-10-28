@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join, basename } from 'node:path';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
@@ -62,13 +62,50 @@ for (const external of [true, false]) for (const name of ['webfetch', 'read', 's
     const saved = f.o.status(started.id).result;
     assert.equal(saved.kind, 'failed'); assert.equal(saved.exchangeFailure.reason, 'tool-error');
     assert.equal(saved.exchangeFailure.toolID, 'call_error');
+    assert.equal(saved.toolErrors[0].classification, 'blocking');
     assert.ok(!JSON.stringify(saved).includes('PRIVATE_ERROR_CREDENTIAL'));
     const consumed = await f.o.consume(started.id);
     assert.equal(consumed.kind, external ? 'failed' : 'stopped');
+    assert.equal(consumed.observedExchangeFailure.toolID, 'call_error');
+    assert.equal(consumed.observerFailure, undefined);
     assert.equal(f.posts(`/api/session/${f.sessionID}/prompt`), external ? 0 : 1);
     if (!external) assert.equal(f.state().plans[0].correctionCount, 9);
   });
 }
+
+for (const external of [true, false]) test(`${external ? 'passive' : 'bound'} read-only errors stay observed, then allow review only with all warnings`, async t => {
+  const f = await setup(t, external), now = Date.now();
+  f.messages.get(f.sessionID).push({ id: 'msg_errors', type: 'assistant', model, time: { completed: now }, content: [
+    { type: 'tool', id: 'call_read', name: 'read', time: { ran: now, completed: now },
+      state: { status: 'error', input: { path: 'PRIVATE_PATH' }, error: { type: 'unknown', message: 'Cannot read binary file: PRIVATE_PATH' } } },
+    { type: 'tool', id: 'call_web', name: 'webfetch', time: { ran: now, completed: now },
+      state: { status: 'error', input: { url: 'https://example.com/PRIVATE_QUERY' }, error: { type: 'unknown',
+        message: 'StatusCode: non 2xx status code (429 GET https://example.com/PRIVATE_QUERY)' } } },
+  ] });
+  const stateBytes = () => existsSync(f.statePath) ? readFileSync(f.statePath, 'utf8') : null;
+  const before = stateBytes(), from = f.calls.length;
+  const started = await f.arm(); assert.equal(started.kind, 'observer-armed'); assert.equal(f.sent.length, 0);
+  if (external) {
+    const progress = await externalOutcome(f.client, f.stateRoot,
+      await selectExternal(f.client, f.stateRoot, f.workspace, f.plan, f.sessionID, f.messageID));
+    assert.equal(progress.kind, 'observing'); assert.equal(progress.executorActivity, 'running');
+    assert.equal(progress.reviewAllowed, false); assert.equal(progress.dispatchAllowed, false);
+    assert.equal(progress.toolErrors.length, 2);
+  }
+  f.finish(f.sessionID); await f.end();
+  const saved = f.o.status(started.id).result;
+  assert.equal(saved.toolErrors.length, 2); assert.ok(!JSON.stringify(saved).includes('PRIVATE_'));
+  const consumed = await f.o.consume(started.id);
+  assert.equal(consumed.kind, external ? 'external-completed' : 'completed-for-review');
+  assert.equal(consumed.executorActivity, 'idle'); assert.equal(consumed.reviewAllowed, true);
+  assert.equal(consumed.dispatchAllowed, false); assert.equal(consumed.taskSent, false);
+  assert.equal(consumed.toolErrors.length, 2); assert.deepEqual(consumed.result.toolErrors, consumed.toolErrors);
+  assert.ok(consumed.toolErrors.every(e => e.classification === 'read-only-warning' && !e.semanticRecoveryVerified));
+  assert.ok(f.calls.slice(from).every(c => c.method === 'GET'));
+  assert.equal(f.posts(`/api/session/${f.sessionID}/prompt`), external ? 0 : 1);
+  if (external) assert.equal(stateBytes(), before);
+  else assert.equal(f.state().plans[0].correctionCount, 9);
+});
 
 test('ordinary wait rejects unknown activity and does not claim readiness', async t => {
   const f = await setup(t); f.active[f.sessionID] = { type: 'unknown' };

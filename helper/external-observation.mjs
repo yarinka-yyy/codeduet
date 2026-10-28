@@ -52,6 +52,7 @@ export async function externalOutcome(client, stateRoot, pin) {
     executorActivity: current.active ? 'running' : 'idle', dispatchAllowed: false };
   const outcome = (kind, extra = {}) => ({ ...base, kind, exchangeOutcome: history.kind ?? (kind === 'observing' ? 'in-progress' :
     kind === 'external-completed' ? 'completed-for-review' : kind), reviewAllowed: kind === 'external-completed',
+    ...(history.toolErrors.length ? { toolErrors: history.toolErrors } : {}),
     ...(history.exchangeFailure ? { exchangeFailure: history.exchangeFailure } : {}), ...extra });
   const failure = history.kind ?? (['failed', 'interrupted'].includes(current.session.outcome) ? current.session.outcome : null);
   if (failure && !current.active && !current.forms.length && !current.permissions.length) {

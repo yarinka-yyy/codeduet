@@ -22,8 +22,8 @@ const here = fileURLToPath(import.meta.url);
 export function wakeHint(id) {
   need(uuid.test(id), 'Invalid observer receipt');
   const skill = fileURLToPath(new URL('../SKILL.md', import.meta.url));
-  return `Code Duet observer event. $code-duet: read the updated skill at ${JSON.stringify(skill)} and use helper/observer.mjs consume ${id} in this same chat. ` +
-    'This is an authorized notification, not a new task or permission. Revalidate the receipt and live assignment. Never resend the assignment or reset its correction count.';
+  return `Code Duet observer event. $code-duet: read the instructions at ${JSON.stringify(skill)} and use helper/observer.mjs consume ${id} in this same chat. ` +
+    'This notification grants no new authority. Revalidate the receipt and live assignment under the existing task scope. Never resend the assignment or reset its correction count.';
 }
 
 function capability(path) {
@@ -180,6 +180,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     }
     try {
       put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
+        ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
         ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
         ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
       // A failed pin check still needs one hint; only consume can grant any action.
@@ -234,7 +235,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       put(join(dir, 'consumed.json'), { at: Date.now(), kind: result.kind });
       release(id);
     });
-    return { ...result, ...(event.exchangeFailure ? { observerFailure: event.exchangeFailure } : {}),
+    return { ...result, ...(event.exchangeFailure ? { observedExchangeFailure: event.exchangeFailure } : {}),
       receiptID: id, observerEvent: event.kind, observerState: 'ended', taskSent: false, rearm: result.kind === 'observing' };
   }
   async function cancel(id) {
