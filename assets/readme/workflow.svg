@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 780" role="img" aria-labelledby="title desc">
+  <title id="title">How Code Duet works</title>
+  <desc id="desc">Your task goes to Codex for planning, DeepSeek for implementation, and Codex for review. Corrections go back to DeepSeek; accepted work leads to the final report.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#527895" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <style>text{font-family:Segoe UI,Arial,sans-serif;fill:#233c53}.title{font-size:28px;font-weight:700}.body{font-size:19px}.small{font-size:17px;font-weight:600}.line{fill:none;stroke:#527895;stroke-width:3;stroke-linecap:round;marker-end:url(#arrow)}</style>
+  </defs>
+  <rect width="1000" height="780" rx="28" fill="#fbf8f1"/>
+  <path d="M187 112 C190 85 210 71 241 73 L762 74 Q805 73 805 104 L803 146 Q805 171 771 173 L241 174 Q195 174 189 150 Z" fill="#e8f0f3" stroke="#718da0" stroke-width="2"/>
+  <text x="500" y="115" class="title" text-anchor="middle">1 · Your task</text><text x="500" y="145" class="body" text-anchor="middle">Tell Codex what you want to build</text>
+  <path class="line" d="M500 176 L500 205"/>
+  <rect x="190" y="210" width="615" height="100" rx="24" fill="#fffefa" stroke="#9caeb7" stroke-width="2"/>
+  <circle cx="245" cy="260" r="23" fill="#fff" stroke="#748d9d" stroke-width="2"/><text x="500" y="253" class="title" text-anchor="middle">2 · Codex plans</text><text x="500" y="283" class="body" text-anchor="middle">Investigate the project and prepare the assignment</text>
+  <path class="line" d="M500 313 L500 342"/>
+  <rect x="190" y="347" width="615" height="100" rx="24" fill="#e0eff5" stroke="#6c9eb6" stroke-width="2"/>
+  <circle cx="245" cy="397" r="23" fill="#4489ad" stroke="#326582" stroke-width="2"/><text x="500" y="390" class="title" text-anchor="middle">3 · DeepSeek builds</text><text x="500" y="420" class="body" text-anchor="middle">Implement the assignment in OpenCode</text>
+  <path class="line" d="M500 450 L500 479"/>
+  <rect x="190" y="484" width="615" height="100" rx="24" fill="#fffefa" stroke="#9caeb7" stroke-width="2"/>
+  <circle cx="245" cy="534" r="23" fill="#fff" stroke="#748d9d" stroke-width="2"/><text x="500" y="527" class="title" text-anchor="middle">4 · Codex reviews</text><text x="500" y="557" class="body" text-anchor="middle">Review the changes and run the required checks</text>
+  <path class="line" d="M345 587 L345 618"/><path class="line" d="M655 587 L655 618"/>
+  <rect x="198" y="623" width="292" height="76" rx="20" fill="#e8f0f3" stroke="#8da7b7" stroke-width="2"/>
+  <text x="344" y="668" class="small" text-anchor="middle">Corrections needed</text>
+  <rect x="512" y="623" width="292" height="76" rx="20" fill="#e4f1e8" stroke="#8bac9c" stroke-width="2"/>
+  <text x="658" y="668" class="small" text-anchor="middle">Criteria met → report to you</text>
+  <path class="line" d="M196 661 C78 661 86 399 181 398"/><text x="92" y="521" class="small" text-anchor="middle">Revise</text>
+  <text x="500" y="747" class="body" text-anchor="middle">One shared project. One writer at a time.</text>
+</svg>
