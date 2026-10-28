@@ -1,5 +1,7 @@
 ![Code Duet — GPT plans. DeepSeek builds. GPT reviews. A shared workflow with DeepSeek in OpenCode.](assets/readme/code-duet.png)
 
+**English** · [Русский](README.ru.md)
+
 Code Duet is a Codex skill that turns **GPT in Codex** and **DeepSeek in OpenCode** into a coordinated development workflow. Describe what you want to build: GPT studies your project and prepares the plan, DeepSeek writes the code, and GPT checks the result and guides the corrections.
 
 You follow the work in your Codex chat, with a shared plan in your project and a final report of the changes and checks. Code Duet handles the handoffs between the two tools.
