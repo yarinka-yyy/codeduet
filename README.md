@@ -1,4 +1,4 @@
-![Code Duet — GPT plans. DeepSeek builds. GPT reviews. A shared workflow with DeepSeek in OpenCode.](assets/readme/code-duet.png)
+![Code Duet — GPT plans. DeepSeek builds. GPT reviews. A shared workflow with DeepSeek in OpenCode.](assets/readme/code-duet-transparent.png)
 
 **English** · [Русский](README.ru.md)
 
@@ -8,7 +8,9 @@ Code Duet brings the two AIs together: GPT handles planning, difficult decisions
 
 ## How it works
 
-![Your task goes to GPT for planning, DeepSeek for implementation, and GPT for review. Corrections return to DeepSeek. Ready leads to the final result.](assets/readme/how-it-works.png)
+<p align="center">
+  <img src="assets/readme/how-it-works-transparent.png" width="90%" alt="Your task goes to GPT for planning, DeepSeek for implementation, and GPT for review. Corrections return to DeepSeek. Ready leads to the final result.">
+</p>
 
 <details>
 <summary>The workflow in words</summary>
