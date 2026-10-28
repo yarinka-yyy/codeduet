@@ -1,77 +1,78 @@
-# Code Duet
+![Code Duet — GPT plans. DeepSeek builds. GPT reviews. A shared workflow with DeepSeek in OpenCode.](assets/readme/code-duet.png)
 
-![Code Duet: GPT plans, DeepSeek builds, GPT reviews. The two work together over a shared plan.](assets/readme/hero-v2.png)
+Code Duet is a Codex skill that turns **GPT in Codex** and **DeepSeek in OpenCode** into a coordinated development workflow. Describe what you want to build: GPT studies your project and prepares the plan, DeepSeek writes the code, and GPT checks the result and guides the corrections.
 
-**English** · Русский and 简体中文 translations coming after the English edition is approved.
-
-**One task. Two roles. A shared plan.**
-
-Code Duet connects **GPT in Codex** with **DeepSeek in OpenCode**. Give GPT a task: it explores your project, prepares a plan, and hands the work to DeepSeek. When DeepSeek finishes, GPT reviews the result and requests corrections if needed. You get a report and stay in control of acceptance.
-
-> **Preview:** Code Duet is under active development. Its coordination and event-observer paths have been tested with simulated executors; full acceptance across real projects is still in progress. Check the limitations below before using it on an important task.
+You follow the work in your Codex chat, with a shared plan in your project and a final report of the changes and checks. Code Duet handles the handoffs between the two tools.
 
 ## How it works
 
-![Illustrated workflow: your task goes to GPT for planning, DeepSeek for implementation, and GPT for review. Corrections return to DeepSeek; the final result goes to you.](assets/readme/workflow-v2.png)
+![Your task goes to GPT for planning, DeepSeek for implementation, and GPT for review. Corrections return to DeepSeek. Ready leads to the final result.](assets/readme/how-it-works.png)
 
-1. **You describe the task** to GPT in Codex.
-2. **GPT investigates and plans**, then sends an identified assignment to DeepSeek in OpenCode.
-3. **DeepSeek implements** while Codex waits for an event.
-4. **GPT reviews** the changes and checks the result after the executor has finished.
-5. **Corrections or result:** if changes are needed, GPT sends a consolidated correction back to DeepSeek. When the criteria are met, GPT reports the result to you.
+<details>
+<summary>The workflow in words</summary>
 
-The two roles take turns on the same project. A passing check or an executor's final message alone does not establish that the work is correct, and the illustration shows the intended successful path rather than a guarantee.
+1. **You describe the task.** GPT explores the project and turns your request into a plan with clear scope and completion criteria.
+2. **DeepSeek implements.** GPT sends the assignment to OpenCode. DeepSeek edits the project and runs the planned checks.
+3. **GPT reviews.** After DeepSeek finishes, GPT inspects the actual changes and checks them against the plan.
+4. **Corrections or completion.** GPT sends a consolidated correction if more work is needed. When the criteria are met, it reports the result, the checks, and any remaining work.
 
-## What you get
+</details>
 
-![A shared plan, event-driven coordination, and review with corrections, illustrated in watercolor.](assets/readme/features-v2.png)
+## What Code Duet handles for you
 
-- **One shared plan.** Keep the task, progress, and review checkpoints in the project.
-- **A clear division of work.** Codex plans and reviews; DeepSeek implements in OpenCode.
-- **Fewer manual handoffs.** Send a bounded assignment through the helper and receive questions, completion, or errors in the same Codex chat.
-- **Event-driven waiting.** After the observer is armed, Codex can finish its turn and continue when a meaningful event arrives.
+| | How it helps |
+|---|---|
+| **One shared plan** | Keep the task, scope, progress, and review checkpoints together in your project. Create a plan or continue an existing one, including plans from Improve Codex. |
+| **Direct handoffs** | Assignments, executor questions, and results travel between Codex and OpenCode without copying messages between chats. |
+| **Quiet waiting** | A background observer watches for a question, completion, or error. GPT ends its turn while DeepSeek works and continues in the same chat when attention is needed. |
+| **Separate review** | DeepSeek implements; GPT reviews the files and checks the result. They take turns working on the project. |
+| **Continued context** | Saved session bindings, assignment IDs, and plan checkpoints keep later work connected to the right task. |
 
-### Less copying between chats
+The local helper communicates with OpenCode's running engine. Normal coordination leaves your mouse and keyboard free.
 
-Without a coordinator, you may need to copy the assignment to an executor, wait for a reply, and bring the result back for review. Code Duet coordinates those handoffs around the shared plan; you can focus on the task and the final review.
+## Quick start
 
-## Requirements
+### 1. Prepare your tools
 
-- Windows with the Codex desktop app and OpenCode Desktop.
-- Node.js 24.
-- OpenCode engine version **2.1.4 or 2.2.0**, with access to `opencode-go/deepseek-v4.1-flash`. Code Duet does not automatically switch models.
-- A project directory and a plan that Codex and OpenCode can both access.
+Use Windows with the **Codex desktop app**, **OpenCode Desktop**, and **Node.js 24**. OpenCode needs access to **DeepSeek V4.1 Flash through OpenCode Go**. Open your project in Codex and start OpenCode Desktop.
 
-## Install
+Supported OpenCode engine versions: **2.1.4** and **2.2.0**. The helper uses Node's built-in modules; no npm dependencies are required.
 
-Clone this repository, then package the skill into a **new** user skill directory. The packager refuses to overwrite an existing `code-duet` folder.
+### 2. Install the skill
+
+Run in PowerShell:
 
 ```powershell
 git clone https://github.com/yarinka-yyy/codeduet.git
 Set-Location codeduet
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
 node .\tools\package.mjs "$env:USERPROFILE\.codex\skills\code-duet"
 ```
 
-The parent `C:\Users\<you>\.codex\skills` must exist. If Code Duet is already installed, preserve and review the existing installation before replacing it. See [runtime and packaging](references/runtime.md) for the helper check and package details.
+The destination must be a new `code-duet` folder. For an existing installation or a project-local setup, see [installation and runtime](references/runtime.md).
 
-## Start a task
+### 3. Give GPT a task
 
-In a Codex chat opened in your project, invoke the skill and describe the work:
+In your project's Codex chat:
 
 ```text
 $code-duet
-Help me implement this task in the current project. Investigate it, prepare the plan, and coordinate implementation with DeepSeek in OpenCode.
+Add a CSV export to the reports page. Study the project, prepare a plan,
+and coordinate implementation and review with DeepSeek in OpenCode.
 ```
 
-Codex checks the workspace and plan, prepares a bounded assignment, and uses the existing OpenCode connection. Once an observer reports that it is armed, Codex ends its turn and resumes on an event. The user starts a new Codex chat manually when needed; a new chat does not reset a plan's correction count.
+You can also ask Code Duet to work from an existing plan. It reuses the chat's saved OpenCode pairing or creates a session for the project. To use a particular existing OpenCode session, select it explicitly; see [existing sessions](references/existing-session.md).
 
-You can also select an existing OpenCode session. Adoption requires the existing work to have safely ended.
+## Through questions and corrections
 
-## Limits and safety
+When DeepSeek asks a question, GPT answers within the task's scope and your permissions. Decisions that need your input come back to you. After implementation, GPT checks the work and sends corrections as a single assignment.
 
-- Up to **20 correction cycles** per plan after the initial assignment. The counter follows the plan across continuations.
-- An uncertain delivery stops the workflow; it is not automatically retried. An unknown owner or retained lock requires diagnosis, not a manual unlock.
-- The observer depends on the desktop app and its supported queue command. A closed app, shutdown, or changed CLI can prevent notification; inspect the existing receipt after an interruption.
-- Human review remains necessary. Simulation and passing tests do not replace acceptance in the real target project.
+Each plan allows up to **20 correction cycles** after the initial implementation. The count follows the plan across continuations. The final report explains what changed, what was checked, and what remains to be done.
 
-For commands and troubleshooting, see the [helper protocol](helper/PROTOCOL.md), [event observer](helper/OBSERVER.md), and [workflow](references/workflow.md).
+## Documentation
+
+- [Workflow and shared plans](references/workflow.md)
+- [Installation and local runtime](references/runtime.md)
+- [Selecting an existing OpenCode session](references/existing-session.md)
+- [Event observation and interrupted runs](helper/OBSERVER.md)
+- [Helper commands and diagnostics](helper/PROTOCOL.md)
