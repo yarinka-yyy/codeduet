@@ -1,33 +1,39 @@
 # Code Duet
 
-![An ivory planner and a blue builder working on a shared plan](assets/readme/hero.png)
+![Code Duet: GPT plans, DeepSeek builds, GPT reviews. The two work together over a shared plan.](assets/readme/hero-v2.png)
 
 **English** · Русский and 简体中文 translations coming after the English edition is approved.
 
-**Codex plans. DeepSeek builds. Codex reviews.**
+**One task. Two roles. A shared plan.**
 
-Code Duet connects Codex with DeepSeek in OpenCode so they can work on the same project and plan. Codex investigates the task, prepares an assignment, and reviews the result. DeepSeek implements the assigned work. You stay in control of the task and its acceptance.
+Code Duet connects **GPT in Codex** with **DeepSeek in OpenCode**. Give GPT a task: it explores your project, prepares a plan, and hands the work to DeepSeek. When DeepSeek finishes, GPT reviews the result and requests corrections if needed. You get a report and stay in control of acceptance.
 
 > **Preview:** Code Duet is under active development. Its coordination and event-observer paths have been tested with simulated executors; full acceptance across real projects is still in progress. Check the limitations below before using it on an important task.
 
 ## How it works
 
-![Workflow: your task goes to Codex for planning, DeepSeek for implementation, and Codex for review. Corrections return to DeepSeek; accepted work returns to you.](assets/readme/workflow.svg)
+![Illustrated workflow: your task goes to GPT for planning, DeepSeek for implementation, and GPT for review. Corrections return to DeepSeek; the final result goes to you.](assets/readme/workflow-v2.png)
 
-1. **You describe the task** to Codex.
-2. **Codex investigates and plans**, then sends an identified assignment to DeepSeek in OpenCode.
+1. **You describe the task** to GPT in Codex.
+2. **GPT investigates and plans**, then sends an identified assignment to DeepSeek in OpenCode.
 3. **DeepSeek implements** while Codex waits for an event.
-4. **Codex reviews** the changes and checks the result after the executor has finished.
-5. If corrections are needed, Codex sends one consolidated correction back to DeepSeek. When the criteria are met, Codex reports the result to you.
+4. **GPT reviews** the changes and checks the result after the executor has finished.
+5. **Corrections or result:** if changes are needed, GPT sends a consolidated correction back to DeepSeek. When the criteria are met, GPT reports the result to you.
 
-The two roles take turns on the same project. A passing check or an executor's final message alone does not establish that the work is correct.
+The two roles take turns on the same project. A passing check or an executor's final message alone does not establish that the work is correct, and the illustration shows the intended successful path rather than a guarantee.
 
 ## What you get
+
+![A shared plan, event-driven coordination, and review with corrections, illustrated in watercolor.](assets/readme/features-v2.png)
 
 - **One shared plan.** Keep the task, progress, and review checkpoints in the project.
 - **A clear division of work.** Codex plans and reviews; DeepSeek implements in OpenCode.
 - **Fewer manual handoffs.** Send a bounded assignment through the helper and receive questions, completion, or errors in the same Codex chat.
 - **Event-driven waiting.** After the observer is armed, Codex can finish its turn and continue when a meaningful event arrives.
+
+### Less copying between chats
+
+Without a coordinator, you may need to copy the assignment to an executor, wait for a reply, and bring the result back for review. Code Duet coordinates those handoffs around the shared plan; you can focus on the task and the final review.
 
 ## Requirements
 
