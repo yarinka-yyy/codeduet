@@ -2,9 +2,9 @@
 
 **English** · [Русский](README.ru.md)
 
-Code Duet is a Codex skill that turns **GPT in Codex** and **DeepSeek in OpenCode** into a coordinated development workflow. Describe what you want to build: GPT studies your project and prepares the plan, DeepSeek writes the code, and GPT checks the result and guides the corrections.
+Code Duet is a Codex skill where **GPT plans and reviews, and DeepSeek writes the code in OpenCode**. Describe your task: GPT studies the project, prepares a plan, and hands it to DeepSeek. Once the code is ready, GPT reviews the changes, runs checks, and sends back anything that needs fixing. It reviews the corrections and lets you know when the task is complete.
 
-You follow the work in your Codex chat, with a shared plan in your project and a final report of the changes and checks. Code Duet handles the handoffs between the two tools.
+Code Duet brings the two AIs together: GPT handles planning, difficult decisions, and review; DeepSeek handles implementation. The skill passes assignments, questions, and results between them. You give the task in your Codex chat and receive the finished work with a report of what changed and how it was checked.
 
 ## How it works
 
@@ -13,10 +13,11 @@ You follow the work in your Codex chat, with a shared plan in your project and a
 <details>
 <summary>The workflow in words</summary>
 
-1. **You describe the task.** GPT explores the project and turns your request into a plan with clear scope and completion criteria.
-2. **DeepSeek implements.** GPT sends the assignment to OpenCode. DeepSeek edits the project and runs the planned checks.
-3. **GPT reviews.** After DeepSeek finishes, GPT inspects the actual changes and checks them against the plan.
-4. **Corrections or completion.** GPT sends a consolidated correction if more work is needed. When the criteria are met, it reports the result, the checks, and any remaining work.
+1. **You describe the task.** Tell GPT what you want to build. It explores the project and writes a plan covering the changes and how to check the result.
+2. **DeepSeek writes the code.** GPT sends the assignment to OpenCode. DeepSeek follows the plan and runs the necessary checks.
+3. **GPT reviews the work.** When DeepSeek finishes, GPT inspects the changed files, checks the result, and compares it with your request.
+4. **Corrections, if needed.** GPT sends concrete feedback to DeepSeek, waits for the fixes, and reviews the work again.
+5. **You get the result.** Once the work passes review, GPT tells you it is ready and explains what changed and how it was checked.
 
 </details>
 
@@ -24,13 +25,13 @@ You follow the work in your Codex chat, with a shared plan in your project and a
 
 | | How it helps |
 |---|---|
-| **One shared plan** | Keep the task, scope, progress, and review checkpoints together in your project. Create a plan or continue an existing one, including plans from Improve Codex. |
-| **Direct handoffs** | Assignments, executor questions, and results travel between Codex and OpenCode without copying messages between chats. |
-| **Quiet waiting** | A background observer watches for a question, completion, or error. GPT ends its turn while DeepSeek works and continues in the same chat when attention is needed. |
-| **Separate review** | DeepSeek implements; GPT reviews the files and checks the result. They take turns working on the project. |
-| **Continued context** | Saved session bindings, assignment IDs, and plan checkpoints keep later work connected to the right task. |
+| **From task to plan** | GPT turns your request into a clear Markdown plan: what to do, in what order, and what a finished result should look like. DeepSeek follows it; GPT reviews against it. |
+| **Automatic handoffs** | The skill passes assignments, questions, results, and feedback between GPT and DeepSeek. You set the task; they work through implementation and review. |
+| **GPT returns when needed** | After handing over the task, GPT waits while DeepSeek works. A background observer brings GPT back to the same chat when the work is finished, an error occurs, or a question needs an answer. |
+| **Review and corrections** | GPT inspects the actual changes and runs checks. When it finds problems, it sends them to DeepSeek and reviews the fixes before accepting the result. |
+| **Continue in the same chats** | GPT and DeepSeek keep working on your project in their respective chats, staying with the current task and the changes already made. |
 
-The local helper communicates with OpenCode's running engine. Normal coordination leaves your mouse and keyboard free.
+Coordination runs in the background without taking over your mouse or keyboard. You can keep using your computer while the AIs work on the task.
 
 ## Quick start
 
@@ -55,26 +56,25 @@ The destination must be a new `code-duet` folder. For an existing installation o
 
 ### 3. Give GPT a task
 
-In your project's Codex chat:
+Tell GPT what you want to build in your Codex chat:
 
 ```text
 $code-duet
-Add a CSV export to the reports page. Study the project, prepare a plan,
-and coordinate implementation and review with DeepSeek in OpenCode.
+Add a CSV export to the reports page.
 ```
 
-You can also ask Code Duet to work from an existing plan. It reuses the chat's saved OpenCode pairing or creates a session for the project. To use a particular existing OpenCode session, select it explicitly; see [existing sessions](references/existing-session.md).
+GPT will explore the project, prepare a plan, and hand the work to DeepSeek. Code Duet connects an OpenCode chat for your project and keeps the work there. If DeepSeek is already working in the chat you want to follow, name it — for example, “watch DeepSeek's work in chat P5.”
 
 ## Through questions and corrections
 
-When DeepSeek asks a question, GPT answers within the task's scope and your permissions. Decisions that need your input come back to you. After implementation, GPT checks the work and sends corrections as a single assignment.
+When DeepSeek has a question about implementation, GPT helps it move forward. It comes back to you when your decision or permission is needed. After review, GPT collects its feedback into one assignment so DeepSeek can address it in the next pass.
 
-Each plan allows up to **20 correction cycles** after the initial implementation. The count follows the plan across continuations. The final report explains what changed, what was checked, and what remains to be done.
+Each plan allows up to **20 correction cycles** after the initial implementation. If an error blocks the work, your input is needed, or the limit is reached, GPT explains what is preventing completion. When the task is ready, you receive a final report of the changes and checks.
 
 ## Documentation
 
 - [Workflow and shared plans](references/workflow.md)
 - [Installation and local runtime](references/runtime.md)
-- [Selecting an existing OpenCode session](references/existing-session.md)
+- [Working with an existing OpenCode chat](references/existing-session.md)
 - [Event observation and interrupted runs](helper/OBSERVER.md)
 - [Helper commands and diagnostics](helper/PROTOCOL.md)
