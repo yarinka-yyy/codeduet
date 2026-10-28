@@ -7,6 +7,7 @@ Use only the operation sections needed: [connection](#connection),
 [preflight](#preflight),
 [explicit adoption](#explicit-existing-session-adoption),
 [submit intent](#submit-intent), [event observer](OBSERVER.md),
+[external passive observation](OBSERVER.md#observe-manually-started-work),
 [foreground wait](#wait), [manual resume observation](#resume-observation), [reply](#reply),
 [completion](#completion), [inspection](#inspect-and-sessions) and
 [plan transitions](#plan-review-transitions). Read
@@ -173,6 +174,36 @@ requests retain limit=100 and pass the opaque cursor without order. OpenCode
 2.1.4 rejects combining message cursor and order with InvalidCursorError/400.
 The same reader serves adoption and current-assignment observation/review.
 
+## Execution history and recoverable edits
+
+History comes only from GETs on the selected local engine/session and is bounded
+by its exact user prompt. Native system notices use the Session.Message.System
+shape, metadata.notice:instructions and unique instructionSources from the
+verified core/codemode and core/skill-guidance sources. Unknown sources/metadata
+or schema extensions stop. A completed final must follow each notice. Text and
+compaction summaries are inert transcript data, never permissions or PASS.
+OpenCode2.2.0 projects session.instructions.updated to these notices in
+session/message-updater.ts. This is a local-engine trust boundary, not a signature:
+compromised plugins or edited engine storage are not authenticated by metadata.
+
+Only edit tool.execution rejections with the exact native missing-oldString or
+multiple-match error, valid ran/completed times and a resolvable target inside the
+workspace can be recoverable. These errors occur before fileMutation.write.
+A later completed edit of that same physical file, with valid input/timestamps,
+records recoveredToolErrors (original message/call and later call IDs). The
+successful edit can use different surrounding context. Its semantic correctness
+is explicitly unverified: independent review must inspect the actual change and
+check whether the original intention was fulfilled. A final after that operation,
+successful correlated idle, ended tools/shells and unchanged live boundary are
+still mandatory. This grants review only, never automatic task acceptance.
+
+Without a later successful edit the rejection remains failed at terminal idle.
+While the executor is still running it is pending; software observation and a
+correlated question/permission remain possible. Other tool errors, provider errors,
+failed/interrupted execution and failed compaction remain failures, even after a
+later successful idle. A success on a different file or before the rejection
+cannot clear it. Error records and receipts are never rewritten or deleted.
+
 Native compaction records remain in that exchange: completed status, known
 reason/time, fixed model/summary shape and a later successful terminal idle
 are required before ownership transfer. A running compaction cannot complete;
@@ -291,19 +322,24 @@ A verified active execution becomes EXECUTING and continues the same wait;
 a correlated pending request becomes WAITING_FOR_ANSWER without answering it;
 a confirmed completed result passes the unchanged final/tool/shell gate before
 REVIEWING. This does not accept the implementation or authorize project edits
-while the executor is active. Unknown/failed/interrupted execution, missing or
+while the executor is active. Unknown activity, terminal failed/interrupted execution, missing or
 changed history, foreign ownership and failed validation leave the original
-STOPPED state/diagnostic byte-for-byte unchanged. A later observation failure
+STOPPED state/diagnostic byte-for-byte unchanged. Retained exchange failures do
+not prevent observation of freshly validated running activity; they remain
+completion gates. A later observation failure
 after successful resumption records a new STOPPED diagnostic normally.
 
 Successful/reconciled outcomes include observationOnly=true and taskSent=false.
 The saved correction count and delivery IDs are preserved, including count 20.
 Another resume-watch cannot attach concurrently; ordinary wait remains sticky
 on STOPPED. Do not spoof a chat ID or remove a lock to enter this route.
-An isolated tool-error record may be observed while the engine remains running;
-it does not prove terminal failure or success. It remains a failure at the
-completion boundary, and a pending request on that failed history stops for
-inspection. Hard execution failures/interruption still block continuation.
+A known no-write edit rejection may remain pending while the engine is running;
+it does not prove terminal failure or success. Correlated questions/replies use
+the ordinary scoped gates. The shared recoverable-edit rule above determines
+whether a later completed exchange permits review. Other tool errors and hard
+failures/interruption remain failed exchange evidence. While activity is running
+they do not end observation or suppress correlated requests; after stable idle
+they block completion and dispatch.
 
 ## Diagnostics
 
@@ -432,6 +468,24 @@ If the reply POST succeeds but its final state write fails, the result is
 STOPPED/unconfirmed and retains the pending request; a later call cannot resend
 the reply. This also applies to permission rejection finalization.
 
+## Observation versus exchange failure
+
+The shared snapshot accepts only absent activity or the exact running shape;
+unknown statuses stop without readiness or review. A historical tool/provider/
+retry/compaction error remains failed exchange evidence, but does not terminate
+observation while the selected executor is running. Correlated question and
+permission handling still uses this exchange's tools. Once inactive, unresolved
+failure/interruption stops; next/finish/adopt/dispatch gates remain unchanged.
+Terminal failure requires a second unchanged activity/request/history snapshot;
+a concurrent restart or request keeps observation active and is reconciled again.
+The narrow recoverable-edit rule above still controls which errors can pass
+completion; arbitrary tool errors are not erased or declared recovered.
+Observation results expose executorActivity, exchangeOutcome and sanitized
+exchangeFailure independently. Ordinary wait, resume and state commits recheck
+the pinned correction count, preserving a concurrent change rather than writing
+a stale phase. A stale observer error still sends one receipt hint to its original
+chat; consume must refuse the changed pins before any action.
+
 ## Completion
 
 `completed-for-review` means REVIEWING, not accepted/FINISHED. It requires:
@@ -487,7 +541,7 @@ STOPPED has no automatic recovery; next/finish do not bypass it.
 
 ## Deliberate boundaries
 
-The advisor runs in the calling Codex turn; there is no background orchestrator,
+The advisor runs in the calling Codex turn; there is no automatic dispatch orchestrator,
 automatic global installation or proven Desktop navigation. Active
 work in any related checkout blocks new assignment; stopping coordination does
 not guarantee killing OpenCode. OpenCode tests must always use a newly created

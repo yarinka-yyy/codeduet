@@ -105,6 +105,25 @@ test('hints carry only a validated receipt, never private question/result/comman
   assert.throws(() => wakeHint('x; private payload'), /Invalid/);
 });
 
+test('known rejected edit does not block an authorized correlated reply or spend another correction', async t => {
+  const f = await setup(t), path = join(f.workspace, 'edit-target.txt'), now = Date.now();
+  writeFileSync(path, 'fixture');
+  f.messages.get(f.session).push({ id: 'msg_edit', type: 'assistant', model, time: { completed: now }, content: [
+    { id: 'call_edit', type: 'tool', name: 'edit', time: { ran: now, completed: now }, state: { status: 'error',
+      input: { path, oldString: 'old', newString: 'new' }, error: { type: 'tool.execution',
+        message: `Could not find oldString in ${path}. It must match exactly, including whitespace and indentation.` } } },
+  ] }, { id: 'msg_question', type: 'assistant', model, content: [
+    { id: 'call_question', type: 'tool', name: 'question', state: { status: 'running' } },
+  ] });
+  f.forms = [{ id: 'frm_question', sessionID: f.session, metadata: { kind: 'question',
+    tool: { messageID: 'msg_question', id: 'call_question' } }, fields: [{ key: 'answer', type: 'string' }] }];
+  assert.equal((await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true })).kind, 'question');
+  const result = await f.adapter.reply(f.workspace, f.plan, 'question', 'frm_question', { answer: { answer: 'fixture' } }, baseline);
+  assert.equal(result.kind, 'replied'); assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+  assert.equal(f.posts(`/api/session/${f.session}/form/frm_question/reply`), 1);
+});
+
 test('permission events retain tool correlation and only notify; no approval or engine mutation', async t => {
   const f = await setup(t), armed = await f.arm(), from = f.calls.length;
   f.messages.get(f.session).push({ id: 'msg_tool', type: 'assistant', model, time: { created: Date.now() },

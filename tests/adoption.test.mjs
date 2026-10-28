@@ -89,6 +89,34 @@ test('native adoption preserves existing history/title/model and is idempotent w
   assert.equal(inspected.result.session.model.variant, 'default');
 });
 
+test('manual native history with recovered edit adopts and sends one new correction through ordinary guards', async t => {
+  const f = await fixture(t), session = seed(f), messages = f.messages.get(session.id);
+  const path = join(f.workspace, 'edit-target.txt'); writeFileSync(path, 'fixture');
+  const ended = session.time.idle;
+  messages.splice(1, 0,
+    { id: 'msg_notice', type: 'system', text: 'PRIVATE_NOTICE', time: { created: ended - 10 },
+      metadata: { notice: 'instructions', instructionSources: ['core/codemode', 'core/skill-guidance'] } },
+    { id: 'msg_recovery', type: 'assistant', model, time: { completed: ended - 1 }, content: [
+      { id: 'call_error', type: 'tool', name: 'edit', time: { ran: ended - 9, completed: ended - 8 },
+        state: { status: 'error', input: { path, oldString: 'old', newString: 'new' }, error: { type: 'tool.execution',
+          message: `Could not find oldString in ${path}. It must match exactly, including whitespace and indentation.` } } },
+      { id: 'call_fixed', type: 'tool', name: 'edit', time: { ran: ended - 7, completed: ended - 6 },
+        state: { status: 'completed', input: { path, oldString: 'context old', newString: 'context new' } } },
+    ] });
+  const preflight = await f.call(['preflight', f.workspace, f.plan, '--session', session.id,
+    '--correction-count', '7', '--non-git-baseline', baseline]);
+  assert.equal(preflight.status, 0);
+  assert.ok(!existsSync(f.statePath)); assert.ok(f.calls.every(call => call.method === 'GET'));
+  const adopted = await f.call(adoptArgs(f, session.id, 7)); assert.equal(adopted.status, 0);
+  assert.equal(adopted.result.correctionCount, 7);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 0);
+  const submitted = await f.call(submitArgs(f)); assert.equal(submitted.status, 0);
+  assert.equal(f.state().plans[0].correctionCount, 8);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
+  assert.equal((await f.call(submitArgs(f))).status, 1);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
+});
+
 for (const existing of [false, true]) test('adoption ' + (existing ? 'reuse' : 'save') + ' keeps state annotation when owner lease release fails', async t => {
   const f = await fixture(t), session = seed(f), chat = 'offline-adopt-release-' + existing;
   const client = await connect({ registrationPath: join(f.home, '.local', 'state', 'opencode', 'service.json') });

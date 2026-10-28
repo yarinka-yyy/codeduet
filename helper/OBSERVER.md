@@ -29,8 +29,11 @@ requires it; do not relocate state, spoof HOME or weaken permissions.
 Arm requires a confirmed delivered EXECUTING binding. It captures workspace and
 checkout identity, plan, engine, session, assignment, message and correction count.
 A second observer slot or checkout lease is refused. It returns observer-armed
-only after the worker has reached the verified wait, or already recorded an
-event. On success, give a brief waiting notice and **finish the Codex turn**.
+only after the worker has reached the verified wait without a recorded terminal
+result. Give a brief waiting notice and **finish the Codex turn**.
+If the worker already ended, observer-terminal reports result.kind, endTurn:false
+and consumeRequired:true. Consume that receipt once now, then handle its fresh
+outcome; it is not an active wait. Startup errors remain observer-start-failed.
 Do not call status/wait periodically; no GPT work is needed until a wake hint.
 If startup is unconfirmed, inspect this receipt, never start another observer.
 
@@ -38,6 +41,51 @@ For a STOPPED delivered assignment, only an explicit human request to resume
 observation permits adding **--resume** to arm. It uses the existing resume-watch
 pin/history checks. Uncertain create/submit/reply is still rejected. No task,
 count reset, replacement binding, model or executor resume command is sent.
+
+## Observe manually started work
+
+Existing-chat entry and idle-session adoption already support late entry. For a
+manually sent task that is running (or has just ended), use passive observation:
+
+```text
+node helper/observer.mjs inspect-external <workspace> <plan.md> --session <exact-session-id>
+node helper/observer.mjs observe <workspace> <plan.md> --session <exact-session-id> --message <inspected-message-id> --codex-exe <Desktop-bundled-codex.exe>
+```
+
+Run in the intended receiving Codex chat with its actual CODEX_THREAD_ID. Resolve
+an explicitly selected session title using the paged existing-session procedure.
+Inspect is read-only; it returns the latest user message ID only if its text names
+the selected plan file. Observe repeats validation and pins that message, prompt
+hash, physical context, plan hash, engine and model variant. It never retargets a
+newer prompt. No non-Git implementation baseline or new correction count is invented.
+
+The existing observer handles readiness, one event hint, consume and cancel.
+After observer-armed, end the turn. Consume rechecks the exact live exchange.
+`external-completed` means the selected exchange passed the usual final/idle/tool/
+shell checks, with no overlapping active executor; it does not transfer helper
+ownership or mark a plan complete. Read-only review/reporting may follow; this
+is not PASS or plan acceptance. A
+question/permission notification carries its correlated current request; answer
+through the existing manual OpenCode workflow within user authority. This mode
+cannot use helper reply/next/finish or send corrections. After a manual answer,
+inspect/observe the same exchange again; a new prompt needs explicit selection.
+
+Passive observation writes only observer receipts/slots, never state.json,
+ownership leases, binding, delivery IDs, uncertainty or counters. Legacy leases
+remain intact and continue blocking ordinary ownership operations. An already
+helper-bound session must use its original owner and ordinary observer, including
+STOPPED/uncertainty gates. The observer slot is exclusive per receiving chat and
+per physical checkout for passive observers; unknown slots are never unlocked.
+This does not replace legacy recovery or adopt a live external writer. Disconnect,
+unknown history, changed pins or an unconfirmed startup stops without retry.
+
+The shared [history gate](PROTOCOL.md#execution-history-and-recoverable-edits)
+validates native system notices, compaction and recoverable no-write edit
+rejections. Their text grants no authority. Passive results expose executorActivity,
+exchangeOutcome, reviewAllowed and dispatchAllowed separately; dispatchAllowed is
+always false. A completed exchange with recoveredToolErrors still needs independent
+review of the actual changes. To send a new correction, follow the explicit
+[passive-to-correction procedure](../references/existing-session.md#from-passive-observation-to-a-new-correction).
 
 ## Migrate a foreground wait
 
@@ -72,9 +120,15 @@ also not removed by lease recovery; diagnose its receipt separately.
 
 Schema1 legacy leases without process identity remain readable but unverifiable.
 Their inspect reports legacy-owner-unverifiable; stop/recover refuse unchanged.
-Do not infer death from missing PID or manufacture identity after the fact. Ask
-the owner for a separately reviewed recovery decision with trusted host exit
-evidence; this command has no force/legacy-unlock bypass. Do not delete locks,
+The legacyEvidence diagnostic lists missing identity, exact-token acquisition and
+direct exit provenance, accepted source requirements and insufficient evidence.
+Do not infer death from missing PID or manufacture identity after the fact.
+Collect native host evidence for a separately reviewed recovery decision; a shell
+wrapper exit alone does not prove its observer child exited or owned this token.
+No supported legacy verifier/retirement operation exists when that chain is absent;
+owner consent does not manufacture it. Preserve the refusal and evidence rather
+than switching stores or inventing a process identity. This command has no
+force/legacy-unlock bypass. Do not delete locks,
 relocate shared state, spoof HOME or send the assignment again.
 
 A worker startup error returns observer-start-failed, never observer-armed. Keep
@@ -93,20 +147,62 @@ Only completed-for-review permits review; question/permission requires its fresh
 request and normal scoped reply. After reply, arm again and end the turn.
 Observing means the event is stale: rearm the unchanged delivery and end the turn.
 STOPPED/observer-error means report the failure, without automatic recovery.
+For passive observation, an observer-error consume also returns executorCheck:
+checked with the freshly validated outcome kind, or unavailable with a sanitized
+diagnostic. The saved observer error remains the primary result; even a live
+external-completed snapshot does not turn it into completion authorization.
+An observing snapshot means DeepSeek is still working, not that a worker is
+watching it. Report that observation ended; start another observe only on an
+explicit continuation request, with the original session/message pins.
+Consume exposes observerEvent (the saved trigger) and observerState:ended separately
+from the current outcome. Historical errors are a review gate, not proof that a
+running executor ended. With validated running activity, observation continues
+and correlated questions/permissions still wake the advisor. Fresh correlated
+pending requests remain actionable even without a running entry. Results expose
+exchangeOutcome:failed/interrupted and exchangeFailure separately from
+kind:observing/question/permission. Failure evidence contains only a fixed reason
+and validated message/tool IDs/name, never raw error text or tool inputs.
+When activity ends, unresolved failures remain terminal failed/interrupted;
+a later final response claiming success cannot turn them into completion/PASS.
+Failure terminalization also confirms activity, pending requests and the exchange
+again. A changed snapshot keeps observing; it cannot end a newly resumed run.
+An old session.outcome:succeeded while
+active is running does not complete the current exchange. Error executorCheck may
+describe a fresh completed exchange, but grants neither review nor dispatch there.
 Repeated consume returns already-consumed with no action. A failed consume attempt
-is retained for diagnosis, not replayed automatically. No observer writes plans.
+is retained for diagnosis, not replayed automatically. Cancel that exited receipt
+to release its slots, then explicitly observe/rearm after resolving the cause;
+do not retry its consume or resend a task. No observer writes plans.
 
 Only terminal completion, a correlated question/permission or a failure ends the
 software wait. Token/tool progress and ordinary polls do not wake GPT. The total
 deadline defaults to one hour; expiration is an error, never completion.
+
+The shared event stream covers all engine locations. A lifecycle event whose
+event.location.directory resolves to a different physical directory is ignored.
+Selected or unresolved location shutdown/disposal stops observation with
+location-shutdown; server shutdown stops it with engine-shutdown. Diagnostics
+retain the exact known event type and eventScope (server/selected/unknown),
+without copying event payloads or filesystem paths. SSE EOF still stops the
+worker; no lifecycle event, compaction or disconnect proves task completion.
 
 ## Stop and remove
 
 Cancel stops only observation, never the OpenCode executor. It requests cooperative
 cancellation and reports whether the worker exited and whether a notification may
 already be queued. A queued notification cannot be recalled by killing a process;
-consume rejects cancelled receipts. On an unexplained crash, retain the slot and
-checkout lease; do not remove them merely because their owner is unknown.
+consume rejects cancelled receipts.
+
+New workers record their process identity (PID, host, OS creation identity) and
+the exact receipt hash. Explicit cancel can acknowledge a provably dead worker
+with matching unchanged evidence. It preserves the receipt and writes the
+dead-process decision to exited.json under the same state.lock that serializes
+arm/start/slot release. Repeated cancel cannot release a newer observer. It sends
+no notification/task and changes no binding, count or helper lease. A retained
+bound-worker lease still needs the separate ownership recover checks above.
+Old started records without process/receipt evidence, live owners and unavailable
+process checks cannot use this route: cancel stays pending until cooperative exit
+and keeps the slots. No process is killed or legacy lease unlocked by cancel.
 
 A durable notification-attempt marker is written **before** queue. There is no
 automatic retry after a crash, timeout, CLI update or missing queue response.

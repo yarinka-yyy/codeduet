@@ -298,6 +298,7 @@ for (const failure of ['provider-limit', 'tool-error', 'interrupted', 'stream-ga
       if (failure === 'stream-gap') f.client.controller.close();
       if (failure === 'failure-event') {
         f.client.messages.push({ id: 'msg_failure', type: 'assistant', model: MODEL, content: [], finish: 'error', time: { created: Date.now(), completed: Date.now() }, error: { message: 'Provider failed' } });
+        f.client.finish();
         f.client.event('session.execution.failed');
       }
       if (failure === 'advisor-interrupted') controller.abort();
@@ -352,7 +353,7 @@ for (const category of ['event-eof', 'event-read', 'event-json', 'event-shape', 
     assert.equal(outcome.executorStopped, false); assert.equal(outcome.retried, false);
     const diagnostic = validateDiagnostic(outcome.diagnostic);
     assert.equal(diagnostic.category, category); assert.ok(diagnostic.elapsedMs >= 0);
-    assert.equal(diagnostic.lastEvent.type, 'execution.started');
+    assert.equal(diagnostic.lastEvent.type, category === 'engine-shutdown' ? 'server.shutdown' : 'execution.started');
     assert.ok(Number.isSafeInteger(diagnostic.lastEvent.at));
     if (category === 'event-read') assert.equal(diagnostic.errorCode, 'UND_ERR_SOCKET');
     assert.deepEqual(f.state().diagnostic, diagnostic);

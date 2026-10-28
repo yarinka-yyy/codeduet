@@ -13,6 +13,10 @@ sole implementation executor.
 
 ## Choose the route
 
+For observation of work already sent manually to an explicitly selected OpenCode
+session, use [external observation](helper/OBSERVER.md#observe-manually-started-work).
+This GET/SSE-only route does not bind, adopt, submit or transfer old ownership.
+
 Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
 pair, bind a new OpenCode session in the selected workspace unless the user
 explicitly selected an existing recipient; only then read
@@ -44,6 +48,12 @@ once. After delivery use the [event observer](helper/OBSERVER.md): arm it for
 this actual chat, confirm observer-armed, report briefly and **end the turn**.
 Do not loop on wait/status tools or narrate unchanged progress. On its wake hint,
 consume that receipt once and revalidate the live assignment before acting.
+If arm returns observer-terminal, consume its receipt now; it is not a running
+observer. Passive completion grants read-only review, never correction dispatch;
+use the [guarded transition](references/existing-session.md#from-passive-observation-to-a-new-correction).
+Historical exchange errors do not end observation while the selected executor is
+running or suppress a fresh correlated question/permission. Keep their failure
+evidence; they still block successful completion.
 While execution or a question is active, DeepSeek owns project edits and
 checks. Start review only after completed-for-review, inspect the
 actual changes, then send at most one consolidated correction at a time. An

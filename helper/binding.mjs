@@ -47,6 +47,9 @@ export function context(workspace, planPath, nonGitBaseline) {
   return ctx;
 }
 
+// GET-only observation does not declare a new implementation baseline.
+export const observationContext = (workspace, planPath) => physicalContext(workspace, planPath).ctx;
+
 export function validateState(state) {
   need(state?.schema === 1 && Array.isArray(state.bindings) && Array.isArray(state.plans), 'Invalid helper state');
   need(Object.keys(state).every(key => ['schema', 'bindings', 'plans'].includes(key)), 'Unexpected helper state fields');
@@ -147,6 +150,24 @@ async function matchingSession(client, binding) {
     realpathSync(binding.workspace) === binding.workspace && realpathSync(binding.checkout) === binding.checkout &&
     identity(binding.workspace) === binding.workspaceID && identity(binding.checkout) === binding.checkoutID, 'Session physical directory mismatch');
   return session;
+}
+
+export async function observationSnapshot(client, binding) {
+  const [session, active, forms, permissions] = await Promise.all([
+    matchingSession(client, binding), client.request('/api/session/active'),
+    client.request(`/api/session/${binding.sessionID}/form`), client.request(`/api/session/${binding.sessionID}/permission`),
+  ]);
+  need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data) && Array.isArray(forms?.data) && Array.isArray(permissions?.data), 'Unknown execution/interactive status');
+  const activity = active.data[binding.sessionID];
+  need(activity === undefined || activity?.type === 'running' && Object.keys(activity).length === 1,
+    'Unknown active execution status');
+  for (const id of Object.keys(active.data)) {
+    if (id === binding.sessionID) continue;
+    need(/^ses_[a-zA-Z0-9]+$/.test(id), 'Unknown active session identity');
+    const other = await client.request('/api/session/' + id);
+    need(text(other?.data?.location?.directory) && !overlaps(binding.checkout, realpathSync(other.data.location.directory)), 'Another executor in this checkout; no ownership transfer');
+  }
+  return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
 }
 
 // Explicit paged discovery, independent of binding and without a store/lock.
@@ -554,7 +575,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
           } else if (candidateBinding?.adoption) {
             if (messages.length) {
               need(liveSession.outcome === 'succeeded', 'Existing history outcome is not confirmed successful');
-              const history = inspectMessages({ messageID: messages[0].id }, messages, { adopting: true });
+              const history = inspectMessages({ workspace: ctx.workspace, messageID: messages[0].id }, messages, { adopting: true });
               need(!history.kind, 'Existing history failed or was interrupted');
               completion(history, liveSession, shells);
             } else need(liveSession.outcome === undefined && liveSession.time?.idle === undefined, 'Existing history/status mismatch');
@@ -566,7 +587,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
               'Untracked history/status exists in the saved session');
           } else if (messages.length) {
             need(liveSession.outcome === 'succeeded', 'Existing history outcome is not confirmed successful');
-            const history = inspectMessages({ messageID: messages[0].id }, messages, { adopting: true });
+            const history = inspectMessages({ workspace: ctx.workspace, messageID: messages[0].id }, messages, { adopting: true });
             need(!history.kind, 'Existing history failed or was interrupted');
             completion(history, liveSession, shells);
           } else need(liveSession.outcome === undefined && liveSession.time?.idle === undefined, 'Existing history/status mismatch');
@@ -691,11 +712,8 @@ function stateFailure(error, stage) {
     conflict ? 'state-locked' : denied ? 'state-access' : 'state-io', stage, {}, error);
 }
 
-export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
-  probeOwner } = {}) {
-  need(text(chatID), 'Actual CODEX_THREAD_ID is required');
+export function withStateLock(stateRoot, operation) {
   const statePath = join(stateRoot, 'state.json');
-  function locked(operation) {
     try { mkdirSync(stateRoot, { recursive: true, mode: 0o700 }); }
     catch (error) { throw stateFailure(error, 'state-directory'); }
     const lockPath = join(stateRoot, 'state.lock');
@@ -733,7 +751,13 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     }
     if (releaseError) throw stateFailure(releaseError, 'state-lock');
     return result;
-  }
+}
+
+export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
+  probeOwner } = {}) {
+  need(text(chatID), 'Actual CODEX_THREAD_ID is required');
+  const statePath = join(stateRoot, 'state.json');
+  const locked = operation => withStateLock(stateRoot, operation);
 
   const ownershipRoot = join(stateRoot, 'ownership');
   const stopRoot = join(stateRoot, 'observation-stop');
@@ -836,8 +860,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   const bindingFields = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath',
     'engineID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt', 'phase', 'uncertain'];
-  function unchanged(current, expected) {
+  function unchanged(current, expected, state) {
     return !!current && bindingFields.every(key => current[key] === expected[key]) &&
+      planCounter(state, current).correctionCount === expected.correctionCount &&
       JSON.stringify(current.pending ?? null) === JSON.stringify(expected.pending ?? null) &&
       JSON.stringify(current.adoption ?? null) === JSON.stringify(expected.adoption ?? null);
   }
@@ -875,7 +900,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   function commit(expected, operation, beforeSave) {
     return locked(state => {
       const binding = state.bindings.find(binding => binding.codexChat === chatID);
-      need(unchanged(binding, expected), 'Saved assignment changed during observation; no stale state write');
+      need(unchanged(binding, expected, state), 'Saved assignment/count changed during observation; no stale state write');
       const result = operation(state, binding);
       beforeSave?.();
       saveState(statePath, state);
@@ -891,7 +916,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     try {
       return locked(state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
-        if (!unchanged(binding, expected)) return binding ?
+        if (!unchanged(binding, expected, state)) return binding ?
           { ...summary(state, binding, 'stopped'), error: binding.stopReason || reason,
             diagnostic, executorStopped: false, retried: false, stateChange: 'unchanged' } :
           { kind: 'stopped', workspace: expected.workspace, planPath: expected.planPath, sessionID: expected.sessionID,
@@ -923,20 +948,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       error: reason, diagnostic: error?.diagnostic ? validateDiagnostic(error.diagnostic) : diagnose(error, 'state-io', 'state-write'),
       stateChange: 'unconfirmed', executorStopped: false, retried: false };
   }
-  async function snapshot(binding) {
-    const [session, active, forms, permissions] = await Promise.all([
-      sessionMatches(binding), client.request('/api/session/active'),
-      client.request(`/api/session/${binding.sessionID}/form`), client.request(`/api/session/${binding.sessionID}/permission`),
-    ]);
-    need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data) && Array.isArray(forms?.data) && Array.isArray(permissions?.data), 'Unknown execution/interactive status');
-    for (const id of Object.keys(active.data)) {
-      if (id === binding.sessionID) continue;
-      need(/^ses_[a-zA-Z0-9]+$/.test(id), 'Unknown active session identity');
-      const other = await client.request('/api/session/' + id);
-      need(text(other?.data?.location?.directory) && !overlaps(binding.checkout, realpathSync(other.data.location.directory)), 'Another executor in this checkout; no ownership transfer');
-    }
-    return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
-  }
+  const snapshot = binding => observationSnapshot(client, binding);
 
 
   function planCounter(state, ctx, importedCount) {
@@ -976,7 +988,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
     if (messages.length) {
       need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
-      const history = inspectMessages({ messageID: messages[0].id }, messages, { adopting: true });
+      const history = inspectMessages({ workspace: binding.workspace, messageID: messages[0].id }, messages, { adopting: true });
       need(!history.kind, 'Existing session failed/interrupted; no automatic recovery');
       completion(history, session, shells);
     } else need(session.outcome === undefined && session.time.idle === undefined, 'Existing history/status mismatch');
@@ -1015,7 +1027,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       const result = { kind: 'ownership-status', token, operation: owner.operation, ownerStatus: proof.status,
         reason: proof.reason, recoveryAllowed: proof.status === 'dead', processID: owner.process?.pid ?? null,
         sessionID: binding.sessionID, assignmentID: binding.assignmentID, messageID: binding.messageID,
-        correctionCount: counter, phase: binding.phase, taskSent: false, executorStopped: false, stateChange: 'unchanged' };
+        correctionCount: counter, phase: binding.phase, taskSent: false, executorStopped: false, stateChange: 'unchanged',
+        ...(owner.schema === 1 ? { legacyEvidence: { verified: false, supportedRecovery: false,
+          missing: ['OS process creation identity', 'exact lease-token acquisition by that process', 'direct observer exit receipt'],
+          acceptableSource: 'Independently verified native host acquisition/exit records bound to the exact lease and delivery',
+          insufficient: ['user assertion', 'wrapper exit without child provenance', 'missing PID', 'age', 'empty active list'] } } : {}) };
       if (action === 'inspect') return result;
       if (action === 'recover' && proof.status !== 'dead' || action === 'stop' && owner.schema !== 2)
         return { ...result, kind: 'rejected' };
@@ -1138,11 +1154,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             messageID: expected.messageID, diagnostic, executorStopped: false } :
           stoppedOutcome(expected, Object.assign(new Error(reason), { diagnostic }), kind);
         try {
-          stream = await watch(client, expected.sessionID, combined);
-          let history;
+          stream = await watch(client, expected.sessionID, combined, expected.workspace);
+          let history, messages;
           while (true) {
-            locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected),
-              'Saved assignment changed during wait; no stale state write'));
+            locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected, state),
+              'Saved assignment/count changed during wait; no stale state write'));
             if (signal.aborted) return stopWait('interrupted', 'Advisor wait interrupted; executor termination unconfirmed',
               diagnose(null, 'interrupted', 'wait', stream.observation));
             if (deadline.aborted) return stopWait('connection-uncertain', 'Wait deadline reached; executor termination unconfirmed',
@@ -1157,15 +1173,25 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             }
             const refresh = stream.takeFailureHint();
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) {
-              history = inspectMessages(expected, await assignmentMessages(client, expected));
+              messages = await assignmentMessages(client, expected);
+              history = inspectMessages(expected, messages);
             }
             if (stream.fault || combined.aborted) continue;
-            if (history.kind && !(resuming && history.toolFailure && current.active?.type === 'running' &&
-              !current.forms.length && !current.permissions.length))
-              return stopWait(history.kind, 'Bound assignment failed/interrupted; inspect its session');
-            if (!current.active && current.session.time?.idle >= expected.submittedAt &&
-              ['failed', 'interrupted'].includes(current.session.outcome)) {
-              return stopWait(current.session.outcome, 'Bound session execution failed/interrupted');
+            locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected, state),
+              'Saved assignment/count changed during wait; no stale state write'));
+            const progress = { executorActivity: current.active ? 'running' : 'idle',
+              exchangeOutcome: history.kind ?? 'in-progress', reviewAllowed: false, dispatchAllowed: false,
+              ...(history.exchangeFailure ? { exchangeFailure: history.exchangeFailure } : {}) };
+            const failure = history.kind ?? (current.session.time?.idle >= expected.submittedAt &&
+              ['failed', 'interrupted'].includes(current.session.outcome) ? current.session.outcome : null);
+            if (failure && !current.active && !current.forms.length && !current.permissions.length) {
+              const confirmed = await snapshot(expected), latest = await assignmentMessages(client, expected);
+              if (confirmed.active || confirmed.forms.length || confirmed.permissions.length ||
+                JSON.stringify(confirmed.session.time) !== JSON.stringify(current.session.time) ||
+                JSON.stringify(latest) !== JSON.stringify(messages)) {
+                history = undefined; continue;
+              }
+              return { ...stopWait(failure, 'Bound assignment failed/interrupted; inspect its session'), ...progress };
             }
             const pending = current.permissions.length ? ['permission', current.permissions[0]] :
               current.forms.length ? ['question', current.forms[0]] : null;
@@ -1175,7 +1201,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 binding.phase = 'WAITING_FOR_ANSWER';
                 binding.pending = { kind: result.kind, id: result.request.id, fingerprint: result.fingerprint };
               }, result.kind);
-              return { ...saved, request: result.request, fingerprint: result.fingerprint };
+              return { ...saved, ...progress, request: result.request, fingerprint: result.fingerprint };
             }
             if (expected.pending && expected.phase !== 'STOPPED') record((state, binding) => {
               delete binding.pending; binding.phase = 'EXECUTING';
@@ -1193,15 +1219,16 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (resuming && expected.phase === 'STOPPED') {
               need(current.active?.type === 'running', 'No correlated active execution, request or completed result');
               const confirmed = await snapshot(expected);
-              history = inspectMessages(expected, await assignmentMessages(client, expected));
-              need(!history.kind || history.toolFailure && confirmed.active?.type === 'running',
+              messages = await assignmentMessages(client, expected);
+              history = inspectMessages(expected, messages);
+              need(!history.kind || confirmed.active?.type === 'running',
                 'Failed/interrupted assignment cannot resume observation');
               if (!confirmed.active || confirmed.forms.length || confirmed.permissions.length) continue;
               need(confirmed.active.type === 'running' && Object.keys(confirmed.active).length === 1, 'Unknown active execution status');
               record((state, binding) => { delete binding.pending; binding.phase = 'EXECUTING'; }, 'observing');
             }
             onReady?.(); onReady = undefined;
-            if (once) return { kind: 'observing', phase: expected.phase, sessionID: expected.sessionID,
+            if (once) return { kind: 'observing', ...progress, phase: expected.phase, sessionID: expected.sessionID,
               assignmentID: expected.assignmentID, messageID: expected.messageID, correctionCount: expected.correctionCount };
             await stream.next(Math.min(5_000, timeoutMs));
           }
@@ -1242,7 +1269,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             return summary(state, binding, 'stale-request');
           }).result;
           history = inspectMessages(expected, await assignmentMessages(client, expected));
-          need(!history.kind, 'Assignment already failed/interrupted');
           verified = interactive(kind, request, expected, history);
           need(expected.pending.fingerprint === verified.fingerprint, 'Pending request changed; no reply');
           const latest = await client.request('/api/session/' + expected.sessionID + (kind === 'question' ? '/form' : '/permission'));
@@ -1333,7 +1359,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               }
               return locked(state => {
                 const binding = state.bindings.find(item => item.codexChat === chatID);
-                need(unchanged(binding, start.expected), 'Saved binding changed during adoption check');
+                need(unchanged(binding, start.expected, state), 'Saved binding changed during adoption check');
                 return { ...summary(state, binding, 'reused'), stateChange: 'unchanged' };
               });
             }
@@ -1399,7 +1425,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           } catch (error) { throw error; }
           return locked(state => {
             const binding = state.bindings.find(item => item.codexChat === chatID);
-            need(unchanged(binding, start.expected), 'Saved binding changed during reuse check');
+            need(unchanged(binding, start.expected, state), 'Saved binding changed during reuse check');
             planCounter(state, ctx, importedCount);
             return { ...summary(state, binding, 'reused'), stateChange: 'unchanged' };
           });

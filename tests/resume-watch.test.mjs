@@ -166,7 +166,7 @@ test('out-of-band counter drift is refused and never reset to the old count', as
   f.onRequest = route => { if (route.includes('/message?') && !changed) {
     f.mutate((binding, state) => { state.plans[0].correctionCount = 10; }); changed = readFileSync(f.statePath);
   } };
-  const result = await f.observe(); assert.equal(result.kind, 'rejected'); assert.match(result.error, /correction count changed/);
+  const result = await f.observe(); assert.equal(result.kind, 'rejected'); assert.match(result.error, /assignment\/count changed/);
   assert.deepEqual(readFileSync(f.statePath), changed); assert.equal(f.state().plans[0].correctionCount, 10);
 });
 
@@ -221,16 +221,20 @@ test('prepared next assignment and changed engine identity cannot be resumed', a
   await assert.rejects(f.observe(), /Engine changed/); unchanged(f, before, callsFrom);
 });
 
-test('a prior edit error does not prevent active observation, but never grants completed-for-review', async t => {
-  const f = await stopped(t), callsFrom = f.calls.length;
+test('known no-write edit rejection permits active observation but unresolved terminal failure stays STOPPED', async t => {
+  const f = await stopped(t), callsFrom = f.calls.length, path = join(f.workspace, 'edit-target.txt'), now = Date.now();
+  writeFileSync(path, 'fixture');
   f.messages.get(f.resume.sessionID).push({ id: 'msg_failed_edit', type: 'assistant', model,
     time: { created: Date.now(), completed: Date.now() }, content: [
-      { id: 'tool_failed_edit', type: 'tool', name: 'edit', state: { status: 'error' }, time: { completed: Date.now() } },
+      { id: 'tool_failed_edit', type: 'tool', name: 'edit', time: { ran: now, completed: now },
+        state: { status: 'error', input: { path, oldString: 'old', newString: 'new' }, error: { type: 'tool.execution',
+          message: `Could not find oldString in ${path}. It must match exactly, including whitespace and indentation.` } } },
     ] });
   let notify, reads = 0;
   const observed = new Promise(resolve => { notify = resolve; });
   f.onRequest = route => { if (route.includes('/message?') && ++reads === 2) setTimeout(notify, 25); };
-  const waiting = f.observe(); await observed;
+  const waiting = f.observe();
+  await Promise.race([observed, waiting.then(result => assert.fail('Ended before readiness: ' + result.kind))]);
   assert.equal(f.state().bindings[0].phase, 'EXECUTING');
   f.finish(f.resume.sessionID);
   const result = await waiting; assert.equal(result.kind, 'failed'); assert.equal(result.phase, 'STOPPED');
@@ -238,9 +242,16 @@ test('a prior edit error does not prevent active observation, but never grants c
   assert.ok(f.calls.slice(callsFrom).every(call => call.method === 'GET'));
 });
 
-test('a hard assistant failure cannot masquerade as an observable isolated tool error', async t => {
-  const f = await stopped(t), before = readFileSync(f.statePath), callsFrom = f.calls.length;
+test('a hard assistant failure stays failed while live observation continues; idle cannot complete', async t => {
+  const f = await stopped(t), callsFrom = f.calls.length;
   f.messages.get(f.resume.sessionID).push({ id: 'msg_failed_step', type: 'assistant', model,
     finish: 'error', content: [{ id: 'tool_failed', type: 'tool', name: 'edit', state: { status: 'error' } }] });
-  const result = await f.observe(); assert.equal(result.kind, 'rejected'); unchanged(f, before, callsFrom);
+  const result = await f.observe({ once: true }); assert.equal(result.kind, 'observing');
+  assert.equal(result.exchangeOutcome, 'failed'); assert.equal(result.reviewAllowed, false);
+  assert.equal(result.exchangeFailure.reason, 'assistant-finish');
+  f.finish(f.resume.sessionID);
+  const terminal = await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true });
+  assert.equal(terminal.kind, 'failed'); assert.equal(terminal.phase, 'STOPPED');
+  assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.ok(f.calls.slice(callsFrom).every(call => call.method === 'GET'));
 });

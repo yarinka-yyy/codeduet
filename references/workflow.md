@@ -84,6 +84,11 @@ initial implementation. Never relabel fixes as a block to bypass the limit.
 
 ## Ownership and waiting
 
+For an explicitly selected task sent manually outside the helper, use the
+[passive observer](../helper/OBSERVER.md#observe-manually-started-work).
+It notifies without acquiring implementation ownership or changing helper state;
+ordinary adoption, submission and correction gates remain unchanged.
+
 PREPARING: advisor prepares the next bounded assignment.
 EXECUTING or WAITING_FOR_ANSWER: DeepSeek owns edits/checks. Codex does not edit
 shared project files, plans or index, or run interfering checks. Only separate

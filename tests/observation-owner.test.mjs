@@ -132,6 +132,8 @@ test('legacy lease without PID remains unknown; inspect/stop/recover cannot reti
   for (const action of ['inspect', 'stop', 'recover']) {
     const result = await f.command(legacy.token, action); assert.equal(result.result.ownerStatus, 'unknown');
     assert.equal(result.result.reason, 'legacy-owner-unverifiable');
+    assert.equal(result.result.legacyEvidence.supportedRecovery, false);
+    assert.ok(result.result.legacyEvidence.missing.includes('exact lease-token acquisition by that process'));
     assert.equal(result.status, action === 'inspect' ? 0 : 1);
   }
   assert.deepEqual(readFileSync(f.statePath), before); assert.deepEqual(readFileSync(run.path), leaseBefore);

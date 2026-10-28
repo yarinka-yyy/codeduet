@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 
@@ -17,7 +18,7 @@ export function decodeFrame(frame) {
 }
 
 // The stream only wakes ordinary reconciliation; a token is never a result.
-export async function watch(client, sessionID, signal) {
+export async function watch(client, sessionID, signal, workspace) {
   const startedAt = Date.now();
   let lastEvent = null;
   const observation = () => ({ elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent });
@@ -53,7 +54,19 @@ export async function watch(client, sessionID, signal) {
           const event = decodeFrame(buffer.slice(0, boundary));
           buffer = buffer.slice(boundary + separator.length);
           if (!event) continue;
-          if (/^(server|location)\.(shutdown|disposed)$/.test(event.type)) throw diagnosticError('Engine/location shutdown', 'engine-shutdown', 'stream');
+          if (/^(server|location)\.(shutdown|disposed)$/.test(event.type)) {
+            const server = event.type.startsWith('server.');
+            // V2 lifecycle scope is on the event envelope, not its session payload.
+            const directory = event.location?.directory;
+            let scope = server ? 'server' : 'unknown';
+            if (!server && typeof directory === 'string' && isAbsolute(directory) && typeof workspace === 'string' && isAbsolute(workspace)) {
+              try { scope = relative(realpathSync(workspace), realpathSync(directory)) === '' ? 'selected' : 'foreign'; }
+              catch { /* Unresolved paths cannot prove a foreign location. */ }
+            }
+            lastEvent = { at: Date.now(), type: diagnosticEvent(event.type) };
+            if (scope === 'foreign') continue;
+            throw diagnosticError('Lifecycle event interrupted observation', server ? 'engine-shutdown' : 'location-shutdown', 'stream', { eventScope: scope });
+          }
           if (event.data.sessionID !== sessionID && event.data.session?.id !== sessionID && event.data.form?.sessionID !== sessionID) continue;
           lastEvent = { at: Date.now(), type: diagnosticEvent(event.type) };
           if (/execution\.(failed|interrupted)|step\.(failed|retry)/.test(event.type)) failureHint = true;
@@ -140,13 +153,42 @@ function nativeInstructions(binding, messages, index) {
     }));
 }
 
+function nativeSystem(message) {
+  const metadata = message.metadata;
+  return Object.keys(message).every(key => ['id', 'type', 'text', 'description', 'time', 'metadata'].includes(key)) &&
+    typeof message.id === 'string' && message.id.startsWith('msg_') && typeof message.text === 'string' &&
+    (message.description === undefined || typeof message.description === 'string') &&
+    Number.isFinite(message.time?.created) && message.time.created >= 0 && Object.keys(message.time).length === 1 &&
+    metadata && Object.keys(metadata).length === 2 && metadata.notice === 'instructions' &&
+    Array.isArray(metadata.instructionSources) && metadata.instructionSources.length > 0 &&
+    new Set(metadata.instructionSources).size === metadata.instructionSources.length &&
+    metadata.instructionSources.every(source => ['core/codemode', 'core/skill-guidance'].includes(source));
+}
+
+function rejectedEdit(tool, workspace) {
+  const input = tool.state?.input, error = tool.state?.error;
+  if (tool.name !== 'edit' || tool.state.status !== 'error' || error?.type !== 'tool.execution' ||
+    typeof workspace !== 'string' || !isAbsolute(workspace) || typeof input?.path !== 'string' ||
+    typeof input.oldString !== 'string' || !input.oldString || typeof input.newString !== 'string' ||
+    !Number.isFinite(tool.time?.ran) || !Number.isFinite(tool.time?.completed) || tool.time.completed < tool.time.ran) return null;
+  // OpenCode 2.2.0 rejects these replacements before fileMutation.write.
+  const missing = `Could not find oldString in ${input.path}. It must match exactly, including whitespace and indentation.`;
+  if (error.message !== missing && !/^Found (?:[2-9]|[1-9]\d+) matches for oldString, but expected exactly one\. Add more surrounding context to make oldString unique, or set replaceAll to true to replace every occurrence\.$/.test(error.message)) return null;
+  try {
+    const path = realpathSync(resolve(workspace, input.path)), rel = relative(realpathSync(workspace), path);
+    if (isAbsolute(rel) || rel === '..' || rel.startsWith('..' + sep)) return null;
+    return path;
+  } catch { return null; }
+}
+
 export function inspectMessages(binding, messages, { adopting = false } = {}) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');
   const tail = messages.slice(1);
   need(!tail.some(message => message.type === 'user'), 'Another user prompt followed the bound assignment');
-  const unsupported = tail.find(message => !['assistant', 'idle', 'synthetic', 'compaction'].includes(message.type));
+  const unsupported = tail.find(message => !['assistant', 'idle', 'synthetic', 'compaction', 'system'].includes(message.type));
   const knownType = ['system', 'skill', 'shell', 'agent-switched', 'model-switched', 'location-switched'].includes(unsupported?.type) ? unsupported.type : 'unrecognized';
   need(!unsupported, 'Unsupported execution history type: ' + knownType + '; cannot transfer ownership');
+  need(tail.filter(message => message.type === 'system').every(nativeSystem), 'Unknown native system record; cannot transfer ownership');
   const inputs = tail.filter(message => message.type === 'synthetic');
   if (!inputs.every(message => typeof message.text === 'string' && Number.isFinite(message.time?.created) && message.time.created >= 0)) {
     throw diagnosticError('Invalid synthetic input metadata; no ownership transfer', 'history-correlation', 'history',
@@ -158,8 +200,11 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   }
   const compactions = tail.filter(message => message.type === 'compaction');
   for (const message of compactions) {
+    need(Object.keys(message).every(key => ['id', 'type', 'time', 'metadata', 'status', 'reason', 'model', 'summary', 'cost', 'tokens', 'error'].includes(key)) &&
+      typeof message.id === 'string' && message.id.startsWith('msg_'), 'Unknown compaction record');
     need(['running', 'completed', 'failed'].includes(message.status), 'Unknown compaction status');
-    need(['auto', 'manual'].includes(message.reason) && Number.isFinite(message.time?.created) && message.time.created >= 0, 'Invalid compaction metadata');
+    need(['auto', 'manual'].includes(message.reason) && Number.isFinite(message.time?.created) && message.time.created >= 0 &&
+      Object.keys(message.time).length === 1, 'Invalid compaction metadata');
     if (message.status === 'completed') need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID &&
       typeof message.summary === 'string', 'Compaction model/summary changed');
   }
@@ -167,16 +212,44 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   for (const message of assistants) {
     need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID && Array.isArray(message.content), 'Executor model/history changed');
   }
-  if (tail.some(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
+  const failed = tail.find(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
     message.type === 'compaction' && message.status === 'failed' ||
-    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish))) return { kind: 'failed' };
-  if (tail.some(message => message.content?.some(part => part.type === 'tool' && part.state?.status === 'error')))
-    return { kind: 'failed', toolFailure: !tail.some(message => message.type === 'idle' && message.outcome === 'interrupted') };
-  if (tail.some(message => message.type === 'idle' && message.outcome === 'interrupted')) return { kind: 'interrupted' };
+    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish));
+  const interrupted = tail.find(message => message.type === 'idle' && message.outcome === 'interrupted');
   const tools = assistants.flatMap(message => message.content.filter(part => part.type === 'tool').map(part => ({ ...part, messageID: message.id })));
   const final = assistants.at(-1);
   const idle = tail.at(-1);
-  return { tools, final, idle, tail };
+  const recoveredToolErrors = [], unresolved = [];
+  for (const [index, tool] of tools.entries()) {
+    if (tool.state?.status !== 'error') continue;
+    const path = rejectedEdit(tool, binding.workspace);
+    const repair = path && tools.slice(index + 1).find(candidate => {
+      if (candidate.name !== 'edit' || candidate.state?.status !== 'completed' ||
+        typeof candidate.state.input?.oldString !== 'string' || !candidate.state.input.oldString ||
+        typeof candidate.state.input?.newString !== 'string' ||
+        typeof candidate.state.input?.path !== 'string' || !Number.isFinite(candidate.time?.ran) ||
+        !Number.isFinite(candidate.time?.completed) || candidate.time.ran <= tool.time.completed ||
+        candidate.time.completed < candidate.time.ran) return false;
+      try { return relative(path, realpathSync(resolve(binding.workspace, candidate.state.input.path))) === ''; }
+      catch { return false; }
+    });
+    if (repair) recoveredToolErrors.push({ messageID: tool.messageID, id: tool.id, recoveredBy: repair.id,
+      evidence: 'later-edit-same-file', semanticRecoveryVerified: false });
+    else unresolved.push({ tool, recoverable: !!path });
+  }
+  const history = { tools, final, idle, tail, recoveredToolErrors };
+  // Keep history failure separate from current executor activity; preserve tools for questions.
+  const evidence = (reason, messageID, tool) => ({ reason,
+    ...(/^msg_[a-zA-Z0-9]{1,160}$/.test(messageID) ? { messageID } : {}),
+    ...(tool && /^[a-zA-Z0-9_-]{1,160}$/.test(tool.id) ? { toolID: tool.id } : {}),
+    ...(tool && /^[a-zA-Z0-9_-]{1,80}$/.test(tool.name) ? { toolName: tool.name } : {}) });
+  if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
+    failed.error ? 'message-error' : failed.retry ? 'retry-record' : failed.type === 'idle' ? 'failed-idle' :
+      failed.type === 'compaction' ? 'failed-compaction' : 'assistant-finish', failed.id) };
+  if (interrupted) return { ...history, kind: 'interrupted', exchangeFailure: evidence('interrupted-idle', interrupted.id) };
+  return unresolved.length ? { ...history, kind: 'failed', toolFailure: true,
+    exchangeFailure: evidence('tool-error', unresolved[0].tool.messageID, unresolved[0].tool),
+    recoverablePending: unresolved.every(value => value.recoverable) } : history;
 }
 
 export function interactive(kind, request, binding, history) {
@@ -212,20 +285,25 @@ export function validateAnswer(request, payload) {
 }
 
 export function completion(history, session, shells) {
+  need(!history.kind, 'Failed/interrupted exchange cannot complete');
   const { final, idle, tools } = history;
   need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
   need(history.tail.filter(message => message.type === 'assistant').every(message => Number.isFinite(message.time?.completed)), 'Unfinished assistant step');
   need(idle?.type === 'idle' && idle.outcome === 'succeeded' && idle.time?.created >= final.time.completed && session.time.idle >= idle.time.created, 'No correlated terminal idle');
   const finalIndex = history.tail.indexOf(final);
   for (const [index, message] of history.tail.entries()) {
-    if (message.type === 'synthetic') need(index < finalIndex &&
-      message.time.created <= final.time.completed, 'No completed final after synthetic input');
+    if (['synthetic', 'system'].includes(message.type)) need(index < finalIndex &&
+      message.time.created <= final.time.completed, 'No completed final after ' + message.type + ' input');
     if (message.type === 'compaction') {
       need(message.status === 'completed', 'Compaction has not completed');
       need(idle.time.created >= message.time.created, 'No terminal idle after compaction');
     }
   }
-  need(tools.every(tool => tool.state?.status === 'completed' && Number.isFinite(tool.time?.completed)), 'Outstanding/unknown tool operation');
+  const recovered = history.recoveredToolErrors ?? [];
+  need(recovered.every(value => tools.some(tool => tool.id === value.recoveredBy &&
+    tool.time?.completed <= final.time.completed)), 'No completed final after recovered edit');
+  need(tools.every(tool => (tool.state?.status === 'completed' || recovered.some(value => value.id === tool.id &&
+    value.messageID === tool.messageID)) && Number.isFinite(tool.time?.completed)), 'Outstanding/unknown tool operation');
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
   need(shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
   // Detached processes cannot be certified by a completed launcher. Stop instead of supervising the OS.
@@ -247,5 +325,6 @@ export function completion(history, session, shells) {
   }
   const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   need(output.trim(), 'Empty final response');
-  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })), endedAt: idle.time.created } };
+  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })),
+    ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
 }
