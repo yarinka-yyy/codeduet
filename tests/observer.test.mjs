@@ -49,6 +49,26 @@ test('detached contract: arm returns ready, waits without a model, one completio
   assert.ok(!JSON.stringify(f.o.status(armed.id)).includes('Simulator completed'));
 });
 
+test('bound wait and observer use a four-hour default while invalid deadlines leave state unchanged', async t => {
+  const f = await setup(t), before = readFileSync(f.statePath), from = f.calls.length;
+  for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 14_400_001]) {
+    await assert.rejects(f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, timeoutMs }), /timeout/);
+    await assert.rejects(f.arm({ timeoutMs }), /deadline/);
+  }
+  assert.deepEqual(readFileSync(f.statePath), before); assert.equal(f.calls.length, from);
+  const durations = [], original = AbortSignal.timeout;
+  t.mock.method(AbortSignal, 'timeout', milliseconds => { durations.push(milliseconds); return original(milliseconds); });
+  assert.equal((await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true })).kind, 'observing');
+  assert.equal(durations.at(-1), 14_400_000);
+  const armed = await f.arm({ timeoutMs: undefined }); assert.equal(armed.kind, 'observer-armed');
+  assert.equal(durations.at(-1), 14_400_000); assert.equal(f.sent.length, 0);
+  f.finish(f.session); await f.end();
+  assert.equal(f.sent[0].timeoutMs, 14_400_000);
+  assert.equal((await f.o.consume(armed.id)).kind, 'completed-for-review');
+  assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
 test('question wakes once, revalidates pending request, then can rearm after a scoped reply', async t => {
   const f = await setup(t), armed = await f.arm();
   f.messages.get(f.session).push({ id: 'msg_tool', type: 'assistant', model, time: { created: Date.now() },

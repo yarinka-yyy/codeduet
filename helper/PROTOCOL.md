@@ -288,8 +288,8 @@ checks read execution/form/permission metadata. Message history is read at entry
 for a request/failure hint or terminal candidate, paging backwards only as far
 as the identified prompt. It is not fetched on each ordinary timer tick.
 
-Default total deadline is one hour, selectable with --timeout-ms from 1 to
-3600000 milliseconds. The request/initial event-handshake limits remain twenty
+Default total deadline is four hours, selectable with --timeout-ms from 1 to
+14400000 milliseconds. The request/initial event-handshake limits remain twenty
 seconds. A deadline is STOPPED/uncertain, never completed. Ordinary skill use
 runs this wait inside the detached [event observer](OBSERVER.md) and ends the
 Codex turn. Only an explicitly selected manual/diagnostic foreground wait keeps

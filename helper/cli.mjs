@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { connect, diagnose } from './connection.mjs';
-import { context, helper, inspect, listSessions, preflight } from './binding.mjs';
+import { context, helper, inspect, listSessions, preflight, WAIT_TIMEOUT_MS } from './binding.mjs';
 
 let client;
 try {
@@ -28,7 +28,7 @@ try {
   }
   if (values['timeout-ms'] !== undefined) {
     timeoutMs = Number(values['timeout-ms']);
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000) throw new Error('Wait timeout must be 1..3600000 ms');
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > WAIT_TIMEOUT_MS) throw new Error('Wait timeout must be 1..' + WAIT_TIMEOUT_MS + ' ms');
   }
   if (command === 'preflight') {
     if (!isAbsolute(workspace) || !isAbsolute(plan)) throw new Error('Use absolute workspace and plan paths');

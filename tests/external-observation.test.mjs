@@ -69,6 +69,17 @@ test('manual active assignment observes, wakes and consumes without touching old
   assert.equal(f.o.status().state, 'absent');
 });
 
+test('passive observer pins a four-hour default and completes early without changing legacy state', async t => {
+  const f = await setup(t), durations = [], original = AbortSignal.timeout;
+  t.mock.method(AbortSignal, 'timeout', milliseconds => { durations.push(milliseconds); return original(milliseconds); });
+  const armed = await f.o.arm(f.workspace, f.plan, { codexExe: process.execPath, sessionID, messageID });
+  assert.equal(armed.kind, 'observer-armed'); assert.equal(durations.at(-1), 14_400_000);
+  assert.equal(f.sent.length, 0);
+  f.finish(sessionID); await f.end(); assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].timeoutMs, 14_400_000);
+  assert.equal((await f.o.consume(armed.id)).kind, 'external-completed');
+});
+
 test('one passive observer per chat/checkout, concurrent arms and cancellation send no task or hint', async t => {
   const f = await setup(t);
   const arms = await Promise.allSettled([f.arm(), f.arm()]);

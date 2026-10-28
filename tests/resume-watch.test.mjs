@@ -48,6 +48,23 @@ test('explicit CLI resumes the same completed assignment without POST, new bindi
   assert.equal((await f.call(f.args)).result.kind, 'rejected'); unchanged(f, reviewed, after);
 });
 
+test('CLI wait and resume-watch accept four hours and reject larger or invalid deadlines without mutation', async t => {
+  const f = await stopped(t), wait = ['wait', f.workspace, f.plan, '--non-git-baseline', baseline];
+  const resume = f.args.slice(0, -2), before = readFileSync(f.statePath), from = f.calls.length;
+  for (const args of [wait, resume]) for (const invalid of ['0', '-1', '1.5', 'NaN', 'Infinity', '14400001']) {
+    const result = await f.call([...args, '--timeout-ms=' + invalid]);
+    assert.equal(result.status, 1); assert.match(result.result.error, /1\.\.14400000/);
+  }
+  assert.deepEqual(readFileSync(f.statePath), before); assert.equal(f.calls.length, from);
+  f.finish(f.resume.sessionID);
+  for (const args of [resume, wait]) {
+    const result = await f.call([...args, '--timeout-ms', '14400000']);
+    assert.equal(result.status, 0, JSON.stringify(result)); assert.equal(result.result.kind, 'completed-for-review');
+  }
+  assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.equal(f.posts(`/api/session/${f.resume.sessionID}/prompt`), 1);
+});
+
 test('resumed active observation owns a lease, leaves the short lock free and waits for actual completion', async t => {
   const f = await stopped(t), callsFrom = f.calls.length;
   let notified, reads = 0;

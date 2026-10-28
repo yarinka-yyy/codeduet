@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { connect, diagnose, requireValue as need } from './connection.mjs';
-import { context, helper, readState, withStateLock } from './binding.mjs';
+import { context, helper, readState, withStateLock, WAIT_TIMEOUT_MS } from './binding.mjs';
 import { processOwner, ownerLiveness } from './process-owner.mjs';
 import { selectExternal, externalUnchanged, externalOutcome, waitExternal } from './external-observation.mjs';
 
@@ -102,8 +102,8 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       workspace: value.workspace, planPath: value.planPath, correctionCount: value.correctionCount,
       observationOnly: true, taskSent: false, stateChange: 'unchanged' };
   }
-  async function arm(workspace, planPath, { codexExe, nonGitBaseline, timeoutMs = 3600000, resume = false, sessionID, messageID } = {}) {
-    need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3600000, 'Observer deadline must be 1..3600000 ms');
+  async function arm(workspace, planPath, { codexExe, nonGitBaseline, timeoutMs = WAIT_TIMEOUT_MS, resume = false, sessionID, messageID } = {}) {
+    need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= WAIT_TIMEOUT_MS, 'Observer deadline must be 1..' + WAIT_TIMEOUT_MS + ' ms');
     const external = sessionID !== undefined;
     need(external ? !resume && nonGitBaseline === undefined && /^msg_[a-zA-Z0-9]+$/.test(messageID) : messageID === undefined,
       'External observation requires exact session/message, without resume or a new baseline');
@@ -285,7 +285,7 @@ if (process.argv[1] && resolve(process.argv[1]) === here) {
     const instance = observer();
     const result = command === 'inspect-external' ? await instance.inspectExternal(first, second, values.session) :
       ['arm', 'observe'].includes(command) ? await instance.arm(first, second, { codexExe: values['codex-exe'],
-      nonGitBaseline: values['non-git-baseline'], timeoutMs: values['timeout-ms'] === undefined ? 3600000 : Number(values['timeout-ms']), resume: values.resume,
+      nonGitBaseline: values['non-git-baseline'], timeoutMs: values['timeout-ms'] === undefined ? undefined : Number(values['timeout-ms']), resume: values.resume,
       sessionID: values.session, messageID: values.message }) :
       await instance[command](first);
     if (result) {

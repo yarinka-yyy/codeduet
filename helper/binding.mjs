@@ -8,6 +8,8 @@ import { MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnos
 import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 import { processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
+export const WAIT_TIMEOUT_MS = 14_400_000;
+
 const phases = ['PREPARING', 'EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING', 'STOPPED', 'FINISHED'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
 const inside = (root, path) => { const rel = relative(root, path); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep); };
@@ -1106,8 +1108,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return { ...result, diagnostic, retried, bootstrap: error?.bootstrap };
       });
     },
-    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = 3_600_000, signal = new AbortController().signal, resume, onReady, once = false } = {}) {
-      need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000, 'Wait timeout must be 1..3600000 ms');
+    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = WAIT_TIMEOUT_MS, signal = new AbortController().signal, resume, onReady, once = false } = {}) {
+      need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= WAIT_TIMEOUT_MS, 'Wait timeout must be 1..' + WAIT_TIMEOUT_MS + ' ms');
       const resuming = resume !== undefined;
       observingProcess = processOwner(); // Capture outside the short state transaction.
       if (resuming) need(resume && Object.keys(resume).length === 3 &&

@@ -9,7 +9,7 @@ hooks, scheduled model calls or global settings. The command does not submit tas
 ## Arm and end the turn
 
 ```text
-node helper/observer.mjs arm <absolute-workspace> <absolute-plan.md> --codex-exe <absolute-Desktop-bundled-codex.exe> [--non-git-baseline <declaration>] [--timeout-ms <1..3600000>]
+node helper/observer.mjs arm <absolute-workspace> <absolute-plan.md> --codex-exe <absolute-Desktop-bundled-codex.exe> [--non-git-baseline <declaration>] [--timeout-ms <1..14400000>]
 node helper/observer.mjs status [receipt-id]
 node helper/observer.mjs consume <receipt-id>
 node helper/observer.mjs cancel <receipt-id>
@@ -176,7 +176,10 @@ do not retry its consume or resend a task. No observer writes plans.
 
 Only terminal completion, a correlated question/permission or a failure ends the
 software wait. Token/tool progress and ordinary polls do not wake GPT. The total
-deadline defaults to one hour; expiration is an error, never completion.
+deadline defaults to four hours (14400000 ms), also the maximum; shorter explicit
+deadlines remain supported. Expiration is an error, never completion. Receipts
+already armed retain their recorded deadline; an installation update does not
+extend or restart an existing observer.
 
 The shared event stream covers all engine locations. A lifecycle event whose
 event.location.directory resolves to a different physical directory is ignored.
