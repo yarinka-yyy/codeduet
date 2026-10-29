@@ -1,6 +1,6 @@
 ![Code Duet — GPT plans. DeepSeek builds. GPT reviews. A shared workflow with DeepSeek in OpenCode.](assets/readme/code-duet-transparent.png)
 
-**English** · [Русский](README.ru.md)
+**English** · [Русский](README.ru.md) · [简体中文](README.zh-CN.md)
 
 Code Duet is a Codex skill where **GPT plans and reviews, and DeepSeek writes the code in OpenCode**. Describe your task: GPT studies the project, prepares a plan, and hands it to DeepSeek. Once the code is ready, GPT reviews the changes, runs checks, and sends back anything that needs fixing. It reviews the corrections and lets you know when the task is complete.
 
@@ -41,7 +41,7 @@ Coordination runs in the background without taking over your mouse or keyboard. 
 
 Use Windows with the **Codex desktop app**, **OpenCode Desktop**, and **Node.js 24**. OpenCode needs access to **DeepSeek V4.1 Flash through OpenCode Go**. Open your project in Codex and start OpenCode Desktop.
 
-Supported OpenCode engine versions: **2.1.4** and **2.2.0**. The helper uses Node's built-in modules; no npm dependencies are required.
+Supported OpenCode engine versions: **2.1.4**, **2.2.0**, and **2.2.1**. The helper uses Node's built-in modules; no npm dependencies are required.
 
 ### 2. Install the skill
 
