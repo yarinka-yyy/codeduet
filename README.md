@@ -41,7 +41,7 @@ Coordination runs in the background without taking over your mouse or keyboard. 
 
 Use Windows with the **Codex desktop app**, **OpenCode Desktop**, and **Node.js 24**. OpenCode needs access to **DeepSeek V4.1 Flash through OpenCode Go**. Open your project in Codex and start OpenCode Desktop.
 
-Supported OpenCode engine versions: **2.1.4**, **2.2.0**, and **2.2.1**. The helper uses Node's built-in modules; no npm dependencies are required.
+Supported OpenCode engine versions: **2.1.4**, **2.2.0**, **2.2.1**, and **2.2.2**. The helper uses Node's built-in modules; no npm dependencies are required.
 
 ### 2. Install the skill
 
