@@ -1,4 +1,4 @@
-![Code Duet — GPT планирует, DeepSeek пишет код, GPT проверяет. Совместная работа с DeepSeek в OpenCode.](assets/readme/code-duet-transparent.png)
+![Code Duet — GPT планирует, DeepSeek пишет код, GPT проверяет. Совместная работа с DeepSeek в OpenCode.](assets/readme/code-duet.ru.png)
 
 [English](README.md) · **Русский** · [简体中文](README.zh-CN.md)
 
@@ -9,7 +9,7 @@ Code Duet организует совместную работу двух ИИ: 
 ## Как это работает
 
 <p align="center">
-  <img src="assets/readme/how-it-works-transparent.png" width="90%" alt="Задача поступает GPT для планирования, затем DeepSeek для реализации и снова GPT для проверки. Исправления возвращаются DeepSeek, а готовый результат — пользователю.">
+  <img src="assets/readme/how-it-works.ru.png" width="90%" alt="Задача поступает GPT для планирования, затем DeepSeek для реализации и снова GPT для проверки. Исправления возвращаются DeepSeek, а готовый результат — пользователю.">
 </p>
 
 <details>

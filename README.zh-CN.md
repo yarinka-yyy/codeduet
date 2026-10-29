@@ -1,4 +1,4 @@
-![Code Duet：GPT 负责规划与审查，DeepSeek 在 OpenCode 中编写代码。](assets/readme/code-duet-transparent.png)
+![Code Duet：GPT 负责规划与审查，DeepSeek 在 OpenCode 中编写代码。](assets/readme/code-duet.zh-CN.png)
 
 [English](README.md) · [Русский](README.ru.md) · **简体中文**
 
@@ -9,7 +9,7 @@ Code Duet 将两个 AI 的工作衔接起来：GPT 负责规划、关键决策�
 ## 工作原理
 
 <p align="center">
-  <img src="assets/readme/how-it-works-transparent.png" width="90%" alt="你提出需求，GPT 制定计划，DeepSeek 编写代码，GPT 审查结果。需要修改时交回 DeepSeek，通过审查后向你交付结果。">
+  <img src="assets/readme/how-it-works.zh-CN.png" width="90%" alt="你提出需求，GPT 制定计划，DeepSeek 编写代码，GPT 审查结果。需要修改时交回 DeepSeek，通过审查后向你交付结果。">
 </p>
 
 <details>
