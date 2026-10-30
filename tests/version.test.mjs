@@ -9,6 +9,11 @@ import { helper, preflight } from '../helper/binding.mjs';
 const registrationPath = f => join(f.home, '.local/state/opencode/service.json');
 const preflightArgs = f => ['preflight', f.workspace, f.plan, '--correction-count', '7', '--non-git-baseline', baseline];
 
+test('supported engine releases are unique and limited to six', () => {
+  assert.ok(ENGINE_VERSIONS.length > 0 && ENGINE_VERSIONS.length <= 6);
+  assert.equal(new Set(ENGINE_VERSIONS).size, ENGINE_VERSIONS.length);
+});
+
 for (const version of ['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3']) test('validated engine ' + version + ' preserves adoption, SSE completion and correction history', async t => {
   const f = await fixture(t, undefined, version), sessionID = 'ses_versionfixture';
   f.sessions.set(sessionID, { id: sessionID, title: 'Dedicated version fixture',
