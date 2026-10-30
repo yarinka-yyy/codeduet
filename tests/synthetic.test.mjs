@@ -79,7 +79,7 @@ test('one read can load ordered nested instruction files, but unrelated parallel
   assert.throws(() => inspectMessages(bound, [user, ...records]), /not correlated/);
 });
 
-for (const version of ['2.1.4', '2.2.0', '2.2.1', '2.2.2']) test(version + ' wait accepts in-flight instruction load and completes without resending', async t => {
+for (const version of ['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3']) test(version + ' wait accepts in-flight instruction load and completes without resending', async t => {
   const f = await fixture(t, undefined, version), client = await connect({
     registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'synthetic-fixture' });

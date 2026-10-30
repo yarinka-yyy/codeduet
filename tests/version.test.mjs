@@ -9,7 +9,7 @@ import { helper, preflight } from '../helper/binding.mjs';
 const registrationPath = f => join(f.home, '.local/state/opencode/service.json');
 const preflightArgs = f => ['preflight', f.workspace, f.plan, '--correction-count', '7', '--non-git-baseline', baseline];
 
-for (const version of ['2.1.4', '2.2.0', '2.2.1', '2.2.2']) test('validated engine ' + version + ' preserves adoption, SSE completion and correction history', async t => {
+for (const version of ['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3']) test('validated engine ' + version + ' preserves adoption, SSE completion and correction history', async t => {
   const f = await fixture(t, undefined, version), sessionID = 'ses_versionfixture';
   f.sessions.set(sessionID, { id: sessionID, title: 'Dedicated version fixture',
     location: { directory: f.workspace }, model: { providerID: model.providerID, id: model.id, variant: 'high' }, time: {} });
@@ -55,11 +55,11 @@ test('unvalidated version is a one-attempt read-only preflight blocker with acti
   assert.equal(result.status, 1); assert.equal(result.result.status, 'blocked');
   const diagnostic = result.result.connection.diagnostic;
   assert.equal(diagnostic.category, 'engine-version');
-  assert.deepEqual(diagnostic.expectedVersions, ['2.1.4', '2.2.0', '2.2.1', '2.2.2']);
+  assert.deepEqual(diagnostic.expectedVersions, ['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3']);
   assert.equal(diagnostic.observedVersion, '2.3.0'); assert.equal(diagnostic.versionSource, 'registration');
   assert.equal(result.result.connection.attempts, 1); assert.equal(result.result.connection.retried, false);
   const check = result.result.checks.find(item => item.name === 'connection');
-  assert.deepEqual(check.diagnostic, diagnostic); assert.match(check.reason, /expected 2\.1\.4 or 2\.2\.0 or 2\.2\.1 or 2\.2\.2, observed 2\.3\.0/);
+  assert.deepEqual(check.diagnostic, diagnostic); assert.match(check.reason, /expected 2\.1\.4 or 2\.2\.0 or 2\.2\.1 or 2\.2\.2 or 2\.2\.3, observed 2\.3\.0/);
   assert.match(result.result.nextStep, /revalidate API compatibility/);
   assert.equal(result.result.nextCommand, null); assert.equal(result.result.taskSent, false);
   assert.equal(result.result.stateChange, 'unchanged'); assert.equal(existsSync(dirname(f.statePath)), false);

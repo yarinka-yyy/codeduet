@@ -130,7 +130,7 @@ Direct API/helper component proof does not establish actual skill-entry routing.
 
 ## Engine release compatibility
 
-`node --test tests/version.test.mjs` checks exact releases 2.1.4, 2.2.0, 2.2.1 and 2.2.2,
+`node --test tests/version.test.mjs` checks exact releases 2.1.4, 2.2.0, 2.2.1, 2.2.2 and 2.2.3,
 including multi-page completed native synthetic/compaction history, explicit
 adoption, variant/count preservation, SSE review/correction and safe version
 mismatches before any dispatch. New releases are not accepted by a version range.
