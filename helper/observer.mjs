@@ -9,6 +9,7 @@ import { connect, diagnose, requireValue as need } from './connection.mjs';
 import { context, helper, readState, withStateLock, WAIT_TIMEOUT_MS } from './binding.mjs';
 import { processOwner, ownerLiveness } from './process-owner.mjs';
 import { selectExternal, externalUnchanged, externalOutcome, waitExternal } from './external-observation.mjs';
+import { packageFiles, packageSkill } from '../tools/package.mjs';
 
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -18,6 +19,7 @@ const pins = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID',
 const put = (path, value) => writeFileSync(path, JSON.stringify(value) + '\n', { flag: 'wx', mode: 0o600 });
 const get = path => JSON.parse(readFileSync(path, 'utf8'));
 const here = fileURLToPath(import.meta.url);
+const loadedObserverHash = hash(readFileSync(here));
 
 export function wakeHint(id) {
   need(uuid.test(id), 'Invalid observer receipt');
@@ -120,6 +122,13 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         put(active, { id }); // Unknown or live slots are never replaced.
         try {
           mkdirSync(dir, { mode: 0o700 });
+          const snapshot = join(dir, 'code-duet');
+          const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
+          const before = packageFiles.map(file => hash(readFileSync(join(sourceRoot, file))));
+          need(before[packageFiles.indexOf('helper/observer.mjs')] === loadedObserverHash, 'Observer package changed before startup');
+          packageSkill(snapshot);
+          need(packageFiles.every((file, index) => hash(readFileSync(join(snapshot, file))) === before[index] &&
+            hash(readFileSync(join(sourceRoot, file))) === before[index]), 'Package changed during observer startup');
           const value = external ? saved : Object.fromEntries(pins.map(key => [key, saved[key]]));
           put(join(dir, 'receipt.json'), { schema: 1, id, ...value, codex, timeoutMs, resume, ...(nonGitBaseline ? { nonGitBaseline } : {}) });
           if (external) put(externalSlot(saved), { id, codexChat: chatID });
@@ -127,7 +136,8 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       });
       if (launch) { await launch(id); launched = true; }
       else {
-        const child = spawn(process.execPath, [here, 'worker', id], { detached: true, windowsHide: true, stdio: 'ignore' });
+        const child = spawn(process.execPath, [join(dir, 'code-duet', 'helper', 'observer.mjs'), 'worker', id],
+          { detached: true, windowsHide: true, stdio: 'ignore' });
         await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); });
         launched = true; child.unref();
       }

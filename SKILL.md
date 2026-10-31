@@ -5,7 +5,7 @@ description: Coordinate authorized implementation through DeepSeek in the local 
 
 # Code Duet
 
-Use this route only after an explicit $code-duet invocation. The invocation
+Use this route only after an explicit $code-duet or $code-duet:code-duet invocation. The invocation
 selects a route; it does not authorize an old plan, installation or publication.
 Codex is the advisor and DeepSeek is the sole implementation executor. Do not
 invoke Improve Codex or create Codex subagents; keep OpenCode/DeepSeek as the

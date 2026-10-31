@@ -43,25 +43,23 @@ Use Windows with the **Codex desktop app**, **OpenCode Desktop**, and **Node.js 
 
 Supported OpenCode engine versions: **2.1.4**, **2.2.0**, **2.2.1**, **2.2.2**, **2.2.3**, and **2.2.5**. The helper uses Node's built-in modules; no npm dependencies are required.
 
-### 2. Install the skill
+### 2. Install the plugin
 
 Run in PowerShell:
 
 ```powershell
-git clone https://github.com/yarinka-yyy/codeduet.git
-Set-Location codeduet
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
-node .\tools\package.mjs "$env:USERPROFILE\.codex\skills\code-duet"
+codex plugin marketplace add yarinka-yyy/codeduet
+codex plugin add code-duet@code-duet
 ```
 
-The destination must be a new `code-duet` folder. For an existing installation or a project-local setup, see [installation and runtime](references/runtime.md).
+Start a new Codex chat and select the `code-duet:code-duet` skill. An existing standalone installation stays separate; see [installation and runtime](references/runtime.md).
 
 ### 3. Give GPT a task
 
 Tell GPT what you want to build in your Codex chat:
 
 ```text
-$code-duet
+$code-duet:code-duet
 Add a CSV export to the reports page.
 ```
 

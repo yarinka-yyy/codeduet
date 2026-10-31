@@ -1,0 +1,18 @@
+{
+  "name": "code-duet",
+  "version": "1.0.0",
+  "description": "Coordinate Codex planning and review with DeepSeek implementation in OpenCode Desktop.",
+  "author": { "name": "yarinka-yyy", "url": "https://github.com/yarinka-yyy" },
+  "homepage": "https://github.com/yarinka-yyy/codeduet",
+  "repository": "https://github.com/yarinka-yyy/codeduet",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Code Duet",
+    "shortDescription": "Codex plans, DeepSeek builds",
+    "longDescription": "Coordinate a shared project and plan between Codex and DeepSeek in OpenCode Desktop.",
+    "developerName": "yarinka-yyy",
+    "category": "Developer Tools",
+    "capabilities": ["Instructions"],
+    "websiteURL": "https://github.com/yarinka-yyy/codeduet"
+  }
+}

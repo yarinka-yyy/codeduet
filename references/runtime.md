@@ -1,5 +1,23 @@
 # Local runtime and portable package
 
+## Plugin installation and updates
+
+The repository also provides `code-duet@code-duet` as a Codex Git marketplace
+plugin. Add `yarinka-yyy/codeduet` as a marketplace, install the plugin and
+start a new Codex chat. The plugin skill is listed as `code-duet:code-duet`;
+the standalone installation remains separate. If both are installed, select
+the intended skill explicitly. Do not remove or overwrite either installation
+as part of setup, and preserve the shared store and existing assignments.
+
+Codex checks configured Git marketplaces at startup; a push does not imply an
+immediate update in an already running app. Each new observer pins a verified
+copy of its skill package in its receipt directory. Existing observers keep the
+package they were started with; an observer started before this protection was
+installed must finish before its source installation is replaced. See the
+[observer](../helper/OBSERVER.md). The repository's plugin copy is generated
+with `node tools/build-plugin.mjs` and must match the source package before a
+release. Update the plugin version for a release.
+
 ## Check an installed helper
 
 Routine use requires Windows, Node.js 24 and the already-running OpenCode

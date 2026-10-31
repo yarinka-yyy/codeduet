@@ -6,7 +6,15 @@ From the source checkout with Node 24:
 ```text
 node --test tests/*.test.mjs tools/transport-proof/probe.test.mjs
 node tests/package-smoke.mjs <absolute-codex-exe> <absolute-new-evidence-directory>
+node tests/plugin-git-update.mjs <absolute-codex-exe>
 ```
+
+The plugin Git test uses a disposable local HTTP Git repository and isolated
+CODEX_HOME. It installs v1 with the real Codex CLI, arms a detached observer
+against the offline engine fixture, publishes v2 only to that local repository,
+and starts the real app-server to verify its startup upgrade. The observer must
+finish and the new package must consume its receipt with the same binding and
+counter. It does not invoke a model or connect to the user's OpenCode.
 
 The package smoke creates a separate copy with spaces and & in its path,
 loads metadata using an isolated CODEX_HOME and runs GET-only helper inspect.

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Code Duet"
+  short_description: "Plan in Codex, implement through OpenCode"
+  default_prompt: "Use $code-duet for the authorized task, preserving the shared plan and reviewing actual changes."
+
+policy:
+  allow_implicit_invocation: false

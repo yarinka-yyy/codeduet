@@ -28,6 +28,9 @@ requires it; do not relocate state, spoof HOME or weaken permissions.
 
 Arm requires a confirmed delivered EXECUTING binding. It captures workspace and
 checkout identity, plan, engine, session, assignment, message and correction count.
+It also keeps a verified copy of the skill in the observer receipt directory;
+the worker and wake hint use that copy even if the plugin is updated. Receipt
+copies are retained as recovery evidence and never replace shared task state.
 A second observer slot or checkout lease is refused. It returns observer-armed
 only after the worker has reached the verified wait without a recorded terminal
 result. Give a brief waiting notice and **finish the Codex turn**.

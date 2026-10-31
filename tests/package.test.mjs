@@ -81,3 +81,13 @@ test('a portable package can reproduce itself through the same CLI in a path wit
   assert.equal(result.kind, 'packaged');
   for (const file of packageFiles) assert.deepEqual(readFileSync(join(second, file)), readFileSync(join(f.destination, file)));
 });
+
+test('published plugin contains the exact current skill package', () => {
+  const source = fileURLToPath(new URL('../', import.meta.url));
+  const plugin = join(source, 'plugin', 'skills', 'code-duet');
+  for (const file of packageFiles) assert.deepEqual(readFileSync(join(plugin, file)), readFileSync(join(source, file)), file);
+  const manifest = JSON.parse(readFileSync(join(source, 'plugin', '.codex-plugin', 'plugin.json'), 'utf8'));
+  const market = JSON.parse(readFileSync(join(source, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  assert.equal(manifest.skills, './skills/');
+  assert.equal(market.plugins[0].source.path, './plugin');
+});

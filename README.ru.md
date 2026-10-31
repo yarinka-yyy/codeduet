@@ -43,25 +43,23 @@ Code Duet организует совместную работу двух ИИ: 
 
 Поддерживаемые версии движка OpenCode: **2.1.4**, **2.2.0**, **2.2.1**, **2.2.2**, **2.2.3** и **2.2.5**. Помощник использует встроенные модули Node.js; устанавливать npm-зависимости не нужно.
 
-### 2. Установите скилл
+### 2. Установите плагин
 
 Выполните в PowerShell:
 
 ```powershell
-git clone https://github.com/yarinka-yyy/codeduet.git
-Set-Location codeduet
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
-node .\tools\package.mjs "$env:USERPROFILE\.codex\skills\code-duet"
+codex plugin marketplace add yarinka-yyy/codeduet
+codex plugin add code-duet@code-duet
 ```
 
-Папка назначения `code-duet` должна быть новой. Если скилл уже установлен или нужен только в одном проекте, см. [установку и локальный запуск](references/runtime.md).
+Начните новый чат Codex и выберите скилл `code-duet:code-duet`. Существующий отдельно установленный скилл остаётся самостоятельным; см. [установку и локальный запуск](references/runtime.md).
 
 ### 3. Дайте GPT задачу
 
 В чате Codex сообщите, что хотите сделать:
 
 ```text
-$code-duet
+$code-duet:code-duet
 Добавь экспорт в CSV на страницу отчётов.
 ```
 

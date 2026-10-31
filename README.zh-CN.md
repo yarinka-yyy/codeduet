@@ -43,25 +43,23 @@ Code Duet 将两个 AI 的工作衔接起来：GPT 负责规划、关键决策�
 
 支持的 OpenCode 引擎版本为 **2.1.4**、**2.2.0**、**2.2.1**、**2.2.2**、**2.2.3** 和 **2.2.5**。辅助程序仅使用 Node.js 内置模块，无需安装 npm 依赖。
 
-### 2. 安装技能
+### 2. 安装插件
 
 在 PowerShell 中运行：
 
 ```powershell
-git clone https://github.com/yarinka-yyy/codeduet.git
-Set-Location codeduet
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
-node .\tools\package.mjs "$env:USERPROFILE\.codex\skills\code-duet"
+codex plugin marketplace add yarinka-yyy/codeduet
+codex plugin add code-duet@code-duet
 ```
 
-目标位置不能已有 `code-duet` 文件夹；安装命令会新建该文件夹。如果已经安装过技能，或只想在单个项目中使用，请参阅[安装与本地运行说明](references/runtime.md)。
+开启新的 Codex 对话并选择 `code-duet:code-duet` 技能。已有的独立技能安装会保留；请参阅[安装与本地运行说明](references/runtime.md)。
 
 ### 3. 向 GPT 提出任务
 
 在 Codex 对话中说明你想做什么：
 
 ```text
-$code-duet
+$code-duet:code-duet
 为报表页面添加 CSV 导出功能。
 ```
 
