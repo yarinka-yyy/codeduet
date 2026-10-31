@@ -31,6 +31,8 @@ node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-i
 node helper/cli.mjs next <absolute-workspace> <absolute-plan.md> <block|correction>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assignment-id> <absolute-packet-file> --kind <block|correction>
 node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
+node helper/cli.mjs retire-legacy <absolute-workspace> <old-plan.md> <lease-token>
+node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
 node helper/cli.mjs resume-watch <absolute-workspace> <absolute-plan.md> <assignment-id> <message-id> --session <exact-session-id> [--timeout-ms <ms>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
@@ -51,7 +53,7 @@ it does not infer execution authorization from the mere existence of a plan.
 
 The shared `connection.mjs` also serves the original transport probe. It reads
 the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
-only, rejects redirects, validates installed/API version 2.1.4, 2.2.0, 2.2.1, 2.2.2 or 2.2.3 and the enabled
+only, rejects redirects, validates installed/API version 2.1.4, 2.2.0, 2.2.1, 2.2.2, 2.2.3 or 2.2.5 and the enabled
 `opencode-go/deepseek-v4.1-flash` model. Credentials stay inside HTTP closures;
 the exposed client, state, results and errors contain no auth/response-body data.
 The default model variant is left unchanged. No second engine or fallback is
@@ -71,7 +73,7 @@ each attempt rereads registration. Access, malformed registration, 400/401/403/
 single-attempt failures. A failed parallel GET aborts its sibling. These retries
 never replay create/prompt/reply POSTs and do not reconnect SSE.
 
-Only the exact validated releases 2.1.4, 2.2.0, 2.2.1, 2.2.2 and 2.2.3 are accepted; registration and
+Only the exact validated releases 2.1.4, 2.2.0, 2.2.1, 2.2.2, 2.2.3 and 2.2.5 are accepted; registration and
 GET info versions must agree. A mismatch is a single-attempt `engine-version`
 diagnostic with expectedVersions, observedVersion (numeric release or unknown)
 and versionSource (registration or server-info). Inspect and preflight expose
@@ -79,6 +81,20 @@ the same safe fields; preflight names the mismatch and requires API revalidation
 rather than suggesting a connection retry. Untrusted version text is not echoed.
 
 ## Identity and persistence
+
+`task-maintenance` is a local, state-lock-protected operation, invoked before
+preflight for a selected task. It records that task's use, archives eligible
+inactive task records after 30 days, restores an archived task's exact counter
+when selected again, and removes records after a further 30 days in the archive.
+Cleanup happens at the next invocation, not while Code Duet is not running.
+Both periods are measured from recorded activity, even if no invocation occurred
+at the 30-day boundary. If task state changed since the previous check, the
+inactivity period starts again at the check because the change time is unknown.
+Existing records without a known last-use time start their timer at first
+maintenance. Running, stopped, uncertain or leased tasks are not archived;
+existing passive observation conservatively pauses archive selection. The journal
+is written before moving state so interrupted archive/restore is recoverable.
+Only Code Duet bookkeeping is removed, never project files or OpenCode history.
 
 One technical file: `~/.local/state/code-duet/state.json`, schema 1. It stores
 bindings by Codex chat and counters by exact physical plan path/workspace. Each

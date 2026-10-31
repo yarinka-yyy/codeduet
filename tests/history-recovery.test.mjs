@@ -36,6 +36,16 @@ for (const reason of ['ambiguous', 'missing']) test('known no-write edit rejecti
   assert.deepEqual(f.messages, before);
 });
 
+for (const hint of ['The closest lines in the file:\n3: example', 'newString is already in the file, so this edit may already be applied.']) {
+  test('2.2.5 edit miss with hint still requires a later same-file repair', t => {
+    const f = history(t);
+    f.rejected.state.error.message = `Could not find oldString in ${f.path}. It must match exactly, including whitespace and indentation.\n\n${hint}`;
+    assert.equal(f.complete(f.inspect()).kind, 'completed-for-review');
+    f.messages[1].content.pop();
+    assert.equal(f.inspect().kind, 'failed');
+  });
+}
+
 for (const unsafe of ['no-repair', 'other-file', 'repair-earlier', 'repair-running', 'unknown-error', 'wrong-error-type',
   'shell-error', 'bad-time', 'missing-file', 'failed-idle', 'interrupted-idle', 'provider-error', 'failed-compaction']) {
   test('unresolved or genuine failure is retained: ' + unsafe, t => {

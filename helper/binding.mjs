@@ -477,10 +477,19 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   } else add('saved-writers', 'unknown', 'Saved checkout ownership depends on readable state and checkout identity');
 
   const ownershipRoot = join(stateRoot, 'ownership');
+  let legacyCandidates = [];
   if (ctx) {
     try {
       const { owners, invalid } = readOwnerships(ownershipRoot);
       const conflict = owners.some(owner => overlaps(ctx.checkout, owner.checkout));
+      if (!invalid && state) legacyCandidates = owners.filter(owner => owner.schema === 1 &&
+        ['wait', 'resume-watch'].includes(owner.operation) && overlaps(ctx.checkout, owner.checkout)).flatMap(owner => {
+        const binding = state.bindings.find(item => item.codexChat === owner.codexChat &&
+          item.sessionID === owner.sessionID && item.assignmentID === owner.assignmentID &&
+          item.workspace === owner.workspace && item.checkout === owner.checkout && !item.uncertain);
+        return binding ? [{ token: owner.token, workspace: binding.workspace, planPath: binding.planPath,
+          sessionID: binding.sessionID, assignmentID: binding.assignmentID }] : [];
+      });
       add('ownership', invalid || conflict ? 'blocked' : 'pass', invalid ?
         'Ownership state is invalid or unreadable; do not clean it up automatically' :
         conflict ? 'A helper operation owns this checkout; wait for that owner' : 'No retained ownership lease overlaps this checkout');
@@ -699,7 +708,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       effective: effectiveCount, status: checks.find(item => item.name === 'correction-count')?.status ?? 'unknown' },
     recipient: { selected: !!selectedSessionID, sessionID: selectedSessionID ?? null,
       source: explicitSession ? 'explicit' : savedBinding ? 'saved-pair' : 'none' },
-    checks, blockers: [...new Set(blockers)], unknowns: [...new Set(unknowns)],
+    checks, blockers: [...new Set(blockers)], unknowns: [...new Set(unknowns)], legacyCandidates,
     nextStep, nextCommand, taskSent: false, snapshotOnly: true, stateChange: 'unchanged',
     storeWriteAccess: 'unknown until an authorized write command; request normal host approval if the store is outside writable roots',
   };
@@ -753,6 +762,119 @@ export function withStateLock(stateRoot, operation) {
     }
     if (releaseError) throw stateFailure(releaseError, 'state-lock');
     return result;
+}
+
+// Lifecycle cleanup runs only when explicitly invoked before a task; state.lock
+// also serializes its journal with every existing helper writer.
+export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir(), '.local/state/code-duet'), now = Date.now() } = {}) {
+  need(Number.isSafeInteger(now) && now >= 0, 'Invalid maintenance time');
+  const ctx = observationContext(workspace, planPath);
+  const ledgerPath = join(stateRoot, 'task-lifecycle.json'), statePath = join(stateRoot, 'state.json');
+  const period = 30 * 24 * 60 * 60 * 1000;
+  return withStateLock(stateRoot, state => {
+    let ledger = { schema: 1, entries: [] };
+    if (existsSync(ledgerPath)) {
+      ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+      need(ledger?.schema === 1 && Array.isArray(ledger.entries) && Object.keys(ledger).length === 2,
+        'Invalid task lifecycle journal');
+    }
+    const seen = new Set();
+    for (const entry of ledger.entries) {
+      need(entry && isAbsolute(entry.workspace) && isAbsolute(entry.planPath) && !seen.has(entry.planPath) &&
+        Number.isSafeInteger(entry.lastUsed) && entry.lastUsed >= 0 &&
+        (entry.archivedAt === null || Number.isSafeInteger(entry.archivedAt) && entry.archivedAt >= 0) &&
+        entry.plan?.workspace === entry.workspace && entry.plan?.planPath === entry.planPath &&
+        Number.isInteger(entry.plan.correctionCount) && entry.plan.correctionCount >= 0 && entry.plan.correctionCount <= 20 &&
+        Array.isArray(entry.bindings) && (entry.pendingRestore === undefined || typeof entry.pendingRestore === 'boolean') &&
+        (entry.fingerprint === undefined || /^[a-f0-9]{64}$/.test(entry.fingerprint)) &&
+        (entry.busy === undefined || typeof entry.busy === 'boolean') &&
+        (!entry.pendingRestore || entry.archivedAt === null), 'Invalid task lifecycle entry');
+      validateState({ schema: 1, bindings: [], plans: [entry.plan] });
+      seen.add(entry.planPath);
+    }
+    const owners = readOwnerships(join(stateRoot, 'ownership'));
+    need(!owners.invalid, 'Cannot maintain tasks while ownership is invalid');
+    const observerRoot = join(stateRoot, 'observers');
+    const externalObserver = existsSync(observerRoot) && readdirSync(observerRoot).some(name => name.startsWith('external-'));
+    const inUse = plan => {
+      if (externalObserver) return true;
+      const bindings = state.bindings.filter(item => item.planPath === plan.planPath);
+      if (bindings.some(item => item.phase !== 'FINISHED' || item.uncertain || item.nextAssignment)) return true;
+      if (owners.owners.some(owner => overlaps(plan.workspace, owner.checkout))) return true;
+      return bindings.some(binding => existsSync(join(stateRoot, 'observers',
+        createHash('sha256').update(binding.codexChat).digest('hex'), 'active')));
+    };
+    for (const plan of state.plans) if (!seen.has(plan.planPath)) {
+      ledger.entries.push({ workspace: plan.workspace, planPath: plan.planPath, plan: structuredClone(plan),
+        bindings: [], lastUsed: now, archivedAt: null });
+      seen.add(plan.planPath);
+    }
+    let stateChanged = false, archived = 0, restored = 0, deleted = 0;
+    const clearPending = [];
+    for (const entry of ledger.entries) {
+      const current = state.plans.find(plan => plan.planPath === entry.planPath);
+      if (entry.archivedAt !== null && current) {
+        const currentBindings = state.bindings.filter(item => item.planPath === entry.planPath);
+        if (JSON.stringify(current) === JSON.stringify(entry.plan) &&
+            JSON.stringify(currentBindings) === JSON.stringify(entry.bindings) && !inUse(current)) {
+          state.plans = state.plans.filter(plan => plan.planPath !== entry.planPath);
+          state.bindings = state.bindings.filter(item => item.planPath !== entry.planPath);
+          stateChanged = true;
+        } else {
+          entry.archivedAt = null; entry.lastUsed = now; entry.plan = structuredClone(current); entry.bindings = [];
+        }
+      } else if (entry.archivedAt === null && !current) {
+        need(entry.pendingRestore, 'Task state is missing without a pending restore');
+        state.plans.push(structuredClone(entry.plan)); stateChanged = true; clearPending.push(entry);
+      } else if (current && entry.pendingRestore) {
+        need(JSON.stringify(current) === JSON.stringify(entry.plan), 'Restored task counter changed');
+        clearPending.push(entry);
+      }
+    }
+    for (const entry of ledger.entries) {
+      const current = state.plans.find(plan => plan.planPath === entry.planPath);
+      if (entry.archivedAt === null && current) {
+        const fingerprint = createHash('sha256').update(JSON.stringify({ plan: current,
+          bindings: state.bindings.filter(item => item.planPath === entry.planPath) })).digest('hex');
+        const busy = inUse(current);
+        if (entry.fingerprint && entry.fingerprint !== fingerprint || entry.busy && !busy) entry.lastUsed = Math.max(entry.lastUsed, now);
+        entry.fingerprint = fingerprint;
+        entry.busy = busy;
+        entry.plan = structuredClone(current);
+        if (entry.planPath === ctx.planPath) entry.lastUsed = Math.max(entry.lastUsed, now);
+        if (now >= entry.lastUsed + period && !busy) {
+          entry.archivedAt = entry.lastUsed + period; entry.bindings = structuredClone(state.bindings.filter(item => item.planPath === entry.planPath));
+          state.plans = state.plans.filter(plan => plan.planPath !== entry.planPath);
+          state.bindings = state.bindings.filter(item => item.planPath !== entry.planPath);
+          stateChanged = true; archived++;
+        }
+      }
+    }
+    function saveLedger() {
+      const temporary = ledgerPath + '.' + randomUUID() + '.tmp';
+      try { writeFileSync(temporary, JSON.stringify(ledger, null, 2) + '\n', { flag: 'wx', mode: 0o600 }); renameSync(temporary, ledgerPath); }
+      finally { if (existsSync(temporary)) unlinkSync(temporary); }
+    }
+    saveLedger();
+    if (stateChanged) saveState(statePath, state);
+    for (const entry of clearPending) entry.pendingRestore = false;
+    ledger.entries = ledger.entries.filter(entry => {
+      if (entry.archivedAt !== null && now >= entry.archivedAt + period) { deleted++; return false; }
+      return true;
+    });
+    const requested = ledger.entries.find(entry => entry.planPath === ctx.planPath && entry.archivedAt !== null);
+    if (requested) {
+      requested.archivedAt = null; requested.lastUsed = Math.max(requested.lastUsed, now); requested.pendingRestore = true;
+      saveLedger(); // A pending restore remains recoverable if state.json cannot be saved.
+      if (!state.plans.some(plan => plan.planPath === requested.planPath)) {
+        state.plans.push(structuredClone(requested.plan)); saveState(statePath, state);
+      }
+      requested.pendingRestore = false;
+      restored++;
+    }
+    saveLedger();
+    return { kind: 'task-maintenance', archived, restored, deleted, taskSent: false };
+  });
 }
 
 export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
@@ -1007,6 +1129,69 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   return {
     statePath,
+    async retireLegacy(workspace, planPath, token) {
+      need(client, 'OpenCode connection is required to check project activity');
+      need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(token), 'Invalid legacy lease token');
+      const ctx = observationContext(workspace, planPath);
+      const history = join(stateRoot, 'ownership-history');
+      const archive = join(history, token + '.retired.json');
+      const archivedLease = join(history, token + '.retired.lock');
+      const select = state => {
+        const owner = ownerships().find(item => item.token === token);
+        need(owner && owner.schema === 1 && ['wait', 'resume-watch'].includes(owner.operation),
+          'Only an exact legacy observation lease can be retired');
+        const liveBinding = state.bindings.find(item => item.codexChat === owner.codexChat);
+        const previous = !liveBinding && existsSync(archive) ? JSON.parse(readFileSync(archive, 'utf8')) : null;
+        const binding = liveBinding ?? previous?.binding;
+        need(binding && binding.workspace === ctx.workspace && binding.workspaceID === ctx.workspaceID &&
+          binding.checkout === ctx.checkout && binding.checkoutID === ctx.checkoutID && binding.planPath === ctx.planPath &&
+          owner.workspace === binding.workspace && owner.checkout === binding.checkout &&
+          owner.sessionID === binding.sessionID && owner.assignmentID === binding.assignmentID &&
+          binding.assignmentID && binding.messageID && !binding.uncertain,
+        'Legacy lease and delivered assignment do not match');
+        need(ownerships().filter(item => overlaps(ctx.checkout, item.checkout)).length === 1,
+          'Another operation owns this checkout');
+        const counter = state.plans.find(item => item.planPath === binding.planPath)?.correctionCount;
+        need(Number.isInteger(counter) && (!previous || previous.schema === 1 &&
+          previous.kind === 'abandoned-legacy-observation' && previous.correctionCount === counter &&
+          JSON.stringify(previous.owner) === JSON.stringify(owner)), 'Retirement journal does not match');
+        return { owner, binding, counter };
+      };
+      const selected = locked(state => structuredClone(select(state)));
+      async function verifyIdle() {
+        const active = await client.request('/api/session/active');
+        need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data), 'Unknown execution status');
+        for (const id of Object.keys(active.data)) {
+          need(/^ses_[a-zA-Z0-9]+$/.test(id), 'Unknown active session identity');
+          const current = await client.request('/api/session/' + id);
+          need(text(current?.data?.location?.directory) &&
+            !overlaps(ctx.checkout, realpathSync(current.data.location.directory)), 'Active executor in this checkout');
+        }
+        const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(ctx.workspace));
+        need(Array.isArray(shells?.data) && shells.data.every(shell =>
+          ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)),
+        'Project shell is running or unknown');
+      }
+      await verifyIdle();
+      await verifyIdle();
+      return locked(state => {
+        const current = select(state);
+        need(JSON.stringify(current) === JSON.stringify(selected), 'Legacy ownership changed; no retirement');
+        mkdirSync(history, { recursive: true, mode: 0o700 });
+        const saved = { schema: 1, kind: 'abandoned-legacy-observation', owner: selected.owner,
+          binding: selected.binding, correctionCount: selected.counter };
+        if (existsSync(archive)) need(JSON.stringify(JSON.parse(readFileSync(archive, 'utf8'))) === JSON.stringify(saved),
+          'Retirement archive differs');
+        else writeFileSync(archive, JSON.stringify(saved), { flag: 'wx', mode: 0o600 });
+        state.bindings = state.bindings.filter(item => item.codexChat !== selected.binding.codexChat);
+        saveState(statePath, state);
+        need(!existsSync(archivedLease), 'Retired lease already exists');
+        renameSync(selected.owner.path, archivedLease);
+        return { kind: 'legacy-retired', sessionID: selected.binding.sessionID,
+          assignmentID: selected.binding.assignmentID, correctionCount: selected.counter,
+          taskAccepted: false, taskSent: false, archived: true };
+      });
+    },
     async observationOwner(workspace, planPath, token, { action = 'inspect', nonGitBaseline } = {}) {
       need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(token) &&
         ['inspect', 'stop', 'recover'].includes(action), 'Invalid observation owner/action');

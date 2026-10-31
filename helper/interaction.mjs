@@ -173,7 +173,9 @@ function rejectedEdit(tool, workspace) {
     !Number.isFinite(tool.time?.ran) || !Number.isFinite(tool.time?.completed) || tool.time.completed < tool.time.ran) return null;
   // OpenCode 2.2.0 rejects these replacements before fileMutation.write.
   const missing = `Could not find oldString in ${input.path}. It must match exactly, including whitespace and indentation.`;
-  if (error.message !== missing && !/^Found (?:[2-9]|[1-9]\d+) matches for oldString, but expected exactly one\. Add more surrounding context to make oldString unique, or set replaceAll to true to replace every occurrence\.$/.test(error.message)) return null;
+  const hint = typeof error.message === 'string' && (error.message === missing + '\n\nnewString is already in the file, so this edit may already be applied.' ||
+    error.message.startsWith(missing + '\n\nThe closest lines in the file:\n'));
+  if (error.message !== missing && !hint && !/^Found (?:[2-9]|[1-9]\d+) matches for oldString, but expected exactly one\. Add more surrounding context to make oldString unique, or set replaceAll to true to replace every occurrence\.$/.test(error.message)) return null;
   try {
     const path = realpathSync(resolve(workspace, input.path)), rel = relative(realpathSync(workspace), path);
     if (isAbsolute(rel) || rel === '..' || rel.startsWith('..' + sep)) return null;

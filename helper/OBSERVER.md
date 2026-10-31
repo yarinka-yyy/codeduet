@@ -121,15 +121,25 @@ also not removed by lease recovery; diagnose its receipt separately.
 
 Schema1 legacy leases without process identity remain readable but unverifiable.
 Their inspect reports legacy-owner-unverifiable; stop/recover refuse unchanged.
+When the user explicitly abandons the old assignment, `cli.mjs retire-legacy
+<workspace> <old-plan.md> <lease-token>` can release an exact schema1 wait or
+resume-watch lease after checking twice that no known executor or project shell is
+running. Read-only preflight exposes matching entries in `legacyCandidates`; use
+their exact workspace, plan and token, and rerun preflight afterwards. It preserves
+the binding and lease under ownership-history, leaves the
+plan counter intact, and removes the old binding without marking work accepted.
+If the state save succeeded but moving the lease failed, rerun this exact command:
+the journal and unchanged lease are verified before completing the move. A live
+or uncertain mutation, malformed lease, overlapping owner or active project still
+blocks this operation. The absence of a PID does not prove the old observer ended;
+stale writes remain rejected by assignment identity checks. Manual activity outside
+the OpenCode API can still race these checks.
 The legacyEvidence diagnostic lists missing identity, exact-token acquisition and
 direct exit provenance, accepted source requirements and insufficient evidence.
 Do not infer death from missing PID or manufacture identity after the fact.
-Collect native host evidence for a separately reviewed recovery decision; a shell
-wrapper exit alone does not prove its observer child exited or owned this token.
-No supported legacy verifier/retirement operation exists when that chain is absent;
-owner consent does not manufacture it. Preserve the refusal and evidence rather
-than switching stores or inventing a process identity. This command has no
-force/legacy-unlock bypass. Do not delete locks,
+Collect native host evidence when available; a shell wrapper exit alone does not
+prove its observer child exited or owned this token. Retirement does not assert
+that the old process died. Do not delete locks,
 relocate shared state, spoof HOME or send the assignment again.
 
 A worker startup error returns observer-start-failed, never observer-armed. Keep

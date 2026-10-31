@@ -41,7 +41,7 @@ Code Duet 将两个 AI 的工作衔接起来：GPT 负责规划、关键决策�
 
 你需要在 Windows 上安装 **Codex 桌面应用**、**OpenCode Desktop** 和 **Node.js 24**。OpenCode 需要能够通过 **OpenCode Go 使用 DeepSeek V4.1 Flash**。在 Codex 中打开项目，并启动 OpenCode Desktop。
 
-支持的 OpenCode 引擎版本为 **2.1.4**、**2.2.0**、**2.2.1**、**2.2.2** 和 **2.2.3**。辅助程序仅使用 Node.js 内置模块，无需安装 npm 依赖。
+支持的 OpenCode 引擎版本为 **2.1.4**、**2.2.0**、**2.2.1**、**2.2.2**、**2.2.3** 和 **2.2.5**。辅助程序仅使用 Node.js 内置模块，无需安装 npm 依赖。
 
 ### 2. 安装技能
 

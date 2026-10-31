@@ -99,11 +99,10 @@ The foreground diagnostic wait still has the documented host/GPT-yield limitatio
 3. Inspect every overlapping helper binding/lease/observer. Resolve each through
    its original owner and supported commands. A schema2 dead observer can use
    ownership recover; that archives only its lease, never releases an unfinished
-   binding. STOPPED/uncertain records remain blocking. A legacy lease lacking an
-   independently verifiable exact-token acquisition/exit chain cannot be retired
-   by current commands. Keep the refusal; another chat/plan, empty active list or
-   user statement does not supply that proof. There is no supported migration
-   past an unresolved legacy owner, and no direct API/UI fallback for dispatch.
+   binding. STOPPED/uncertain records remain blocking. With an explicit user
+   request to abandon the old assignment, an exact legacy observation lease can
+   use `retire-legacy` as described in OBSERVER.md; this preserves evidence and
+   the count but does not prove the former observer exited or accept its work.
 4. Establish this plan's real correction count from its checkpoint and delivered
    correction history, including uncertain deliveries. Retain the evidence; only
    then supply --correction-count N. Missing history stays unknown, never zero.

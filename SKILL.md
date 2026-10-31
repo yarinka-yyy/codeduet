@@ -29,6 +29,10 @@ proposes a new bind; pass --session only when the user explicitly selected that
 exact existing recipient. A preflight snapshot does not grant dispatch authority;
 adopt and submit repeat their own fresh checks. Use inspect for diagnosis when no
 plan is ready or after an error; do not require it in addition to a complete preflight.
+Before that preflight, run `node helper/cli.mjs task-maintenance <absolute-workspace>
+<absolute-plan.md>` to update this task's activity and perform local lifecycle
+maintenance. This sends no OpenCode request. It restores a requested archived
+counter before preflight, and skips active or uncertain ownership.
 
 Use only opencode-go/deepseek-v4.1-flash with existing/default options. Never
 start another engine, switch models or change global settings.
@@ -67,6 +71,8 @@ assignment, use [observer arm --resume](helper/OBSERVER.md). This is a
 separate route from dispatch preflight; inspect alone does not authorize it.
 A foreground lease blocking that transition uses the [owner diagnosis and
 migration route](helper/OBSERVER.md#migrate-a-foreground-wait); never delete a lock.
+If the user explicitly abandons an old task blocked by a legacy observation lease,
+the same route describes `retire-legacy`; preserve its evidence and count.
 Handle scoped questions and permission requests within the user's and runtime
 authority. Send source corrections to the executor; do not implement them yourself.
 
