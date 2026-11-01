@@ -31,11 +31,11 @@ when preparing a packet.
    and missing gates. Historical improve_executor/gpt-6-luna/max is provenance,
    not DeepSeek settings. A substantive requirement for a specific executor
    must be resolved before dispatch, rather than silently reinterpreted.
-5. Read the plan's correction count. A fresh, never-executed plan starts at 0.
-   When adopting an existing plan from the other route or after missing state,
-   import its established count with bind/adopt --correction-count N. Never invent
-   zero for missing history. A conflicting saved/imported count stops; the
-   helper does not overwrite it. Keep the count in the canonical checkpoint.
+5. A new explicit Code Duet selection starts its own correction cycle at zero
+   through `start-cycle` after task maintenance. Older plan corrections remain
+   history; never import them into the new cycle. An observer wake or automatic
+   continuation is not a new selection and must not reset the count. Keep the
+   current cycle count in the canonical checkpoint.
 
 ## Prepare one connected assignment
 
@@ -62,7 +62,7 @@ with --session and follow [existing-session routing](existing-session.md).
 Beginning in an already-used Codex chat is supported. Only opencode-go/deepseek-v4.1-flash with the
 existing/default options. No model/billing fallback, automatic chat rotation,
 subagents, new service or global agent configuration. The user creates a new
-Codex chat manually; it does not reset the plan's correction count.
+Codex chat manually; only a new explicit selection starts a new cycle.
 
 Preflight is read-only and reports pass, blocked and unknown checks plus the
 exact next step. It does not create a recipient, change helper state, test
@@ -139,12 +139,14 @@ For corrections: write one actionable consolidated list and updated checkpoint,
 then next <workspace> <plan> correction and submit with --kind correction and
 a fresh assignment ID. next only prepares; submit reserves the cycle immediately
 before its one POST. Questions, checks, preparation and accepted new blocks do
-not increment it. Up to 20 corrections after initial implementation, shared by
-the physical plan across blocks/chats/explicit continuation.
+not increment it. Up to 20 corrections are counted in the current explicit
+selection, not from the task's earlier history.
 An uncertain POST reserves one possibly delivered cycle and leaves STOPPED;
 it is not automatically refunded/retried. Report that uncertainty in the plan.
 After correction 20, still review normally. Accept if every applicable gate
-passes; otherwise stop incomplete, with no cycle 21. Do not substitute the
+passes; otherwise report the limit and remaining work, then stop. A new explicit
+selection starts the next cycle at zero; do not silently continue or send a 21st
+correction in the old cycle. Do not substitute the
 ordinary two-failure correction threshold or weaken scope/acceptance criteria.
 
 For a next accepted connected block: checkpoint the acceptance and remaining

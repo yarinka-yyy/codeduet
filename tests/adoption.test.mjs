@@ -301,7 +301,7 @@ for (const name of ['variant', 'history', 'running']) test('adopted submit rejec
   assert.ok(f.calls.every(call => call.method === 'GET'));
 });
 
-test('adopted 19->20 uses the common wait/review/next/new-plan workflow and ignores old final messages', async t => {
+test('adopted 19->20 reviews, stops, then starts a fresh cycle and preserves the pair', async t => {
   const f = await fixture(t), session = seed(f), old = structuredClone(f.messages.get(session.id));
   await f.call(adoptArgs(f));
   const admitted = await f.call(submitArgs(f));
@@ -312,6 +312,8 @@ test('adopted 19->20 uses the common wait/review/next/new-plan workflow and igno
   assert.equal(f.running.stdoutBytes, 0); assert.equal(f.state().bindings[0].phase, 'EXECUTING');
   f.finish(session.id);
   assert.equal((await waiting).result.kind, 'completed-for-review');
+  assert.equal((await f.call(['next', f.workspace, f.plan, 'block', '--non-git-baseline', baseline])).result.kind, 'correction-limit');
+  assert.equal((await f.call(['start-cycle', f.workspace, f.plan])).result.previousCount, 20);
   assert.equal((await f.call(['next', f.workspace, f.plan, 'block', '--non-git-baseline', baseline])).status, 0);
   assert.equal((await f.call(submitArgs(f, 'next-block', 'block'))).status, 0);
   const again = f.call(waitArgs(f)); await streamed(f, again); f.finish(session.id); assert.equal((await again).status, 0);
@@ -321,7 +323,7 @@ test('adopted 19->20 uses the common wait/review/next/new-plan workflow and igno
   assert.equal(switched.status, 0); assert.equal(switched.result.sessionID, session.id);
   const args = submitArgs(f, 'new-plan-block', 'initial'); args[2] = secondPlan;
   assert.equal((await f.call(args)).status, 0);
-  assert.deepEqual(f.state().plans.map(plan => plan.correctionCount), [20, 0]);
+  assert.deepEqual(f.state().plans.map(plan => plan.correctionCount), [0, 0]);
   assert.equal(f.posts('/api/session'), 0);
 });
 

@@ -36,10 +36,11 @@ For a manually submitted task still executing, use [passive external observation
 not adopt. It sends nothing and does not replace a saved pair or old ownership.
 
 Read the canonical plan/checkpoint, protected changes and former writer status.
-Recover this plan's actual correction count from its saved record and accepted
-checkpoint/history. Import with --correction-count N if no record exists;
-unknown is not zero. Zero needs a genuinely new plan or established zero count.
-A disagreement stops before dispatch. Do not sum unrelated messages/plans.
+Read the plan's accepted checkpoint/history to understand the work. Earlier
+corrections are history, not corrections in the newly selected Code Duet cycle.
+Run `start-cycle` for a new explicit selection; it records any prior count and
+starts at zero without changing the session binding. Never reset on an observer
+wake or an automatic continuation.
 Preflight can check an exact candidate while the current Codex chat is unbound;
 it never chooses from the session list or saves an adoption.
 
@@ -103,17 +104,16 @@ The foreground diagnostic wait still has the documented host/GPT-yield limitatio
    request to abandon the old assignment, an exact legacy observation lease can
    use `retire-legacy` as described in OBSERVER.md; this preserves evidence and
    the count but does not prove the former observer exited or accept its work.
-4. Establish this plan's real correction count from its checkpoint and delivered
-   correction history, including uncertain deliveries. Retain the evidence; only
-   then supply --correction-count N. Missing history stays unknown, never zero.
-   Do not copy another plan's counter or count tool retries as correction cycles.
+4. Retain the plan's checkpoint and delivered correction history. For a new
+   explicit selection use its current cycle count; do not count earlier work or
+   tool retries. Never reset an uncertain delivery or a running observation.
 5. Use the same physical workspace. For a non-Git root containing a nested app/
    repository, do not initialize Git or silently switch roots. Record an explicit
    non-Git baseline declaration in the canonical plan, covering protected/dirty
    files and the nested checkout's actual revision/diff; pass that exact text as
    --non-git-baseline. This is an owner-reviewed baseline, not a clean-tree claim.
 6. Once all blockers are resolved and the selected executor is idle, run preflight
-   with --session, the verified count and baseline. Only adopt-existing permits
+   with --session and the baseline. Only adopt-existing permits
    adopt with the same arguments. Adopt repeats history/identity/writer guards and
    sends no prompt. Running work, unresolved failure or unknown ownership stops.
 7. Submit one new identified correction packet with --kind correction. An adopted

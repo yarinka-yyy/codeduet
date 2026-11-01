@@ -22,7 +22,7 @@ pair, bind a new OpenCode session in the selected workspace unless the user
 explicitly selected an existing recipient; only then read
 [existing-session routing](references/existing-session.md). Late entry in an
 already-used Codex chat is supported. The user creates fresh Codex chats
-manually; never spoof identity, rotate chats or reset a plan count.
+manually; never spoof identity or rotate chats.
 Before the ordinary helper route, run [read-only preflight](helper/PROTOCOL.md#preflight)
 for the selected workspace and plan. It uses the current chat's saved pair, or
 proposes a new bind; pass --session only when the user explicitly selected that
@@ -33,6 +33,11 @@ Before that preflight, run `node helper/cli.mjs task-maintenance <absolute-works
 <absolute-plan.md>` to update this task's activity and perform local lifecycle
 maintenance. This sends no OpenCode request. It restores a requested archived
 counter before preflight, and skips active or uncertain ownership.
+For a new explicit user selection of Code Duet, after maintenance and before
+preflight run `node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>`.
+It starts this selection's correction count at zero and saves the previous count.
+Never run it for an observer wake, automatic continuation, or an active/uncertain
+assignment. If it refuses, preserve the owner and resolve that task first.
 
 Use only opencode-go/deepseek-v4.1-flash with existing/default options. Never
 start another engine, switch models or change global settings.

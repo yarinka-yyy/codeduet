@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { connect, diagnose } from './connection.mjs';
-import { context, helper, inspect, listSessions, maintainTasks, preflight, WAIT_TIMEOUT_MS } from './binding.mjs';
+import { context, helper, inspect, listSessions, maintainTasks, preflight, startCycle, WAIT_TIMEOUT_MS } from './binding.mjs';
 
 let client;
 try {
@@ -10,9 +10,10 @@ try {
   const [command, workspace, plan, assignment, packet] = args;
   const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
   if (command === 'task-maintenance' && args.length !== 3) throw new Error('Usage: cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>');
+  if (command === 'start-cycle' && args.length !== 3) throw new Error('Usage: cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>');
   if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
-  if (!['ownership', 'task-maintenance', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(command) ||
-    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3 })[command])) {
+  if (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3 })[command])) {
     throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>] | retire-legacy <workspace> <old-plan> <lease-token>; paths must be absolute');
   }
   if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch'].includes(command)) throw new Error('Assignment kind belongs to submit; correction-count to bind/adopt/preflight; session to preflight/resume-watch; cursor to sessions');
@@ -33,7 +34,7 @@ try {
   }
   if (command === 'preflight') {
     if (!isAbsolute(workspace) || !isAbsolute(plan)) throw new Error('Use absolute workspace and plan paths');
-  } else if (['retire-legacy', 'task-maintenance'].includes(command)) {
+  } else if (['retire-legacy', 'task-maintenance', 'start-cycle'].includes(command)) {
     if (!isAbsolute(workspace) || !isAbsolute(plan)) throw new Error('Use absolute workspace and plan paths');
   } else if (command !== 'inspect' && command !== 'sessions') {
     if (!isAbsolute(workspace) || !isAbsolute(plan)) throw new Error('Use absolute workspace and plan paths');
@@ -46,9 +47,10 @@ try {
   }
   let connectionError, result;
   if (command === 'task-maintenance') result = maintainTasks(workspace, plan);
+  if (command === 'start-cycle') result = startCycle(workspace, plan);
   if (command === 'ownership') result = await helper(null).observationOwner(workspace, plan, assignment,
     { action: values.action, nonGitBaseline: values['non-git-baseline'] });
-  try { if (!['ownership', 'task-maintenance'].includes(command)) client = await connect(); }
+  try { if (!['ownership', 'task-maintenance', 'start-cycle'].includes(command)) client = await connect(); }
   catch (error) {
     if (command === 'inspect' || command === 'preflight') connectionError = error;
     else {

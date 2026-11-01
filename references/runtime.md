@@ -47,7 +47,7 @@ select a session or authorize dispatch.
 
 Once the physical workspace and plan are known, use the single read-only
 preflight <workspace> <plan> result as the ordinary route check. Add
---correction-count N when importing an established count, --session <exact-id>
+--session <exact-id>
 only for a user-selected existing recipient, and --non-git-baseline <declaration>
 for a non-Git workspace. Preflight reports connection attempts and all available
 blockers; it does not prove store writability or authorize a later mutation.

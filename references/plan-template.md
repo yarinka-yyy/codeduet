@@ -74,7 +74,7 @@ corrections after initial implementation; never weaken gates or send cycle 21.>
 
 ## Review checkpoint (advisor-owned)
 - Accepted blocks/history: <facts>; current assignment/route: <exact IDs/options>.
-- Correction count: 0 for a genuinely new plan; preserve/import existing count.
+- Correction count: current Code Duet selection's cycle; earlier plan work is history.
 - Baseline/protected changes: <facts>; claims versus verified results: <facts>.
 - Checks/evidence/source state: <commands/results>; pending gates: <facts>.
 - Next: <one bounded continuation>; ownership: <confirmed current status>.

@@ -20,6 +20,11 @@ mkdirSync(repo); mkdirSync(home);
 const source = resolve('..');
 cpSync(join(source, 'app', 'plugin'), join(repo, 'plugin'), { recursive: true });
 cpSync(join(source, 'app', '.agents'), join(repo, '.agents'), { recursive: true });
+const manifestPath = join(repo, 'plugin/.codex-plugin/plugin.json');
+const manifest = JSON.parse(readFileSync(manifestPath)), oldVersion = manifest.version;
+const versionParts = oldVersion.split('.').map(Number);
+assert.equal(versionParts.length, 3); assert.ok(versionParts.every(Number.isSafeInteger));
+versionParts[2]++; const newVersion = versionParts.join('.');
 function run(exe, args, cwd = repo, env = process.env) {
   const result = spawnSync(exe, args, { cwd, env, encoding: 'utf8', windowsHide: true, timeout: 30000 });
   assert.equal(result.status, 0, `${exe} ${args.join(' ')}\n${result.stderr}\n${result.stdout}`);
@@ -51,7 +56,7 @@ try {
   const url = `http://127.0.0.1:${port}/market.git`;
   run(codex, ['plugin', 'marketplace', 'add', url, '--ref', 'main', '--json'], root, env);
   run(codex, ['plugin', 'add', 'code-duet@code-duet', '--json'], root, env);
-  const v1 = join(home, 'plugins/cache/code-duet/code-duet/1.0.0/skills/code-duet/SKILL.md');
+  const v1 = join(home, 'plugins/cache/code-duet/code-duet', oldVersion, 'skills/code-duet/SKILL.md');
   assert.ok(existsSync(v1), 'v1 missing');
   const f = await fixture({ after: callback => cleanup.push(callback) }), stateRoot = dirname(f.statePath);
   const chatID = '00000000-0000-4000-8000-000000000073';
@@ -60,6 +65,9 @@ try {
   const adapter = helper(await connectEngine(), { stateRoot, chatID });
   await adapter.bind(f.workspace, f.plan, baseline, 8);
   await adapter.submit(f.workspace, f.plan, 'git-update-fixture', f.packet, baseline, 'correction');
+  const legacyState = f.state();
+  legacyState.plans.push({ workspace: f.workspace, planPath: join(f.workspace, 'plans', 'legacy.md'), correctionCount: 21 });
+  writeFileSync(f.statePath, JSON.stringify(legacyState));
   const before = readFileSync(f.statePath), oldModule = await import(pathToFileURL(join(dirname(v1), 'helper/observer.mjs')).href);
   let hint, workerError = '';
   const watcher = oldModule.observer({ stateRoot, chatID, connectEngine,
@@ -77,8 +85,7 @@ try {
     } });
   const armed = await watcher.arm(f.workspace, f.plan, { codexExe: process.execPath, nonGitBaseline: baseline, timeoutMs: 30000 });
   assert.equal(armed.kind, 'observer-armed');
-  const manifestPath = join(repo, 'plugin/.codex-plugin/plugin.json');
-  const manifest = JSON.parse(readFileSync(manifestPath)); manifest.version = '1.0.1';
+  manifest.version = newVersion;
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   const skill = join(repo, 'plugin/skills/code-duet/SKILL.md');
   writeFileSync(skill, readFileSync(skill, 'utf8') + '\n<!-- isolated update fixture -->\n');
@@ -88,7 +95,7 @@ try {
   let stderr = ''; server.stderr.on('data', data => { stderr += data; });
   const exited = once(server, 'exit');
   server.stdin.write(JSON.stringify({ id: 1, method: 'initialize', params: { clientInfo: { name: 'duet-update-test', version: '1.0.0' } } }) + '\n');
-  const v2 = join(home, 'plugins/cache/code-duet/code-duet/1.0.1/skills/code-duet/SKILL.md');
+  const v2 = join(home, 'plugins/cache/code-duet/code-duet', newVersion, 'skills/code-duet/SKILL.md');
   try {
     const deadline = Date.now() + 30000;
     while (!existsSync(v2) && Date.now() < deadline) await new Promise(done => setTimeout(done, 200));
@@ -99,6 +106,8 @@ try {
     const [workerExit] = await once(worker, 'exit'); assert.equal(workerExit, 0, workerError);
     assert.ok(hint.includes(armed.id), 'observer did not deliver a hint');
     const newModule = await import(pathToFileURL(join(dirname(v2), 'helper/observer.mjs')).href);
+    const updatedBinding = await import(pathToFileURL(join(dirname(v2), 'helper/binding.mjs')).href);
+    assert.equal(updatedBinding.readState(f.statePath).plans[1].correctionCount, 21);
     assert.equal((await newModule.observer({ stateRoot, chatID, connectEngine }).consume(armed.id)).kind, 'completed-for-review');
     assert.equal(f.state().plans[0].correctionCount, 9);
     assert.equal(f.posts(`/api/session/${f.state().bindings[0].sessionID}/prompt`), 1);

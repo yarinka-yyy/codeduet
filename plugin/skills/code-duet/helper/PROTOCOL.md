@@ -23,6 +23,7 @@ kind distinguishes executor failure, interruption and connection uncertainty.
 node helper/cli.mjs inspect
 node helper/cli.mjs inspect <absolute-workspace>
 node helper/cli.mjs sessions <absolute-workspace> [--cursor <cursor>]
+node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs preflight <absolute-workspace> <absolute-plan.md> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>]
 node helper/cli.mjs adopt <absolute-workspace> <absolute-plan.md> <exact-session-id> [--correction-count <0..20>]
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
@@ -101,9 +102,11 @@ bindings by Codex chat and counters by exact physical plan path/workspace. Each
 binding contains workspace/checkout paths and filesystem identities, engine and
 OpenCode session IDs, current plan, phase, and current assignment/message IDs.
 There is no task transcript, password, Git baseline history or second task list.
-Existing counter values are validated and preserved. The advisor imports an
-established count when first adopting a plan; conflicting imports stop without
-overwriting saved history. Count policy and operating contract are below.
+Existing nonnegative counter values, including legacy values above 20, remain
+readable. `start-cycle` records the previous count under `cycle-history` and
+sets this plan's new count to zero without changing bindings. It refuses active
+or uncertain ownership/observers. Run only for a new explicit user selection,
+after task-maintenance; never on an observer wake or automatic continuation.
 
 Writes use a same-directory temporary file and atomic rename. The global
 `state.lock` covers only synchronous store reload, validation and atomic update;
@@ -176,9 +179,9 @@ never infer an exact unique title match from it. Follow nonempty cursors until
 exhausted, including on short pages. No current chat, store, lock, transcript
 read or engine mutation is needed. Discovery is not binding or authorization.
 
-adopt requires an exact session ID and a canonical plan. With no saved plan
-counter, --correction-count N is required; with one, an omitted count preserves
-it and a conflicting import fails. The advisor establishes the actual count.
+adopt requires an exact session ID and a canonical plan. A new explicit selection
+first uses start-cycle to establish its own count; an omitted count preserves it
+and a conflicting explicit import fails.
 Adoption checks physical/model identity and idle/interactive/overlapping writer
 state, and reads only the latest exchange back to its user prompt with bounded
 pagination. The shared completion gate must accept its final/idle/tools and
@@ -560,17 +563,16 @@ technical record until a new identified submission replaces it.
 Initial implementation defaults to --kind initial. A fresh pair adopting
 unfinished work explicitly uses block or correction according to the existing
 checkpoint; a new chat never turns corrections into initial implementation.
-For a new technical plan record, bind --correction-count imports its established
-0..20 count. It never resets an existing record. Missing/conflicting history
-is an advisor STOP condition, not permission to guess zero.
+For a new explicit selection, start-cycle establishes zero independently of the
+plan's earlier corrections. Existing task history and bindings are retained.
 
 Only corrective submission increments the count. Reservation is atomic with
 STOPPED/uncertain submit intent immediately before its one POST; local invalid
 arguments, preparing a task, questions/replies and independent checks spend no
 cycle. Uncertain delivery retains the one possible cycle; no automatic refund
-or resubmit. At 20, review is still allowed; a further correction produces an
-unchanged `correction-limit` result before intent or prompt. Do not disguise
-fixes as a block.
+or resubmit. At 20, review and finish remain allowed; further assignments return
+`correction-limit` before intent or prompt. Report and stop. Only a new explicit
+selection may start-cycle and resume after the normal ownership checks.
 
 finish rechecks ended execution and releases this adapter assignment as
 FINISHED; it sends no engine prompt and changes no plan/index. The advisor may

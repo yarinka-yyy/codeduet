@@ -69,7 +69,7 @@ GPT will explore the project, prepare a plan, and hand the work to DeepSeek. Cod
 
 When DeepSeek has a question about implementation, GPT helps it move forward. It comes back to you when your decision or permission is needed. After review, GPT collects its feedback into one assignment so DeepSeek can address it in the next pass.
 
-Each plan allows up to **20 correction cycles** after the initial implementation. If an error blocks the work, your input is needed, or the limit is reached, GPT explains what is preventing completion. When the task is ready, you receive a final report of the changes and checks.
+Each explicit Code Duet run allows up to **20 correction cycles**, counted from that run. At the limit, GPT reviews the result and stops if work remains. Select Code Duet again to start a fresh count and continue the same task. When the task is ready, you receive a final report of the changes and checks.
 
 ## Documentation
 

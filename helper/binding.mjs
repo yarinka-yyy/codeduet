@@ -83,7 +83,7 @@ export function validateState(state) {
     need(plan && isAbsolute(plan.workspace) && isAbsolute(plan.planPath) && !plans.has(plan.planPath), 'Invalid/duplicate plan counter');
     plans.add(plan.planPath);
     need(Object.keys(plan).every(key => ['workspace', 'planPath', 'correctionCount'].includes(key)), 'Unexpected plan state fields');
-    need(Number.isInteger(plan.correctionCount) && plan.correctionCount >= 0 && plan.correctionCount <= 20, 'Invalid correction count');
+    need(Number.isSafeInteger(plan.correctionCount) && plan.correctionCount >= 0, 'Invalid correction count');
   }
   for (const binding of state.bindings) need(state.plans.some(plan => plan.workspace === binding.workspace && plan.planPath === binding.planPath), 'Missing bound plan counter');
   return state;
@@ -231,7 +231,7 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
       result.workspace = { directory: binding.workspace, checkout: binding.checkout };
       if (binding.phase !== 'PREPARING') result.blockers.push('Binding phase is ' + binding.phase);
       if (binding.uncertain) result.blockers.push('Prior mutation uncertain; no retry');
-      if (binding.nextAssignment === 'correction' && plan.correctionCount === 20) result.blockers.push('Twenty corrections exhausted');
+      if (plan.correctionCount >= 20) result.blockers.push('Twenty corrections exhausted; select Code Duet again to start a new cycle');
       if (state.bindings.some(other => other !== binding && overlaps(binding.checkout, other.checkout) &&
         (!['PREPARING', 'FINISHED'].includes(other.phase) || other.uncertain))) result.blockers.push('Another helper owns this checkout');
       if (client && binding.sessionID) {
@@ -389,11 +389,12 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     add('correction-count', 'blocked', 'Saved plan counter belongs to another physical workspace');
   } else if (savedPlan && correctionCount !== undefined && savedPlan.correctionCount !== correctionCount) {
     add('correction-count', 'blocked', 'Requested count ' + correctionCount + ' conflicts with saved count ' + savedPlan.correctionCount);
-  } else if (savedPlan) add('correction-count', 'pass', 'Saved correction count: ' + savedPlan.correctionCount);
+  } else if (savedPlan && savedPlan.correctionCount >= 20) add('correction-count', 'blocked', 'Correction limit reached; select Code Duet again to start a new cycle');
+  else if (savedPlan) add('correction-count', 'pass', 'Saved correction count: ' + savedPlan.correctionCount);
   else if (correctionCount !== undefined) add('correction-count', 'pass', 'Explicit correction count: ' + correctionCount);
   else {
     effectiveCount = null;
-    add('correction-count', 'unknown', 'No count is saved for this plan; recover it first and use 0 only for a genuinely new plan');
+    add('correction-count', 'unknown', 'No count is saved for this plan; start a cycle for a new explicit selection');
   }
 
   const hasChatID = text(chatID);
@@ -672,7 +673,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   else if (blockers.length) nextStep = 'Resolve the listed blockers and rerun preflight; this call sent no task.';
   else if (status === 'unknown') nextStep = !connected ? 'Restore the OpenCode connection and rerun preflight.' :
     !hasChatID ? 'Run from the real Codex chat with its actual CODEX_THREAD_ID, then rerun preflight.' :
-      effectiveCount === null ? 'Recover this plan’s established correction count; use 0 only for a genuinely new plan, then rerun preflight.' :
+      effectiveCount === null ? 'Start a cycle for the new explicit selection, then rerun preflight.' :
         'Resolve the unknown checks and rerun preflight before bind/adopt/submit.';
   else if (proposedRoute === 'adopt-existing') {
     nextStep = 'Run adopt for the explicitly selected session with the reported workspace, plan and count; no extra confirmation is needed.';
@@ -784,7 +785,7 @@ export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir
         Number.isSafeInteger(entry.lastUsed) && entry.lastUsed >= 0 &&
         (entry.archivedAt === null || Number.isSafeInteger(entry.archivedAt) && entry.archivedAt >= 0) &&
         entry.plan?.workspace === entry.workspace && entry.plan?.planPath === entry.planPath &&
-        Number.isInteger(entry.plan.correctionCount) && entry.plan.correctionCount >= 0 && entry.plan.correctionCount <= 20 &&
+        Number.isSafeInteger(entry.plan.correctionCount) && entry.plan.correctionCount >= 0 &&
         Array.isArray(entry.bindings) && (entry.pendingRestore === undefined || typeof entry.pendingRestore === 'boolean') &&
         (entry.fingerprint === undefined || /^[a-f0-9]{64}$/.test(entry.fingerprint)) &&
         (entry.busy === undefined || typeof entry.busy === 'boolean') &&
@@ -874,6 +875,48 @@ export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir
     }
     saveLedger();
     return { kind: 'task-maintenance', archived, restored, deleted, taskSent: false };
+  });
+}
+
+// Called only for a new explicit selection, never for an observer wake-up.
+export function startCycle(workspace, planPath, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID } = {}) {
+  need(text(chatID), 'Actual CODEX_THREAD_ID is required');
+  const ctx = observationContext(workspace, planPath), statePath = join(stateRoot, 'state.json');
+  return withStateLock(stateRoot, state => {
+    const ledgerPath = join(stateRoot, 'task-lifecycle.json');
+    if (existsSync(ledgerPath)) {
+      const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+      need(ledger?.schema === 1 && Array.isArray(ledger.entries), 'Invalid task lifecycle journal');
+      const entry = ledger.entries.find(item => item.planPath === ctx.planPath);
+      need(!entry || entry.archivedAt === null && !entry.pendingRestore, 'Restore task through maintenance before starting a cycle');
+    }
+    const owners = readOwnerships(join(stateRoot, 'ownership'));
+    need(!owners.invalid && !owners.owners.some(owner => overlaps(ctx.checkout, owner.checkout)), 'A task owner is active or unknown; no counter reset');
+    const observers = join(stateRoot, 'observers');
+    need(!existsSync(observers) || !readdirSync(observers, { withFileTypes: true }).some(entry =>
+      entry.name.startsWith('external-') || entry.isDirectory() && existsSync(join(observers, entry.name, 'active'))),
+      'An observer is active or uncertain; no counter reset');
+    for (const binding of state.bindings.filter(item => item.planPath === ctx.planPath)) {
+      need(binding.workspace === ctx.workspace && ['PREPARING', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.uncertain && !binding.pending,
+        'Assignment is active or uncertain; no counter reset');
+      need(binding.codexChat === chatID || binding.phase === 'FINISHED', 'Another chat owns this task; no counter reset');
+    }
+    let plan = state.plans.find(item => item.planPath === ctx.planPath);
+    if (!plan) {
+      plan = { workspace: ctx.workspace, planPath: ctx.planPath, correctionCount: 0 };
+      state.plans.push(plan); saveState(statePath, state);
+      return { kind: 'cycle-started', correctionCount: 0, previousCount: null, taskSent: false };
+    }
+    need(plan.workspace === ctx.workspace, 'Plan belongs to another workspace');
+    const previousCount = plan.correctionCount;
+    if (previousCount) {
+      const history = join(stateRoot, 'cycle-history');
+      mkdirSync(history, { recursive: true, mode: 0o700 });
+      writeFileSync(join(history, randomUUID() + '.json'), JSON.stringify({ schema: 1, workspace: plan.workspace,
+        planPath: plan.planPath, codexChat: chatID, previousCount, at: Date.now() }) + '\n', { flag: 'wx', mode: 0o600 });
+      plan.correctionCount = 0; saveState(statePath, state);
+    }
+    return { kind: 'cycle-started', correctionCount: 0, previousCount, taskSent: false };
   });
 }
 
@@ -1252,8 +1295,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     async next(workspace, planPath, kind, nonGitBaseline) {
       need(['block', 'correction'].includes(kind), 'Next assignment kind must be block or correction');
       const begun = beginObserved(workspace, planPath, nonGitBaseline, ['REVIEWING', 'FINISHED'], 'next',
-        (state, binding) => kind === 'correction' && planCounter(state, binding).correctionCount === 20 ?
-          { ...summary(state, binding, 'correction-limit'), error: 'Twenty correction cycles exhausted; no cycle 21', stateChange: 'unchanged' } : null);
+        (state, binding) => planCounter(state, binding).correctionCount >= 20 ?
+          { ...summary(state, binding, 'correction-limit'), error: 'Twenty corrections reached; stop and select Code Duet again for a new cycle', stateChange: 'unchanged' } : null);
       if (begun.outcome) return begun.outcome;
       return withOwnership(begun.lease, async () => {
         try {
@@ -1709,8 +1752,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         if (binding.assignmentID === assignmentID) return { outcome: { ...summary(state, binding, 'rejected'),
           error: 'Use a fresh assignment ID after review', stateChange: 'unchanged', retried: false } };
         const plan = planCounter(state, ctx);
-        if (kind === 'correction' && plan.correctionCount === 20) return { outcome: {
-          ...summary(state, binding, 'correction-limit'), error: 'Twenty correction cycles exhausted; no cycle 21',
+        if (plan.correctionCount >= 20) return { outcome: {
+          ...summary(state, binding, 'correction-limit'), error: 'Twenty corrections reached; stop and select Code Duet again for a new cycle',
           stateChange: 'unchanged', retried: false } };
         checkoutAvailable(state, ctx, binding);
         return { ctx, state: structuredClone(state),
