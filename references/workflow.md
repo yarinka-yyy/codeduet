@@ -45,6 +45,9 @@ fresh chat or another executor. On an explicit continuation request, first read
 the checkpoint and inspect old execution. For observation of a delivered
 assignment, use explicitly authorized [observer arm --resume](../helper/OBSERVER.md).
 It does not retry delivery or permit project edits during execution. No automatic recovery is supplied.
+For explicit closure without acceptance, use [close-assignment](../helper/PROTOCOL.md#close-assignment).
+It prepares a separate correction in the same binding. Use a fresh assignment
+ID and the existing counter, and record the old run as closed without acceptance.
 
 Record the pre-dispatch baseline in the plan: physical workspace/checkout, Git
 HEAD and status, assigned paths, pre-existing dirty/untracked files and hashes

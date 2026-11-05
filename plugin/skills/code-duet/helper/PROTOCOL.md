@@ -590,6 +590,26 @@ FINISHED can explicitly continue via next in the same plan, or bind can select
 a new plan after checking the previous assignment. Neither resets counters.
 STOPPED has no automatic recovery; next/finish do not bypass it.
 
+## close-assignment
+
+`node <skill>/helper/cli.mjs close-assignment <workspace> <plan> <assignment-id> <message-id> --session <session-id>`
+
+Run only on the user's explicit instruction, from the original Codex chat.
+The exact admitted prompt, terminal idle and current inactive execution are
+verified, including no outstanding forms, permissions, tools or known project
+shells. A late model change and completed manual compaction can follow the
+assignment idle. An unrelated prompt, unknown execution, or uncertain mutation
+blocks closure. The OpenCode requests are GET only.
+
+`closed-without-acceptance` records the original diagnostic, stop reason and
+counter under `assignment-closures/<message-id>.json` in the helper state
+directory. It does not count as review or acceptance. The same request returns
+the recorded result, including after a subsequent dispatch in that binding.
+The binding becomes `PREPARING` for `correction` on the same session. Run
+preflight and submit the separately authorized packet with a fresh ID and
+`--kind correction`. No `next`, rebind or counter reset is needed. Submit
+rechecks the closed history boundary, then reserves the ordinary correction.
+
 ## Deliberate boundaries
 
 The advisor runs in the calling Codex turn; there is no automatic dispatch orchestrator,

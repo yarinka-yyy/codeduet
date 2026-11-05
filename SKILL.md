@@ -19,6 +19,11 @@ For observation of work already sent manually to an explicitly selected OpenCode
 session, use [external observation](helper/OBSERVER.md#observe-manually-started-work).
 This GET/SSE-only route does not bind, adopt, submit or transfer old ownership.
 
+If the user explicitly asks to close an already delivered, stopped assignment
+without accepting it, follow [close-assignment](helper/PROTOCOL.md#close-assignment).
+Close it before preflight or a new correction. Treat a subsequent submit as
+separate work that requires its own authorization and packet.
+
 Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
 pair, bind a new OpenCode session in the selected workspace unless the user
 explicitly selected an existing recipient; only then read

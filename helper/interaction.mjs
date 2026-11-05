@@ -373,10 +373,19 @@ export function completion(history, session, shells) {
   need(tools.every(tool => (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
     (readOnlyToolError(tool) || recovered.some(value => value.id === tool.id && value.messageID === tool.messageID))) &&
     Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed), 'Outstanding/unknown tool operation');
+  endedShells(history, shells);
+  const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+  need(output.trim(), 'Empty final response');
+  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })),
+    ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
+    ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
+}
+
+function endedShells(history, shells, closing = false) {
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
   need(shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
   // Detached processes cannot be certified by a completed launcher. Stop instead of supervising the OS.
-  for (const tool of tools) {
+  for (const tool of history.tools) {
     const input = tool.state.input ?? {};
     const shellID = tool.state.metadata?.shellID;
     const listed = typeof shellID === 'string' ? shells.data.filter(shell => shell.id === shellID) : [];
@@ -387,23 +396,60 @@ export function completion(history, session, shells) {
       Number.isFinite(shell.time.started) && shell.time.started >= launch.ran &&
       shell.time.completed >= shell.time.started && shell.time.completed <= notice.time.created),
       'Project shell disagrees with completion notice');
-    const shellEnded = listed.length === 1 || Boolean(notice);
+    const shellEnded = listed.length === 1 || Boolean(notice && (!closing ||
+      notice.metadata.state === 'completed' && Number.isSafeInteger(notice.metadata.exit)));
     need(!/background/i.test(tool.name) && (!(input.background === true || tool.state.metadata?.background === true) ||
       shellEnded), 'Background operation status unknown; no ownership transfer');
     if (/^(bash|shell|exec|terminal|powershell)$/.test(tool.name)) {
       need(typeof input.command === 'string', 'Unknown shell command');
-      need(tool.state.metadata?.status === 'completed' || shellEnded, 'Unknown shell/background completion status');
+      need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
+        shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status');
       const command = input.command;
       const unquoted = command.replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
         .replace(/\b\d+>&\d+\b/g, 'redirect')
         .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
-      need(!/Start-Process|Start-Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\b(?:cmd\s+\/c\s+)?start\s/i.test(command) &&
+      // A single-quoted PowerShell rg pattern is search data, even when it names a launcher.
+      const launcherSource = closing ? command.replace(/(^|[;|])(\s*rg\s+-n\s+)'(?:''|[^'\r\n])*'/gi, '$1$2quoted') : command;
+      need(!/Start-Process|Start-Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\b(?:cmd\s+\/c\s+)?start\s/i.test(launcherSource) &&
         !/(^|[^&])&([^&]|$)/.test(unquoted), 'Detached command status unknown; no ownership transfer');
     }
   }
-  const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
-  need(output.trim(), 'Empty final response');
-  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })),
-    ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
-    ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
+}
+
+export function closureBoundary(binding, messages, session, shells) {
+  const modelRef = model => model?.providerID === MODEL.providerID && model?.id === MODEL.id &&
+    (model.variant === undefined || typeof model.variant === 'string' && model.variant.length <= 80);
+  const terminal = item => item?.type === 'idle' && ['succeeded', 'failed', 'interrupted'].includes(item.outcome) &&
+    Number.isSafeInteger(item.time?.created) && item.time.created >= binding.submittedAt;
+  need(session.time?.archived === undefined && (session.archived === undefined || session.archived === false) &&
+    modelRef(session.model), 'Archived session or unsupported model; no closure');
+  const late = messages.findIndex((item, index) => item.type === 'model-switched' ||
+    item.type === 'compaction' && messages[index - 1]?.type === 'idle');
+  const exchange = late < 0 ? messages : messages.slice(0, late);
+  const ended = exchange.at(-1);
+  need(exchange.length > 1 && terminal(ended), 'No correlated terminal idle for the delivered assignment');
+  const history = inspectMessages(binding, exchange, { adopting: true });
+  need(exchange.slice(1, -1).every(item => item.type === 'assistant' ?
+    Number.isSafeInteger(item.time?.completed) && item.time.completed <= ended.time.created :
+    Number.isSafeInteger(item.time?.created) && item.time.created <= ended.time.created &&
+    (item.type !== 'compaction' || ['completed', 'failed'].includes(item.status))) &&
+    history.tools.every(tool => ['completed', 'error'].includes(tool.state?.status) &&
+      Number.isSafeInteger(tool.time?.completed) && tool.time.completed <= ended.time.created), 'Unfinished operation in delivered assignment');
+  endedShells(history, shells, true);
+  let idle = ended, lastTime = ended.time.created, compacting = false, selected;
+  for (const item of late < 0 ? [] : messages.slice(late)) {
+    const time = item.time?.created;
+    need(Number.isSafeInteger(time) && time >= lastTime, 'Unordered history after assignment idle');
+    lastTime = time;
+    if (!compacting && item.type === 'model-switched' && modelRef(item.previous) && modelRef(item.model) &&
+      (!selected || (item.previous.variant ?? null) === (selected.variant ?? null))) selected = item.model;
+    else if (!compacting && item.type === 'compaction' && item.reason === 'manual' && item.status === 'completed' && modelRef(item.model)) compacting = true;
+    else if (compacting && terminal(item)) { idle = item; compacting = false; }
+    else throw new Error('Unrelated or unfinished history after assignment idle; no closure');
+  }
+  need(!compacting && (!selected || (selected.variant ?? null) === (session.model.variant ?? null)) &&
+    session.time.idle === idle.time.created && session.outcome === idle.outcome &&
+    (session.time.busy === undefined || Number.isSafeInteger(session.time.busy) && session.time.busy <= idle.time.created),
+  'Live idle state disagrees with delivered history');
+  return { lastMessageID: messages.at(-1).id, idleAt: idle.time.created, variant: session.model.variant ?? null };
 }

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
-import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
+import { assignmentMessages, recentSessionMessages, closureBoundary, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 import { processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
 export const WAIT_TIMEOUT_MS = 14_400_000;
@@ -135,11 +135,40 @@ function readOwnerships(root) {
 
 function saveState(path, state) {
   validateState(state);
+  saveJSON(path, state);
+}
+
+function saveJSON(path, value) {
   const temporary = path + '.' + randomUUID() + '.tmp';
   try {
-    writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     renameSync(temporary, path);
   } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+}
+
+const closurePath = (root, messageID) => join(root, 'assignment-closures', messageID + '.json');
+const closureOwner = binding => createHash('sha256').update(JSON.stringify([
+  ...['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID']
+    .map(key => binding[key]),
+])).digest('hex');
+function readClosure(root, binding, messageID = binding.messageID) {
+  if (!messageID) return null;
+  const path = closurePath(root, messageID);
+  if (!existsSync(path)) return null;
+  const receipt = JSON.parse(readFileSync(path, 'utf8'));
+  need(receipt?.schema === 1 && receipt.owner === closureOwner(binding) && receipt.sessionID === binding.sessionID &&
+    receipt.messageID === messageID && text(receipt.assignmentID) &&
+    (binding.messageID !== messageID || receipt.assignmentID === binding.assignmentID) &&
+    Number.isSafeInteger(receipt.correctionCount) && receipt.correctionCount >= 0 &&
+    typeof receipt.boundary?.lastMessageID === 'string' && Number.isSafeInteger(receipt.boundary?.idleAt) &&
+    (receipt.boundary.variant === null || text(receipt.boundary.variant) && receipt.boundary.variant.length <= 80) &&
+    (receipt.stopReason === undefined || text(receipt.stopReason)), 'Invalid or foreign assignment closure');
+  if (receipt.diagnostic !== undefined) validateDiagnostic(receipt.diagnostic);
+  return receipt;
+}
+
+function sameBoundary(a, b) {
+  return ['lastMessageID', 'idleAt', 'variant'].every(key => a[key] === b[key]);
 }
 
 async function matchingSession(client, binding) {
@@ -227,6 +256,11 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
         ...(binding.uncertain ? { uncertain: binding.uncertain } : {}),
         ...(binding.stopReason ? { stopReason: binding.stopReason } : {}),
         ...(binding.diagnostic ? { diagnostic: binding.diagnostic } : {}) };
+      if (binding.phase === 'PREPARING' && binding.nextAssignment === 'correction') {
+        const closed = readClosure(stateRoot, binding);
+        if (closed) result.binding.closure = { status: 'closed-without-acceptance',
+          stopReason: closed.stopReason, diagnostic: closed.diagnostic };
+      }
       need(!result.workspace || result.workspace.directory === binding.workspace, 'Inspection workspace differs from saved binding');
       result.workspace = { directory: binding.workspace, checkout: binding.checkout };
       if (binding.phase !== 'PREPARING') result.blockers.push('Binding phase is ' + binding.phase);
@@ -575,14 +609,20 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
           const messages = historyResult.value;
           need(Array.isArray(messages), 'Unknown candidate history');
           if (candidateBinding?.assignmentID) {
-            const history = inspectMessages(candidateBinding, messages);
-            need(!history.kind, 'Saved assignment history failed or was interrupted');
-            if (['FINISHED', 'REVIEWING'].includes(candidateBinding.phase) ||
-              candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment) completion(history, liveSession, shells);
-            if (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment && candidateBinding.adoption) {
-              need(candidateBinding.adoption.lastMessageID === (messages.at(-1)?.id ?? null) &&
-                candidateBinding.adoption.idleAt === (liveSession.time?.idle ?? null) &&
-                candidateBinding.adoption.variant === (liveSession.model?.variant ?? null), 'Saved history boundary changed');
+            const closed = candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
+              readClosure(stateRoot, candidateBinding);
+            if (closed) need(sameBoundary(closed.boundary, closureBoundary(candidateBinding, messages, liveSession, shells)),
+              'History changed since closure; no dispatch');
+            else {
+              const history = inspectMessages(candidateBinding, messages);
+              need(!history.kind, 'Saved assignment history failed or was interrupted');
+              if (['FINISHED', 'REVIEWING'].includes(candidateBinding.phase) ||
+                candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment) completion(history, liveSession, shells);
+              if (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment && candidateBinding.adoption) {
+                need(candidateBinding.adoption.lastMessageID === (messages.at(-1)?.id ?? null) &&
+                  candidateBinding.adoption.idleAt === (liveSession.time?.idle ?? null) &&
+                  candidateBinding.adoption.variant === (liveSession.model?.variant ?? null), 'Saved history boundary changed');
+              }
             }
           } else if (candidateBinding?.adoption) {
             if (messages.length) {
@@ -1050,6 +1090,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required',
         executorStopped: false, retried: false, stateChange: 'unchanged' } };
       savedContext(binding, ctx, operation === 'resume-watch');
+      if (operation === 'resume-watch') need(!readClosure(stateRoot, binding), 'Closure was staged; repeat the exact close-assignment command');
       if (!binding.assignmentID || !allowedPhases.includes(binding.phase)) {
         const kind = operation === 'reply' && binding.assignmentID && binding.phase === 'EXECUTING' ? 'stale-request' : 'rejected';
         return { outcome: { ...summary(state, binding, kind),
@@ -1140,6 +1181,22 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
     return { lastMessageID: history.idle.id, idleAt: current.session.time.idle };
+  }
+  async function checkedClosureBoundary(binding) {
+    const quiet = current => !current.active && !current.forms.length && !current.permissions.length;
+    const current = await snapshot(binding);
+    need(quiet(current), 'Session is active or awaiting a reply; no closure or dispatch');
+    const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
+    const messages = await assignmentMessages(client, binding);
+    const boundary = closureBoundary(binding, messages, current.session, await client.request(shellRoute));
+    const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
+    need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
+      'History changed during closure verification');
+    const confirmed = await snapshot(binding);
+    need(quiet(confirmed) && confirmed.session.outcome === current.session.outcome &&
+      JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
+      JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model), 'Session changed during closure verification');
+    return boundary;
   }
   async function idleExisting(state, binding) {
     await idleWorkspace(state, binding);
@@ -1317,6 +1374,63 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           await reviewedResult(begun.expected);
           return commit(begun.expected, (state, binding) => { binding.phase = 'FINISHED'; return summary(state, binding, 'released'); }).result;
         } catch (error) { return stoppedOutcome(begun.expected, error); }
+      });
+    },
+    async closeAssignment(workspace, planPath, selection, connectionError) {
+      need(selection && typeof selection.sessionID === 'string' && /^ses_[a-zA-Z0-9]+$/.test(selection.sessionID) &&
+        typeof selection.assignmentID === 'string' && /^[a-zA-Z0-9._-]{1,120}$/.test(selection.assignmentID) &&
+        typeof selection.messageID === 'string' && /^msg_[a-zA-Z0-9]+$/.test(selection.messageID),
+      'Closure requires exact session, assignment and message IDs');
+      const ctx = observationContext(workspace, planPath);
+      const result = receipt => ({ kind: 'closed-without-acceptance', phase: 'PREPARING',
+        ...selection, correctionCount: receipt.correctionCount, nextAssignment: 'correction',
+        ...(receipt.stopReason ? { stopReason: receipt.stopReason } : {}),
+        ...(receipt.diagnostic ? { diagnostic: receipt.diagnostic } : {}), taskSent: false, reviewAllowed: false });
+      const start = locked(state => {
+        const binding = state.bindings.find(item => item.codexChat === chatID);
+        need(binding && binding.sessionID === selection.sessionID && Object.keys(ctx).every(key => binding[key] === ctx[key]),
+          'No exact saved chat/session/workspace/plan binding');
+        const receipt = readClosure(stateRoot, binding, selection.messageID);
+        if (receipt && receipt.assignmentID === selection.assignmentID && (binding.messageID !== selection.messageID ||
+          binding.phase === 'PREPARING' && binding.nextAssignment === 'correction')) return { outcome: result(receipt) };
+        if (connectionError) throw connectionError;
+        need(client, 'OpenCode connection required for closure');
+        savedContext(binding, ctx, true);
+        need(binding.phase === 'STOPPED' && binding.assignmentID === selection.assignmentID &&
+          binding.messageID === selection.messageID && !binding.pending && !binding.nextAssignment,
+        'Only the exact stopped, delivered assignment with no pending request can be closed');
+        checkoutAvailable(state, ctx, binding);
+        return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
+          lease: claimOwnership(state, ctx, binding, 'next') };
+      });
+      if (start.outcome) return start.outcome;
+      return withOwnership(start.lease, async () => {
+        const expected = start.expected;
+        const boundary = await checkedClosureBoundary({ ...expected, adoption: undefined });
+        let saving = false;
+        try {
+          const saved = commit(expected, (state, binding) => {
+            checkoutAvailable(state, ctx, binding);
+            need(binding.stopReason === expected.stopReason && JSON.stringify(binding.diagnostic) === JSON.stringify(expected.diagnostic),
+              'Stop evidence changed during closure');
+            const receipt = { schema: 1, owner: closureOwner(binding), sessionID: binding.sessionID, assignmentID: binding.assignmentID,
+              messageID: binding.messageID, correctionCount: expected.correctionCount, boundary,
+              stopReason: binding.stopReason, diagnostic: binding.diagnostic };
+            const path = closurePath(stateRoot, binding.messageID);
+            mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+            // Write the receipt first. A still-STOPPED binding must reverify before completing a staged closure.
+            saveJSON(path, receipt);
+            delete binding.stopReason; delete binding.diagnostic;
+            if (binding.adoption) Object.assign(binding.adoption, boundary);
+            binding.phase = 'PREPARING'; binding.nextAssignment = 'correction';
+            return result(receipt);
+          }, () => { saving = true; });
+          const { stateChange, ...outcome } = saved.result;
+          return outcome;
+        } catch (error) {
+          if (saving) error.stateOutcome = unconfirmedOutcome(expected, error, 'Closure persistence unconfirmed; repeat only the same close-assignment');
+          throw error;
+        }
       });
     },
     async connectionLost(error) {
@@ -1756,14 +1870,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           ...summary(state, binding, 'correction-limit'), error: 'Twenty corrections reached; stop and select Code Duet again for a new cycle',
           stateChange: 'unchanged', retried: false } };
         checkoutAvailable(state, ctx, binding);
-        return { ctx, state: structuredClone(state),
+        return { ctx, state: structuredClone(state), closed: readClosure(stateRoot, binding),
           expected: { ...structuredClone(binding), correctionCount: plan.correctionCount },
           lease: claimOwnership(state, ctx, binding, 'submit') };
       });
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
         const adoption = start.expected.adoption;
-        if (adoption) {
+        if (start.closed) {
+          need(sameBoundary(start.closed.boundary, await checkedClosureBoundary(start.expected)),
+            'History changed since closure; no dispatch');
+        } else if (adoption) {
           const current = await idleExisting(start.state, start.expected);
           need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === adoption[key]),
             'Existing session changed since preparation; no dispatch');
@@ -1779,14 +1896,15 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           need(confirmed.session.model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High; no dispatch');
           need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
             confirmed.session.time?.idle === session.time?.idle, 'Session activity changed during model selection; no dispatch');
-          if (adoption) {
+          const boundary = start.closed?.boundary ?? adoption;
+          if (boundary) {
             const page = await client.request(sessionRoute + '/message?limit=2&order=desc');
             const [head, prior] = Array.isArray(page?.data) ? page.data : [false];
-            const sameHead = head !== false && (head?.id ?? null) === adoption.lastMessageID;
-            need(sameHead || (prior?.id ?? null) === adoption.lastMessageID && head?.type === 'model-switched' &&
+            const sameHead = head !== false && (head?.id ?? null) === boundary.lastMessageID;
+            need(sameHead || (prior?.id ?? null) === boundary.lastMessageID && head?.type === 'model-switched' &&
               head.model?.providerID === MODEL.providerID && head.model?.id === MODEL.id && head.model.variant === EXECUTOR_MODEL.variant &&
               head.previous?.providerID === MODEL.providerID && head.previous?.id === MODEL.id &&
-              (head.previous.variant ?? null) === adoption.variant, 'Existing history changed during model selection; no dispatch');
+              (head.previous.variant ?? null) === boundary.variant, 'Existing history changed during model selection; no dispatch');
           }
           await idleWorkspace(start.state, ctx);
         }
