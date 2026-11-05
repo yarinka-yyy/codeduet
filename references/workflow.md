@@ -59,8 +59,8 @@ the saved pair or proposed new-bind route, plan/count/baseline and available liv
 state in one result. With no pair it proposes a new OpenCode session unless the
 user explicitly selected an existing recipient; for that case pass the exact ID
 with --session and follow [existing-session routing](existing-session.md).
-Beginning in an already-used Codex chat is supported. Only opencode-go/deepseek-v4.1-flash with the
-existing/default options. No model/billing fallback, automatic chat rotation,
+Beginning in an already-used Codex chat is supported. Code Duet dispatches with
+opencode-go/deepseek-v4.1-flash at High reasoning. No model/billing fallback, automatic chat rotation,
 subagents, new service or global agent configuration. The user creates a new
 Codex chat manually; only a new explicit selection starts a new cycle.
 

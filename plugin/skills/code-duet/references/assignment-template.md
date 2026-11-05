@@ -11,7 +11,7 @@ the plan before dispatch; the executor does not edit that checkpoint.
 - Canonical index / plan: <exact absolute existing paths>.
 - Workspace / physical checkout: <exact absolute paths>.
 - Route: OpenCode session <actual ID>, opencode-go/deepseek-v4.1-flash,
-  existing/default options. Read applicable AGENTS.md.
+  High reasoning. Read applicable AGENTS.md.
 - Overall goal and accepted prerequisites: <concise facts>.
 - Assigned connected block / ordered steps: <only authorized steps>.
 - Allowed paths and contracts: <exact list and relevant existing patterns>.

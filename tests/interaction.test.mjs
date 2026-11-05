@@ -86,7 +86,7 @@ async function setup(t) {
     async request(route, body) {
       this.calls.push({ route, body });
       if (route === '/api/session' && body) {
-        this.session = { id: 'ses_test', model: MODEL, location: body.location, time: {} };
+        this.session = { id: 'ses_test', model: body.model, location: body.location, time: {} };
         return { data: structuredClone(this.session) };
       }
       if (route.endsWith('/prompt')) {
@@ -142,6 +142,7 @@ async function setup(t) {
   };
   const adapter = helper(client, { stateRoot: join(root, 'state'), chatID: 'offline-chat-only' });
   await adapter.bind(workspace, plan, baseline);
+  assert.equal(client.session.model.variant, 'high');
   await adapter.submit(workspace, plan, 'assignment-1', packet, baseline);
   return { client, adapter, workspace, plan, baseline,
     wait: (extra = {}) => adapter.wait(workspace, plan, { nonGitBaseline: baseline, timeoutMs: 500, ...extra }),

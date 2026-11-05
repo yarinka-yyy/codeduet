@@ -52,7 +52,7 @@ function engine() {
       this.calls.push({ route, body });
       if (route === '/api/session' && body) {
         const id = 'ses_offline' + (sessions.size + 1);
-        sessions.set(id, { id, model: MODEL, location: body.location, time: {} }); timelines.set(id, []);
+        sessions.set(id, { id, model: body.model, location: body.location, time: {} }); timelines.set(id, []);
         return { data: structuredClone(sessions.get(id)) };
       }
       if (route === '/api/session/active') return { data: structuredClone(this.active) };

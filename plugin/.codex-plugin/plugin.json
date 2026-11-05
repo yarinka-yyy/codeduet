@@ -1,6 +1,6 @@
 {
   "name": "code-duet",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Coordinate Codex planning and review with DeepSeek implementation in OpenCode Desktop.",
   "author": { "name": "yarinka-yyy", "url": "https://github.com/yarinka-yyy" },
   "homepage": "https://github.com/yarinka-yyy/codeduet",

@@ -10,6 +10,8 @@ selects a route; it does not authorize an old plan, installation or publication.
 Codex is the advisor and DeepSeek is the sole implementation executor. Do not
 invoke Improve Codex or create Codex subagents; keep OpenCode/DeepSeek as the
 sole implementation executor.
+Code Duet dispatches assignments through DeepSeek V4.1 Flash on OpenCode Go
+with High reasoning. Passive observation leaves the manually started chat alone.
 
 ## Choose the route
 

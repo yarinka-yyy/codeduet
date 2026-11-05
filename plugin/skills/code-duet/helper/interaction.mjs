@@ -165,6 +165,27 @@ function nativeSystem(message) {
     metadata.instructionSources.every(source => ['core/codemode', 'core/skill-guidance'].includes(source));
 }
 
+function nativeBackgroundShell(message, launches) {
+  const { metadata, description, text, time } = message;
+  if (!metadata || metadata.source !== 'shell' || typeof metadata.shellID !== 'string' ||
+    !/^sh_[a-zA-Z0-9]{1,160}$/.test(metadata.shellID) ||
+    metadata.jobID !== metadata.shellID || !['completed', 'error', 'cancelled'].includes(metadata.state) ||
+    !Object.keys(message).every(key => ['id', 'type', 'text', 'description', 'time', 'metadata'].includes(key)) ||
+    typeof message.id !== 'string' || !message.id.startsWith('msg_') || Object.keys(time).length !== 1 ||
+    typeof description !== 'string' || !text.startsWith(`<shell id="${metadata.jobID}" state="${metadata.state}" command="${description}">\n`) ||
+    !text.endsWith('\n</shell>')) return false;
+  const result = metadata.state === 'completed';
+  if (!Object.keys(metadata).every(key => ['source', 'shellID', 'jobID', 'state'].includes(key) ||
+    result && ['truncated', 'exit', 'signal', 'timeout'].includes(key)) || result &&
+    (typeof metadata.truncated !== 'boolean' || metadata.exit !== undefined && !Number.isSafeInteger(metadata.exit) ||
+      metadata.signal !== undefined && typeof metadata.signal !== 'string' ||
+      metadata.timeout !== undefined && typeof metadata.timeout !== 'boolean')) return false;
+  const launch = launches.get(metadata.shellID);
+  if (!launch || launch.notice || launch.command !== description || time.created < launch.ran) return false;
+  launch.notice = message;
+  return true;
+}
+
 function rejectedEdit(tool, workspace) {
   const input = tool.state?.input, error = tool.state?.error;
   if (tool.name !== 'edit' || tool.state.status !== 'error' || error?.type !== 'tool.execution' ||
@@ -210,10 +231,6 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     throw diagnosticError('Invalid synthetic input metadata; no ownership transfer', 'history-correlation', 'history',
       { historyType: 'synthetic', errorCode: 'InvalidSyntheticInput' });
   }
-  if (!adopting && inputs.some(message => !nativeInstructions(binding, messages, messages.indexOf(message)))) {
-    throw diagnosticError('Synthetic input is not correlated to this assignment read; no ownership transfer', 'history-correlation', 'history',
-      { historyType: 'synthetic', errorCode: 'UncorrelatedSyntheticInput' });
-  }
   const compactions = tail.filter(message => message.type === 'compaction');
   for (const message of compactions) {
     need(Object.keys(message).every(key => ['id', 'type', 'time', 'metadata', 'status', 'reason', 'model', 'summary', 'cost', 'tokens', 'error'].includes(key)) &&
@@ -228,6 +245,26 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
   for (const message of assistants) {
     need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID && Array.isArray(message.content), 'Executor model/history changed');
   }
+  const backgroundShells = new Map();
+  for (const [index, message] of tail.entries()) {
+    if (message.type === 'assistant') for (const tool of message.content) {
+      const { input, metadata, status } = tool.state ?? {};
+      if (tool.type !== 'tool' || tool.name !== 'shell' || input?.background !== true ||
+        typeof input.command !== 'string' || typeof metadata?.shellID !== 'string' || !Number.isFinite(tool.time?.ran) ||
+        !(status === 'running' && tool.time.completed === undefined || status === 'completed' && metadata.status === 'running' &&
+          Number.isFinite(tool.time.completed) && tool.time.completed >= tool.time.ran) ||
+        !Number.isFinite(message.time?.created) || message.time.created > tool.time.ran ||
+        (Number.isFinite(messages[0].time?.created) && messages[0].time.created > message.time.created)) continue;
+      need(!backgroundShells.get(metadata.shellID)?.notice, 'Background shell launch is ambiguous');
+      backgroundShells.set(metadata.shellID, backgroundShells.has(metadata.shellID) ? null :
+        { command: input.command, ran: tool.time.ran, toolID: tool.id, messageID: message.id });
+    }
+    if (message.type === 'synthetic' && !nativeBackgroundShell(message, backgroundShells) && !adopting &&
+      !nativeInstructions(binding, messages, index + 1)) {
+      throw diagnosticError('Synthetic input is not correlated to this assignment; no ownership transfer', 'history-correlation', 'history',
+        { historyType: 'synthetic', errorCode: 'UncorrelatedSyntheticInput' });
+    }
+  }
   const failed = tail.find(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
     message.type === 'compaction' && message.status === 'failed' ||
     message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish));
@@ -241,6 +278,13 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     ...(tool && /^[a-zA-Z0-9_-]{1,80}$/.test(tool.name) ? { toolName: tool.name } : {}) });
   const recoveredToolErrors = [], unresolved = [], toolErrors = [];
   for (const [index, tool] of tools.entries()) {
+    const launch = backgroundShells.get(tool.state?.metadata?.shellID);
+    const result = launch?.notice?.metadata;
+    if (result && launch.toolID === tool.id && launch.messageID === tool.messageID &&
+      (result.state !== 'completed' || result.exit !== 0 || result.timeout || result.signal !== undefined)) {
+      unresolved.push({ tool, recoverable: false });
+      toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: 'blocking', semanticRecoveryVerified: false });
+    }
     if (tool.state?.status !== 'error') continue;
     const category = readOnlyToolError(tool);
     if (category) {
@@ -265,7 +309,7 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: repair ? 'recovered-edit' : 'blocking',
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
-  const history = { tools, final, idle, tail, recoveredToolErrors, toolErrors };
+  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors };
   // Keep history failure separate from current executor activity; preserve tools for questions.
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
     failed.error ? 'message-error' : failed.retry ? 'retry-record' : failed.type === 'idle' ? 'failed-idle' :
@@ -335,11 +379,20 @@ export function completion(history, session, shells) {
   for (const tool of tools) {
     const input = tool.state.input ?? {};
     const shellID = tool.state.metadata?.shellID;
+    const listed = typeof shellID === 'string' ? shells.data.filter(shell => shell.id === shellID) : [];
+    const launch = history.backgroundShells?.get(shellID);
+    const notice = launch && launch.toolID === tool.id && launch.messageID === tool.messageID ? launch.notice : undefined;
+    if (notice) need(listed.length <= 1 && listed.every(shell => shell.status === 'exited' &&
+      shell.command === input.command && shell.exit === notice.metadata.exit && shell.signal === undefined &&
+      Number.isFinite(shell.time.started) && shell.time.started >= launch.ran &&
+      shell.time.completed >= shell.time.started && shell.time.completed <= notice.time.created),
+      'Project shell disagrees with completion notice');
+    const shellEnded = listed.length === 1 || Boolean(notice);
     need(!/background/i.test(tool.name) && (!(input.background === true || tool.state.metadata?.background === true) ||
-      typeof shellID === 'string' && shells.data.some(shell => shell.id === shellID)), 'Background operation status unknown; no ownership transfer');
+      shellEnded), 'Background operation status unknown; no ownership transfer');
     if (/^(bash|shell|exec|terminal|powershell)$/.test(tool.name)) {
       need(typeof input.command === 'string', 'Unknown shell command');
-      need(tool.state.metadata?.status === 'completed' || typeof shellID === 'string' && shells.data.some(shell => shell.id === shellID), 'Unknown shell/background completion status');
+      need(tool.state.metadata?.status === 'completed' || shellEnded, 'Unknown shell/background completion status');
       const command = input.command;
       const unquoted = command.replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
         .replace(/\b\d+>&\d+\b/g, 'redirect')

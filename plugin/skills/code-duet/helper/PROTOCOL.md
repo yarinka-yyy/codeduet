@@ -57,8 +57,10 @@ the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
 only, rejects redirects, validates installed/API version 2.1.4, 2.2.0, 2.2.1, 2.2.2, 2.2.3 or 2.2.5 and the enabled
 `opencode-go/deepseek-v4.1-flash` model. Credentials stay inside HTTP closures;
 the exposed client, state, results and errors contain no auth/response-body data.
-The default model variant is left unchanged. No second engine or fallback is
-started, and no service/global configuration is changed.
+New Code Duet sessions start at High. Before dispatch on a saved idle session,
+the helper selects High with `POST /api/session/:session/model` if needed and
+verifies the readback before sending a prompt. Adoption and passive observation
+do not change the model. There is no fallback or global configuration change.
 
 Ordinary JSON requests use fetch with a twenty-second deadline. SSE alone uses
 a dedicated node:http connection and a web-readable body; it does not inherit
@@ -230,6 +232,12 @@ HTTP(S) input URL. Both require native unknown/tool.execution error type and
 finite ordered ran/completed timestamps. A generic read error, shell command,
 POST429, mismatched URL or unknown variant remains blocking. Successful searches
 with no matches are ordinary completed operations, not tool failures.
+
+For an explicit background `shell` launch, a native completion notice can prove
+exit zero when `/api/shell` has dropped the command. It must match the preceding
+launch in this assignment by shell ID, command and ordered times, and precede the
+final response. An active shell, conflicting API data, unsuccessful command or
+separate unresolved tool error blocks review.
 
 These warnings need no inferred fallback to permit independent read-only review.
 They remain error operations with semanticRecoveryVerified:false, even when a

@@ -59,8 +59,8 @@ transition; neither a warning nor external-completed grants correction authority
 
 Adoption takes the cooperative store lock, rechecks identity/idle/history and
 saves the binding atomically. It makes no create, prompt, rename, model or
-configuration mutation in OpenCode. Existing/default model variant is saved
-and must remain unchanged. Another Codex binding to that session blocks it.
+configuration mutation in OpenCode. The current model variant is saved as part
+of the boundary. Another Codex binding to that session blocks it.
 Repeated adoption of the same valid prepared/finished pair does not reset it.
 
 The stored boundary contains only the last message ID, idle timestamp and
@@ -76,8 +76,9 @@ Use initial, block or correction according to the actual plan; adoption never
 turns a corrective message into initial implementation or refunds its count.
 
 Submit rechecks the adopted session's identity/model, latest completed exchange
-and saved boundary, forms/permissions, shells and other writers before its
-single POST. A changed session stops dispatch. The new prompt/message ID
+and saved boundary, forms/permissions, shells and other writers. If needed it
+selects High on that chat and verifies the selection before sending one prompt.
+A changed session stops dispatch. The new prompt/message ID
 separates old answers and questions from the current assignment.
 
 Then follow the same event-observer/reply/completion/independent-review/next/finish route.

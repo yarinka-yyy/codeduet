@@ -111,10 +111,40 @@ test('manual native history with recovered edit adopts and sends one new correct
   assert.equal(adopted.result.correctionCount, 7);
   assert.equal(f.posts(`/api/session/${session.id}/prompt`), 0);
   const submitted = await f.call(submitArgs(f)); assert.equal(submitted.status, 0);
+  assert.equal(session.model.variant, 'high');
+  assert.equal(f.state().bindings[0].adoption.variant, 'high');
+  const writes = f.calls.filter(call => call.method === 'POST').map(call => call.route);
+  assert.deepEqual(writes, [`/api/session/${session.id}/model`, `/api/session/${session.id}/prompt`]);
   assert.equal(f.state().plans[0].correctionCount, 8);
   assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
   assert.equal((await f.call(submitArgs(f))).status, 1);
   assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
+});
+
+test('failed High selection stops dispatch without spending a correction or changing the binding', async t => {
+  const f = await fixture(t, undefined, '2.2.5'), session = seed(f);
+  assert.equal((await f.call(adoptArgs(f))).status, 0);
+  const before = readFileSync(f.statePath);
+  f.rejectRequest = (method, route) => method === 'POST' && route.endsWith('/model') ? { _tag: 'InvalidRequestError' } : undefined;
+  const result = await f.call(submitArgs(f));
+  assert.equal(result.status, 1);
+  assert.equal(result.result.diagnostic.operation, 'session.switchModel');
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 0);
+  assert.deepEqual(readFileSync(f.statePath), before);
+});
+
+test('a saved ordinary session switches to High before its next dispatch', async t => {
+  const f = await fixture(t, undefined, '2.2.5');
+  const bound = await f.call(f.bindArgs(0));
+  assert.equal(bound.status, 0);
+  const id = bound.result.sessionID, session = f.sessions.get(id);
+  assert.equal(session.model.variant, 'high');
+  session.model.variant = 'low';
+  assert.equal((await f.call(submitArgs(f, 'ordinary-initial', 'initial'))).status, 0);
+  assert.equal(f.state().bindings[0].sessionID, id);
+  assert.equal(session.model.variant, 'high');
+  assert.equal(f.posts(`/api/session/${id}/model`), 1);
+  assert.equal(f.posts(`/api/session/${id}/prompt`), 1);
 });
 
 for (const existing of [false, true]) test('adoption ' + (existing ? 'reuse' : 'save') + ' keeps state annotation when owner lease release fails', async t => {
@@ -200,7 +230,8 @@ test('an empty explicitly selected existing fixture can be adopted with an expli
   assert.equal(result.status, 0);
   assert.deepEqual(f.state().bindings[0].adoption, { variant: 'default', lastMessageID: null, idleAt: null });
   assert.equal((await f.call(submitArgs(f, 'new-plan', 'initial'))).status, 0);
-  assert.equal(f.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(f.posts('/api/session/ses_empty/model'), 1);
+  assert.equal(f.posts('/api/session/ses_empty/prompt'), 1);
 });
 
 test('adoption refuses missing/invalid/conflicting correction counts without inventing or resetting zero', async t => {
@@ -335,7 +366,7 @@ test('an old pending request after an adopted submit cannot be answered as a new
   f.emit('form.created', session.id);
   const stopped = await waiting;
   assert.equal(stopped.status, 1); assert.equal(stopped.result.phase, 'STOPPED');
-  assert.equal(f.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(f.calls.filter(call => call.method === 'POST' && call.route.endsWith('/reply')).length, 0);
 });
 
 test('an uncertain adopted correction spends cycle 20 exactly once and cannot be adopted or submitted again', async t => {

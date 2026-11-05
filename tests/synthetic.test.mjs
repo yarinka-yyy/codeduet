@@ -129,6 +129,52 @@ test('unmatched synthetic persists truthful STOPPED and cannot trigger a retry o
   assert.ok(!result.stdout.includes(privateText) && !stopped.includes(Buffer.from(privateText)));
 });
 
+test('OpenCode 2.2.5 wait reconciles an exited background shell from native history', async t => {
+  for (const scenario of ['success', 'fast exit', 'API agrees', 'wrong ID', 'duplicate notice', 'bad time',
+    'bad envelope', 'running', 'API conflict', 'nonzero exit', 'other shell error']) {
+    const f = await fixture(t, undefined, '2.2.5');
+    const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+    const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'background-shell' });
+    const binding = await adapter.bind(f.workspace, f.plan, baseline);
+    await adapter.submit(f.workspace, f.plan, 'background-shell', f.packet, baseline);
+    const { sessionID } = binding, now = Date.now() - 20, command = 'docker build -t isolated-test .';
+    const shellID = 'sh_fixture', noticeID = scenario === 'wrong ID' ? 'sh_foreign' : shellID;
+    const tool = { id: 'call_shell', type: 'tool', name: 'shell', time: { ran: now + 1, completed: now + 3 },
+      state: { status: 'completed', input: { command, background: true }, metadata: { status: 'running', shellID } } };
+    const notice = { id: 'msg_background', type: 'synthetic', description: command, time: { created:
+      scenario === 'bad time' ? now : now + (scenario === 'fast exit' ? 2 : 4) },
+    metadata: { source: 'shell', shellID: noticeID, jobID: noticeID, state: 'completed', truncated: false,
+      exit: scenario === 'nonzero exit' ? 1 : 0 },
+    text: `<shell id="${noticeID}" state="completed" command="${command}">\n${privateText}\n</shell>` };
+    const records = f.messages.get(sessionID);
+    if (scenario === 'bad envelope') notice.text = privateText;
+    records.push({ id: 'msg_shell', type: 'assistant', model, time: { created: now, completed: now + 3 }, content: [tool] }, notice);
+    if (scenario === 'duplicate notice') records.push({ ...notice, id: 'msg_duplicate' });
+    if (scenario === 'other shell error') records[1].content.push({ ...tool, id: 'call_other',
+      state: { status: 'error', input: { command: 'separate command' }, error: { type: 'tool.execution', message: privateText } } });
+    if (scenario === 'running') f.shells = [{ id: shellID, status: 'running' }];
+    if (['API agrees', 'API conflict'].includes(scenario)) f.shells = [{ id: shellID, status: 'exited', command,
+      exit: scenario === 'API agrees' ? 0 : 1, time: { started: now + 1, completed: now + 3 } }];
+    f.finish(sessionID);
+    const result = await adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, timeoutMs: 3000 });
+    if (['success', 'fast exit', 'API agrees'].includes(scenario)) {
+      assert.equal(result.kind, 'completed-for-review', JSON.stringify(result));
+      assert.equal((await adapter.finish(f.workspace, f.plan, baseline)).phase, 'FINISHED');
+    } else {
+      assert.equal(result.phase, 'STOPPED', scenario);
+      assert.equal(result.reviewAllowed ?? false, false, scenario);
+      if (['wrong ID', 'duplicate notice', 'bad time', 'bad envelope'].includes(scenario)) {
+        assert.equal(result.diagnostic?.errorCode, 'UncorrelatedSyntheticInput', scenario);
+      }
+      if (scenario === 'nonzero exit' || scenario === 'other shell error') {
+        assert.equal(result.exchangeFailure?.toolID, scenario === 'nonzero exit' ? 'call_shell' : 'call_other');
+      }
+    }
+    assert.equal(f.posts(`/api/session/${sessionID}/prompt`), 1);
+    assert.ok(!JSON.stringify(result).includes(privateText));
+  }
+});
+
 test('history diagnostic schema rejects private extensions and unknown type/code', () => {
   const diagnostic = { category: 'history-correlation', stage: 'history', elapsedMs: 0, lastEvent: null,
     historyType: 'synthetic', errorCode: 'UncorrelatedSyntheticInput' };

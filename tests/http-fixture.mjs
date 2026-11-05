@@ -66,6 +66,14 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
         const session = { id: 'ses_http' + (sessions.size + 1), title: body.title, location: body.location, model: body.model, time: {} };
         sessions.set(session.id, session); return send({ data: session });
       }
+      if (route.endsWith('/model') && request.method === 'POST') {
+        const session = sessions.get(sessionID);
+        const previous = session.model;
+        session.model = body.model;
+        messages.set(sessionID, [...(messages.get(sessionID) ?? []), { id: 'msg_selectedHigh', type: 'model-switched',
+          previous, model: session.model, time: { created: Date.now() } }]);
+        response.writeHead(204); response.end(); return;
+      }
       if (route.endsWith('/prompt') && request.method === 'POST') {
         if (f.fault === 'drop') { response.destroy(); return; }
         if (f.fault === 'http429') { response.writeHead(429); response.end(secret); return; }

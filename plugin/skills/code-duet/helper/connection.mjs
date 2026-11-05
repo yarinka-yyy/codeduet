@@ -5,6 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
+export const EXECUTOR_MODEL = Object.freeze({ ...MODEL, variant: 'high' });
 export const ENGINE_VERSIONS = Object.freeze(['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.5']);
 const releaseVersion = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value);
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
@@ -22,6 +23,7 @@ const operations = new Map([
   ['GET /api/info', 'server.info'], ['GET /api/model', 'model.list'],
   ['GET /api/session', 'session.list'], ['POST /api/session', 'session.create'],
   ['GET /api/session/active', 'session.active'], ['GET /api/session/:session', 'session.get'],
+  ['POST /api/session/:session/model', 'session.switchModel'],
   ['GET /api/session/:session/message', 'session.message.list'],
   ['GET /api/session/:session/form', 'session.form.list'],
   ['GET /api/session/:session/permission', 'session.permission.list'],

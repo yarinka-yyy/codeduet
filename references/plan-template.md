@@ -31,7 +31,7 @@ No installed Improve Codex files or agent profile are required.
 ## Connected assignment and prerequisites
 <Overall goal, accepted prerequisites/contracts, assigned steps/allowed paths,
 protected dirty state, exact physical checkout and canonical plan path.>
-Route: OpenCode <actual session>, opencode-go/deepseek-v4.1-flash, default options.
+Route: OpenCode <actual session>, opencode-go/deepseek-v4.1-flash, High reasoning.
 Preserve prior ordinary executor/profile records as history.
 
 ## Commands you will need

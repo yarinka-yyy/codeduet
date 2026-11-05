@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { execFileSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
+import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, recentSessionMessages, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 import { processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
@@ -1698,7 +1698,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         let response;
         try {
           response = await client.request('/api/session', {
-            title: 'Code Duet: ' + basename(ctx.workspace), location: { directory: ctx.workspace }, model: MODEL,
+            title: 'Code Duet: ' + basename(ctx.workspace), location: { directory: ctx.workspace }, model: EXECUTOR_MODEL,
           });
           need(/^ses_[a-zA-Z0-9]+$/.test(response?.data?.id), 'Creation uncertain; no retry');
         } catch (error) {
@@ -1716,7 +1716,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             'Session created; saved session identity is unconfirmed, inspect the store');
           throw error;
         }
-        try { await sessionMatches(expected); }
+        try { need((await sessionMatches(expected)).model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High'); }
         catch (error) {
           error.stateOutcome = stoppedOutcome(expected, error, 'stopped');
           throw error;
@@ -1762,16 +1762,34 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       });
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
-        try {
-          if (start.expected.adoption) {
-            const current = await idleExisting(start.state, start.expected);
-            need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === start.expected.adoption[key]),
-              'Existing session changed since preparation; no dispatch');
+        const adoption = start.expected.adoption;
+        if (adoption) {
+          const current = await idleExisting(start.state, start.expected);
+          need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === adoption[key]),
+            'Existing session changed since preparation; no dispatch');
+        }
+        const session = await sessionMatches(start.expected);
+        await noForms(start.expected);
+        await idleWorkspace(start.state, ctx);
+        if (session.model.variant !== EXECUTOR_MODEL.variant) {
+          const sessionRoute = '/api/session/' + session.id;
+          await client.request(sessionRoute + '/model', { model: EXECUTOR_MODEL });
+          const expected = adoption ? { ...start.expected, adoption: { ...adoption, variant: EXECUTOR_MODEL.variant } } : start.expected;
+          const confirmed = await snapshot(expected);
+          need(confirmed.session.model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High; no dispatch');
+          need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+            confirmed.session.time?.idle === session.time?.idle, 'Session activity changed during model selection; no dispatch');
+          if (adoption) {
+            const page = await client.request(sessionRoute + '/message?limit=2&order=desc');
+            const [head, prior] = Array.isArray(page?.data) ? page.data : [false];
+            const sameHead = head !== false && (head?.id ?? null) === adoption.lastMessageID;
+            need(sameHead || (prior?.id ?? null) === adoption.lastMessageID && head?.type === 'model-switched' &&
+              head.model?.providerID === MODEL.providerID && head.model?.id === MODEL.id && head.model.variant === EXECUTOR_MODEL.variant &&
+              head.previous?.providerID === MODEL.providerID && head.previous?.id === MODEL.id &&
+              (head.previous.variant ?? null) === adoption.variant, 'Existing history changed during model selection; no dispatch');
           }
-          await sessionMatches(start.expected);
-          await noForms(start.expected);
           await idleWorkspace(start.state, ctx);
-        } catch (error) { throw error; }
+        }
         let reservationAttempted = false, reservationExpected, reserved;
         try {
           reserved = commit(start.expected, (state, binding) => {
@@ -1779,6 +1797,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             const plan = planCounter(state, ctx);
             need(kind !== 'correction' || plan.correctionCount < 20, 'Twenty correction cycles exhausted; no cycle 21');
             if (kind === 'correction') plan.correctionCount++;
+            if (binding.adoption) binding.adoption.variant = EXECUTOR_MODEL.variant;
             binding.assignmentID = assignmentID;
             binding.messageID = 'msg_' + randomUUID().replaceAll('-', '');
             binding.submittedAt = Date.now();
