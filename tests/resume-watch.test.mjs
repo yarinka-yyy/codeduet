@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
 import { helper } from '../helper/binding.mjs';
+import { sha256 } from '../helper/postgres-recovery.mjs';
 
 async function stopped(t) {
   const f = await fixture(t, undefined, '2.2.0');
@@ -53,6 +54,68 @@ test('explicit CLI resumes the same completed assignment without POST, new bindi
   assert.equal(f.posts('/api/session/' + f.resume.sessionID + '/prompt'), 1);
   const reviewed = readFileSync(f.statePath), after = f.calls.length;
   assert.equal((await f.call(f.args)).result.kind, 'rejected'); unchanged(f, reviewed, after);
+});
+
+async function postgresFixture(t) {
+  const f = await stopped(t), run = join(f.workspace, 'postgres fixture');
+  const dataDirectory = join(run, 'data', 'pgdata'), log = join(run, 'logs', 'postgres.log');
+  mkdirSync(dataDirectory, { recursive: true }); mkdirSync(dirname(log));
+  const ran = Date.now(), pid = 301, port = 55432;
+  const command = `$run='${run}'\n$pgdata=Join-Path $run 'data/pgdata'\n` +
+    "& (Join-Path $bin 'pg_ctl.exe') -D $pgdata -l (Join-Path $run 'logs/postgres.log') -w -t 60 start";
+  f.messages.get(f.resume.sessionID).push({ id: 'msg_postgres', type: 'assistant', model, time: { completed: ran + 3 }, content: [
+    { id: 'call_postgres', type: 'tool', name: 'shell', time: { ran, completed: ran + 3 }, state: {
+      status: 'completed', metadata: { status: 'completed', timeout: true }, input: { command },
+    } },
+  ] });
+  const line = (at, text) => new Date(at).toISOString().replace('T', ' ').replace('Z', ` UTC [${pid}] LOG:  `) + text;
+  const logText = [line(ran + 1, 'starting PostgreSQL 16'),
+    line(ran + 2, `listening on IPv4 address "127.0.0.1", port ${port}`),
+    line(ran + 4, 'database system is shut down')].join('\n');
+  writeFileSync(log, logText);
+  const evidence = { messageID: f.resume.messageID, dataDirectory, log, logHash: sha256(logText), port,
+    calls: [{ id: 'call_postgres', commandHash: sha256(command), pid }] };
+  const file = join(f.home, 'postgres-evidence.json');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  f.finish(f.resume.sessionID);
+  return { f, evidence, file, logText, args: [...f.args.slice(0, -1), '15000', '--postgres-evidence', file] };
+}
+
+test('PostgreSQL recovery refuses an unmatched shutdown and leaves STOPPED intact', async t => {
+  const { f, evidence, file, logText, args } = await postgresFixture(t);
+  const incomplete = logText.split('\n').slice(0, 2).join('\n');
+  writeFileSync(evidence.log, incomplete);
+  writeFileSync(file, JSON.stringify({ ...evidence, logHash: sha256(incomplete) }));
+  const before = readFileSync(f.statePath), from = f.calls.length;
+  const outcome = await f.call(args);
+  assert.match(outcome.result.error, /lifecycle evidence is incomplete/);
+  unchanged(f, before, from);
+});
+
+test('PostgreSQL recovery opens review with the timeout and reuses the receipt on release', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
+}, async t => {
+  const { f, evidence, file, logText, args } = await postgresFixture(t);
+  writeFileSync(file, JSON.stringify(evidence));
+  const from = f.calls.length;
+  const outcome = await f.call(args, undefined, 20000);
+  assert.equal(outcome.status, 0, JSON.stringify(outcome.result));
+  assert.equal(outcome.result.phase, 'REVIEWING');
+  assert.equal(outcome.result.taskSent, false);
+  assert.equal(outcome.result.result.postgresRecovery[0].timeout, true);
+  assert.equal(outcome.result.result.tools[0].timeout, true);
+  assert.equal(outcome.result.correctionCount, 9);
+  const state = f.state(), binding = state.bindings[0];
+  assert.equal(binding.messageID, f.resume.messageID);
+  assert.equal(binding.postgresRecovery, undefined);
+  const receipt = join(dirname(f.statePath), 'postgres-recoveries', f.resume.messageID + '.json');
+  assert.equal(JSON.parse(readFileSync(receipt)).timeline[0].timeout, true);
+  const finish = ['finish', f.workspace, f.plan, '--non-git-baseline', baseline];
+  const released = await f.call(finish, undefined, 20000);
+  assert.equal(released.result.kind, 'released', JSON.stringify(released.result));
+  assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+  assert.equal(readFileSync(evidence.log, 'utf8'), logText);
 });
 
 test('CLI wait and resume-watch accept four hours and reject larger or invalid deadlines without mutation', async t => {

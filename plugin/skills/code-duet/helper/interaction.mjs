@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
+import { verifyPostgresRecovery } from './postgres-recovery.mjs';
 
 export function fingerprint(request) {
   return createHash('sha256').update(JSON.stringify(request)).digest('hex');
@@ -310,7 +311,8 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: repair ? 'recovered-edit' : 'blocking',
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
-  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors };
+  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors,
+    ...(binding.postgresRecovery ? { recoveryBinding: binding } : {}) };
   // Keep history failure separate from current executor activity; preserve tools for questions.
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
     failed.error ? 'message-error' : failed.retry ? 'retry-record' : failed.type === 'idle' ? 'failed-idle' :
@@ -374,21 +376,24 @@ export function completion(history, session, shells) {
   need(tools.every(tool => (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
     (readOnlyToolError(tool) || recovered.some(value => value.id === tool.id && value.messageID === tool.messageID))) &&
     Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed), 'Outstanding/unknown tool operation');
-  endedShells(history, shells);
+  const postgres = endedShells(history, shells);
   const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   need(output.trim(), 'Empty final response');
-  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status })),
+  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
+    ...(tool.state.metadata?.timeout === true ? { timeout: true } : {}) })),
+    ...(postgres.length ? { postgresRecovery: postgres } : {}),
     ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
     ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
 }
 
 const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
 
-function detachedReason(command, tool) {
+function detachedReason(command, tool, postgresRecovery) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
   const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
   // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
-  const launcherSource = outputData.test(command) ? '' : command.replace(
+  const launcherSource = outputData.test(command) ? '' : (postgresRecovery ?
+    command.replace(/^[ \t]*"--- pg_ctl start log ---"[ \t]*\r?$/gm, '') : command).replace(
     /^([ \t]*rg[ \t]+-n[ \t]+)'[\w .:-]*(\|[\w:.-]+(?:\|[\w:.-]+)*)?'(?=[ \t])/i,
     (pattern, prefix, alternatives) => detachedLauncher.test(alternatives ?? '') ? pattern : prefix + 'quoted');
   const launcher = launcherSource.match(detachedLauncher);
@@ -402,12 +407,12 @@ function detachedReason(command, tool) {
     .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
   const loneAmpersand = /(^|[^&])&([^&]|$)/;
   if (loneAmpersand.test(normalize(command)) &&
-    (!/=\s*&/.test(command) || loneAmpersand.test(normalize(maskVerifiedAssignmentCalls(command, tool)))))
+    (!/[=|]\s*&/.test(command) || loneAmpersand.test(normalize(maskVerifiedInvocationCalls(command, tool)))))
     return 'unclassified or background ampersand';
 }
 
 // shortcut: recover Windows PowerShell calls only while their exact engine lifecycle events are available.
-const assignmentCallProbe = String.raw`
+const invocationCallProbe = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $call = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
@@ -415,11 +420,8 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($call.command, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { exit }
 $offsets = @($ast.FindAll({ param($node)
-  $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-  $node.Right -is [System.Management.Automation.Language.PipelineAst] -and
-  $node.Right.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and
-  $node.Right.PipelineElements[0].InvocationOperator -eq 'Ampersand'
-}, $true) | ForEach-Object { $_.Right.PipelineElements[0].Extent.StartOffset })
+  $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq 'Ampersand'
+}, $true) | ForEach-Object { $_.Extent.StartOffset })
 if (!$offsets.Count) { exit }
 $start = [DateTimeOffset]::FromUnixTimeMilliseconds($call.ran).LocalDateTime
 $end = [DateTimeOffset]::FromUnixTimeMilliseconds($call.completed).LocalDateTime
@@ -448,7 +450,7 @@ if ($matchesByProcess.Count -eq 2 -and $matchesByProcess[0].Id -eq 403 -and $mat
   ConvertTo-Json -Compress -InputObject $offsets
 }`;
 
-function maskVerifiedAssignmentCalls(command, tool) {
+function maskVerifiedInvocationCalls(command, tool) {
   const { ran, completed } = tool.time ?? {};
   if (process.platform !== 'win32' || !process.env.SystemRoot || tool.name !== 'shell' ||
     tool.state.status !== 'completed' || tool.state.metadata?.status !== 'completed' ||
@@ -456,8 +458,8 @@ function maskVerifiedAssignmentCalls(command, tool) {
   try {
     const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
     const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-      Buffer.from(assignmentCallProbe, 'utf16le').toString('base64')], {
-      input: Buffer.from(JSON.stringify({ command, ran, completed })).toString('base64'),
+      Buffer.from(invocationCallProbe, 'utf16le').toString('base64')], {
+      input: Buffer.from(JSON.stringify({ command: tool.state.input.command, ran, completed })).toString('base64'),
       encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
     });
     if (!output.trim()) return command;
@@ -479,7 +481,8 @@ function endedShells(history, shells, closing = false) {
     const tool = history.tools.find(tool => unfinished?.id && tool.state.metadata?.shellID === unfinished.id);
     throw new Error('Project shell still running or unknown (' + (tool ? 'call ' + shellEvidenceID(tool.id) : 'shell ' + shellEvidenceID(unfinished?.id)) + ')');
   }
-  // Detached processes cannot be certified by a completed launcher. Stop instead of supervising the OS.
+  const postgres = history.recoveryBinding ? verifyPostgresRecovery(history.recoveryBinding, history.tools, history.idle?.time?.created) : new Map();
+  // A completed launcher alone cannot certify a detached process.
   for (const tool of history.tools) {
     const input = tool.state.input ?? {};
     const shellID = tool.state.metadata?.shellID;
@@ -500,10 +503,16 @@ function endedShells(history, shells, closing = false) {
       need(typeof input.command === 'string', 'Unknown shell command' + call);
       need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
         shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
-      const reason = detachedReason(input.command, tool);
+      const recovered = postgres.get(tool.id);
+      const command = recovered?.command ?? input.command;
+      const reason = detachedReason(command, tool, postgres.size > 0);
       need(!reason, 'Detached command status unknown; no ownership transfer' + call + ': ' + reason);
     }
   }
+  const timeline = [...postgres].map(([id, { pid, startedAt, endedAt, timeout }]) => ({ id, pid, startedAt, endedAt, timeout }));
+  if (history.recoveryBinding?.postgresTimeline) need(JSON.stringify(history.recoveryBinding.postgresTimeline) === JSON.stringify(timeline),
+    'PostgreSQL recovery history changed after review opened');
+  return timeline;
 }
 
 export function closureBoundary(binding, messages, session, shells) {

@@ -1,12 +1,12 @@
 import { parseArgs } from 'node:util';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { connect, diagnose } from './connection.mjs';
 import { context, helper, inspect, listSessions, maintainTasks, preflight, startCycle, WAIT_TIMEOUT_MS } from './binding.mjs';
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
   const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
@@ -25,6 +25,14 @@ try {
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
     !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
+  let postgresRecovery;
+  if (values['postgres-evidence'] !== undefined) {
+    const path = values['postgres-evidence'];
+    if (command !== 'resume-watch' || !isAbsolute(path)) throw new Error('postgres-evidence requires resume-watch and an absolute JSON file path');
+    const file = lstatSync(path);
+    if (!file.isFile() || file.size > 65536) throw new Error('Invalid PostgreSQL evidence file');
+    postgresRecovery = JSON.parse(readFileSync(path, 'utf8'));
+  }
   if (command === 'resume-watch' && (!/^ses_[a-zA-Z0-9]+$/.test(values.session) ||
     !/^[a-zA-Z0-9._-]{1,120}$/.test(assignment) || !/^msg_[a-zA-Z0-9]+$/.test(packet)))
     throw new Error('resume-watch <workspace> <plan> <assignment-id> <message-id> requires --session <exact-id>');
@@ -93,7 +101,7 @@ try {
       const abort = new AbortController();
       const interrupt = () => abort.abort();
       for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(name, interrupt);
-      try { result = await adapter.wait(workspace, plan, { nonGitBaseline: baseline, signal: abort.signal,
+      try { result = await adapter.wait(workspace, plan, { nonGitBaseline: baseline, signal: abort.signal, postgresRecovery,
         ...(timeoutMs ? { timeoutMs } : {}), ...(command === 'resume-watch' ? {
           resume: { sessionID: values.session, assignmentID: assignment, messageID: packet } } : {}) }); }
       finally { for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.off(name, interrupt); }

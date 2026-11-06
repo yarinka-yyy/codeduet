@@ -36,7 +36,7 @@ node helper/cli.mjs transition <absolute-workspace> <target-plan.md> <prior-mess
 node helper/cli.mjs retire-legacy <absolute-workspace> <old-plan.md> <lease-token>
 node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
-node helper/cli.mjs resume-watch <absolute-workspace> <absolute-plan.md> <assignment-id> <message-id> --session <exact-session-id> [--timeout-ms <ms>]
+node helper/cli.mjs resume-watch <absolute-workspace> <absolute-plan.md> <assignment-id> <message-id> --session <exact-session-id> [--timeout-ms <ms>] [--postgres-evidence <absolute-json-file>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
 ```
 
@@ -388,6 +388,18 @@ after successful resumption records a new STOPPED diagnostic normally.
 
 Successful/reconciled outcomes include observationOnly=true and taskSent=false.
 The saved correction count and delivery IDs are preserved, including count 20.
+For a terminal Windows PostgreSQL run, explicitly authorized `--postgres-evidence`
+accepts an operator-reviewed JSON object with `messageID`, absolute `dataDirectory`
+and `log`, `logHash` (SHA-256 of the file), `port`, and chronological `calls`
+with `id`, `pid`, and `commandHash` (SHA-256 of the exact UTF-8 shell command).
+Use reviewed paths and launch identities, including indirect script launches.
+The supported layout is `data/pgdata` and `logs/postgres.log` under the same run
+directory. Each log launch needs a matching listener and shutdown for its PID.
+All launches must match the selected delivery and the command time windows.
+The helper checks current PostgreSQL processes, the listening port, and the PID
+file, then rechecks the assignment and shell registry. Only an authorized
+resume stores the receipt under the shared state directory. Later release and
+transition checks revalidate the same evidence. Review output retains timeouts.
 Another resume-watch cannot attach concurrently; ordinary wait remains sticky
 on STOPPED. Do not spoof a chat ID or remove a lock to enter this route.
 A known no-write edit rejection may remain pending while the engine is running;
