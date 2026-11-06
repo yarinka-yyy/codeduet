@@ -168,13 +168,24 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   mkdirSync(dirname(lease), { recursive: true });
   writeFileSync(lease, JSON.stringify({ schema: 1, token, operation: 'bind', codexChat: old.codexChat,
     workspace: old.workspace, checkout: old.checkout, sessionID: old.sessionID, assignmentID: old.assignmentID }));
-  assert.equal((await f.call(['ownership', f.workspace, f.plan, token, '--non-git-baseline', baseline])).result.reason,
-    'legacy-bind-needs-local-reboot-proof');
+  const inspected = (await f.call(['ownership', f.workspace, f.plan, token, '--non-git-baseline', baseline])).result;
+  assert.equal(inspected.reason, 'legacy-bind-needs-local-reboot-proof');
+  assert.equal(inspected.recoveryAllowed, false);
+  assert.match(inspected.legacyBind.explanation, /no PID or process start time/);
+  assert.deepEqual(inspected.legacyBind.steps, [
+    ['ownership', f.workspace, f.plan, token, '--action', 'recover-legacy-bind', '--non-git-baseline', baseline],
+    ['replace-finished-session', f.workspace, f.plan, old.messageID, '--session', old.sessionID,
+      '--lost-powershell-calls', '<comma-separated-call-ids>', '--recovered-bind', token, '--non-git-baseline', baseline],
+    ['preflight', f.workspace, f.plan, '--session', '<new-session-id>', '--non-git-baseline', baseline],
+  ]);
   assert.match((await run()).result.error, /ownership locked/);
   const restarted = { ...f.client, engineID: 'offline-restarted-engine' };
   const recover = boot => helper(restarted, { stateRoot, chatID: old.codexChat, probeBootTime: () => boot })
     .observationOwner(f.workspace, f.plan, token, { action: 'recover-legacy-bind', nonGitBaseline: baseline });
-  await assert.rejects(recover(0), /confirmed Windows restart/);
+  const rejected = await recover(0);
+  assert.equal(rejected.kind, 'rejected');
+  assert.match(rejected.error, /confirmed Windows restart/);
+  assert.deepEqual(rejected.legacyBind, inspected.legacyBind);
   const createReceipt = join(stateRoot, 'finished-session-replacements', old.messageID + '.json');
   mkdirSync(dirname(createReceipt), { recursive: true });
   writeFileSync(createReceipt, '{}');

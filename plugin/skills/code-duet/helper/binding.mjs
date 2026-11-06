@@ -1498,10 +1498,20 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         const selected = selectBind(readState(statePath)), { owner, binding, counter } = selected;
         const proof = legacy ? { status: 'unknown', reason: 'legacy-bind-needs-local-reboot-proof' } :
           owner.process.start ? ownerLiveness(owner.process, probeOwner) : { status: 'unknown', reason: 'process-start-unavailable' };
+        const legacyBind = legacy && binding.phase === 'FINISHED' && binding.messageID && !binding.pending ? {
+          explanation: 'This lease has no PID or process start time. Windows must confirm a restart after the lease was written.',
+          steps: [
+            ['ownership', workspace, planPath, token, '--action', 'recover-legacy-bind'],
+            ['replace-finished-session', workspace, planPath, binding.messageID, '--session', binding.sessionID,
+              '--lost-powershell-calls', '<comma-separated-call-ids>', '--recovered-bind', token],
+            ['preflight', workspace, planPath, '--session', '<new-session-id>'],
+          ].map(args => nonGitBaseline ? [...args, '--non-git-baseline', nonGitBaseline] : args),
+        } : undefined;
         const result = { kind: 'ownership-status', token, operation: 'bind', ownerStatus: proof.status, reason: proof.reason,
           processID: owner.process?.pid ?? null, recoveryAllowed: !legacy && proof.status === 'dead',
           sessionID: binding?.sessionID ?? null, messageID: binding?.messageID ?? null, phase: binding?.phase ?? null,
-          correctionCount: counter, uncertain: binding?.uncertain ?? null, taskSent: false, stateChange: 'unchanged' };
+          correctionCount: counter, uncertain: binding?.uncertain ?? null, taskSent: false, stateChange: 'unchanged',
+          ...(legacyBind ? { legacyBind } : {}) };
         if (action === 'inspect') return result;
         if (legacy && action === 'recover-legacy-bind') {
           need(client, 'OpenCode connection is required to check legacy bind recovery');
@@ -1511,9 +1521,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const receipt = join(stateRoot, 'finished-session-replacements', binding.messageID + '.json');
           need(!existsSync(receipt), 'A replacement receipt exists; create may have been reserved');
           const boot = probeBootTime(owner.path);
-          need(Number.isFinite(boot) && selected.birth > 0 && selected.written > 0 &&
-            boot > Math.max(selected.birth, selected.written),
-          'Legacy bind owner is unverifiable; a confirmed Windows restart after the lease was written is required');
+          if (!(Number.isFinite(boot) && selected.birth > 0 && selected.written > 0 &&
+            boot > Math.max(selected.birth, selected.written))) return { ...result, kind: 'rejected',
+            error: 'Legacy bind owner is unverifiable; a confirmed Windows restart after the lease was written is required' };
           const checkLocal = state => {
             const current = selectBind(state);
             need(JSON.stringify(current) === JSON.stringify(selected), 'Legacy bind lease or saved delivery changed');
@@ -1548,7 +1558,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             archiveOwner(owner, { schema: 1, kind: 'legacy-bind-recovery', owner, proof: restart, counter,
               messageID: binding.messageID, fingerprint: selected.fingerprint, historyFingerprint: historyFingerprint(messages) });
           });
-          return { ...result, kind: 'bind-ownership-released', ownerStatus: restart.status, reason: restart.reason,
+          return { ...result, legacyBind: undefined, kind: 'bind-ownership-released', ownerStatus: restart.status, reason: restart.reason,
             recoveryAllowed: true, leaseArchived: true };
         }
         if (legacy || action !== 'recover' || proof.status !== 'dead') return { ...result, kind: 'rejected' };
@@ -2110,6 +2120,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20,
         'Invalid imported correction count');
       const bindProcess = processOwner();
+      need(validProcessOwner(bindProcess) && bindProcess.start, 'Cannot verify the bind owner process identity; no lease was created');
       const start = locked(state => {
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         planCounter(state, ctx, importedCount);

@@ -642,12 +642,18 @@ Replacement sends no prompt and does not authorize the next assignment.
 From the owning chat, run `ownership <workspace> <plan> <lease-token> --action inspect`
 with the same non-Git baseline when needed. For a new bind lease, `--action recover`
 archives the exact lease after its process has exited and its binding pins match.
+New binds require a verifiable owner process identity before acquiring the lease.
 A create reservation stays `STOPPED` with `uncertain: create`, even after the lease
 is archived. Recovery never retries a create or sends a prompt.
 
 For a bind lease without process identity, explicitly use `--action recover-legacy-bind`.
 This requires a confirmed Windows restart after the lease was written on the local
-fixed drive. It also requires the original FINISHED binding, no create reservation
+fixed drive because the old lease has no PID or process start time. For an eligible
+FINISHED delivery, `inspect` and a refusal due to missing restart proof return
+`legacyBind.steps`, the CLI argument lists for recovery, replacement and preflight.
+Supply the exact lost call IDs and use the new session ID returned by replacement.
+Run each step only after the preceding one succeeds.
+Recovery also requires the original FINISHED binding, no create reservation
 or replacement receipt, and fresh idle checks for the checkout and session. The
 existing lease keeps other helper operations out during validation. If the proof
 is missing or the state changes, the lease stays in place. Successful recovery

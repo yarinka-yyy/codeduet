@@ -119,7 +119,14 @@ for (const route of ['/api/session/active', '/api/session']) test('bind ownershi
     assert.equal(f.state().plans[0].correctionCount, 0);
     assert.equal((await f.call(f.bindArgs(0), chatID)).status, 1);
     assert.equal(f.posts('/api/session'), 1);
-  } else assert.equal(existsSync(f.statePath), false);
+  } else {
+    assert.equal(existsSync(f.statePath), false);
+    assert.equal(f.posts('/api/session'), 0);
+    const retry = await f.call(f.bindArgs(0), chatID);
+    assert.equal(retry.result.kind, 'created', JSON.stringify(retry.result));
+    assert.equal(retry.result.phase, 'PREPARING');
+    assert.equal(f.posts('/api/session'), 1);
+  }
 });
 test('normal foreground completion releases ownership and preserves correction nine', async t => {
   const f = await setup(t), from = f.calls.length, run = await foreground(t, f);
