@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import { MODEL } from '../helper/connection.mjs';
 import { inspectMessages, completion, closureBoundary } from '../helper/interaction.mjs';
 
@@ -21,13 +24,17 @@ function exchange() {
 const inspect = (messages, adopting = true) => inspectMessages({ messageID: 'msg_user' }, messages, { adopting });
 const complete = history => completion(history, { time: { idle: 41 } }, { data: [] });
 
-function checkShell(command, { input = {}, metadata = {}, shells = [] } = {}) {
+function checkShell(command, { input = {}, metadata = {}, shells = [], time = { completed: 10 } } = {}) {
   const messages = exchange().filter(message => message.type !== 'synthetic');
-  Object.assign(messages[1].content[0], { id: 'call_shell_check', name: 'shell', state: {
+  const offset = time.completed - 10;
+  for (const message of messages.slice(1)) {
+    for (const key of Object.keys(message.time)) message.time[key] += offset;
+  }
+  Object.assign(messages[1].content[0], { id: 'call_shell_check', name: 'shell', time, state: {
     status: 'completed', input: { command, ...input }, metadata: { status: 'completed', ...metadata },
   } });
   const binding = { messageID: 'msg_user', submittedAt: 1 };
-  const session = { model: MODEL, outcome: 'succeeded', time: { idle: 41 } };
+  const session = { model: MODEL, outcome: 'succeeded', time: { idle: 41 + offset } };
   return [() => completion(inspectMessages(binding, messages), session, { data: shells }),
     () => closureBoundary(binding, messages, session, { data: shells })];
 }
@@ -106,6 +113,11 @@ for (const [command, reason] of [
   ['cd C:/fixture; & $tool test; sleep 10 &', 'ampersand'],
   ['Write-Output ok\n& (Join-Path $nodeDir "tool.exe") &', 'ampersand'],
   ['sleep 10 \\\n& echo done', 'ampersand'],
+  ["$out = & (Join-Path $run 'fixture.ps1')", 'ampersand'],
+  ['$out = & $tool --version', 'ampersand'],
+  ['echo = & ( sleep 1 )', 'ampersand'],
+  ['$out = & $tool --version\nGet-Date &', 'ampersand'],
+  ['$out = & $tool --version\nStart-Job { Get-Date }', 'start-job'],
   ['$p=Start-Process tool.exe -PassThru; if (!$p.WaitForExit(1000)) { $p.Kill() }', 'start-process'],
   ['Start-Job { build }', 'start-job'],
   ['nohup build', 'nohup'],
@@ -119,6 +131,28 @@ for (const [command, reason] of [
     assert.ok(!error.message.includes('PRIVATE_INPUT'));
     return true;
   });
+});
+
+test('Windows PowerShell lifecycle evidence admits only the exact observed assignment call', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POWERSHELL_EVENTS !== '1',
+}, () => {
+  const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const command = `# ${randomUUID()}\n` +
+    "$out = & (Join-Path $env:SystemRoot 'System32/where.exe') /?\n" +
+    "$tool = 'Write-Output'\n$out = & $tool 'fixture'\n$out";
+  const ran = Date.now();
+  execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+    windowsHide: true, timeout: 5000, stdio: 'ignore',
+  });
+  const time = { ran, completed: Date.now() }, metadata = { exit: 0 };
+  const [finish, close] = checkShell(command, { time, metadata });
+  assert.equal(finish().kind, 'completed-for-review');
+  assert.equal(close().idleAt, time.completed + 31);
+  for (const variant of [command + '\nGet-Date &', command.replace("'fixture'", "'different'"), command + '\n# different']) {
+    for (const check of checkShell(variant, { time, metadata })) {
+      assert.throws(check, /call_shell_check.*unclassified or background ampersand/);
+    }
+  }
 });
 
 test('shell evidence still blocks pending and untracked background operations', () => {

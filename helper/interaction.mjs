@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 
 export function fingerprint(request) {
@@ -383,7 +384,7 @@ export function completion(history, session, shells) {
 
 const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
 
-function detachedReason(command) {
+function detachedReason(command, tool) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
   const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
   // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
@@ -395,11 +396,77 @@ function detachedReason(command) {
 
   // A physical line cannot start a Bash background operator unless the line continues a command.
   const separateLines = !/[\\^`]\r?\n/.test(command);
-  const unquoted = (separateLines ? command.replace(/(^|\r?\n)[ \t]*&[ \t]*(?=\(|['"\$\w])/g, '$1') : command)
+  const normalize = source => (separateLines ? source.replace(/(^|\r?\n)[ \t]*&[ \t]*(?=\(|['"\$\w])/g, '$1') : source)
     .replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
     .replace(/\b\d+>&\d+\b/g, 'redirect')
     .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
-  if (/(^|[^&])&([^&]|$)/.test(unquoted)) return 'unclassified or background ampersand';
+  const loneAmpersand = /(^|[^&])&([^&]|$)/;
+  if (loneAmpersand.test(normalize(command)) &&
+    (!/=\s*&/.test(command) || loneAmpersand.test(normalize(maskVerifiedAssignmentCalls(command, tool)))))
+    return 'unclassified or background ampersand';
+}
+
+// shortcut: recover Windows PowerShell calls only while their exact engine lifecycle events are available.
+const assignmentCallProbe = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$call = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($call.command, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { exit }
+$offsets = @($ast.FindAll({ param($node)
+  $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+  $node.Right -is [System.Management.Automation.Language.PipelineAst] -and
+  $node.Right.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and
+  $node.Right.PipelineElements[0].InvocationOperator -eq 'Ampersand'
+}, $true) | ForEach-Object { $_.Right.PipelineElements[0].Extent.StartOffset })
+if (!$offsets.Count) { exit }
+$start = [DateTimeOffset]::FromUnixTimeMilliseconds($call.ran).LocalDateTime
+$end = [DateTimeOffset]::FromUnixTimeMilliseconds($call.completed).LocalDateTime
+$exe = Join-Path $PSHOME 'powershell.exe'
+$prefix = "$exe -NoLogo -NoProfile -NonInteractive -Command "
+# The event query can round timestamps. Check the exact millisecond window below.
+$events = @(Get-WinEvent -FilterHashtable @{ LogName='Windows PowerShell'; ProviderName='PowerShell';
+  Id=400,403; StartTime=$start.AddSeconds(-1); EndTime=$end.AddSeconds(1) } -MaxEvents 257)
+if ($events.Count -ge 257) { exit }
+$matchesByProcess = @($events | ForEach-Object {
+  $at = ([DateTimeOffset]$_.TimeCreated).ToUnixTimeMilliseconds()
+  $context = ([string]$_.Properties[2].Value).Replace([Environment]::NewLine, [string][char]10)
+  $applicationField = [regex]::Match($context, '(?ms)^[ \t]*HostApplication=(.*)\n[ \t]*EngineVersion=')
+  if ($at -ge $call.ran -and $at -le $call.completed -and $applicationField.Success) {
+    $application = $applicationField.Groups[1].Value
+    if ($application.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+        $application.Substring($prefix.Length) -ceq $call.command.Replace([Environment]::NewLine, [string][char]10) -and
+        $context.Substring(0, $applicationField.Index) -match '(?im)^[ \t]*HostId=([0-9a-f-]{36})$') {
+      [pscustomobject]@{ Id=$_.Id; ProcessId=$_.ProcessId; HostId=$Matches[1] }
+    }
+  }
+})
+if ($matchesByProcess.Count -eq 2 -and $matchesByProcess[0].Id -eq 403 -and $matchesByProcess[1].Id -eq 400 -and
+  $matchesByProcess[0].ProcessId -gt 0 -and $matchesByProcess[0].ProcessId -eq $matchesByProcess[1].ProcessId -and
+  $matchesByProcess[0].HostId -eq $matchesByProcess[1].HostId) {
+  ConvertTo-Json -Compress -InputObject $offsets
+}`;
+
+function maskVerifiedAssignmentCalls(command, tool) {
+  const { ran, completed } = tool.time ?? {};
+  if (process.platform !== 'win32' || !process.env.SystemRoot || tool.name !== 'shell' ||
+    tool.state.status !== 'completed' || tool.state.metadata?.status !== 'completed' ||
+    !Number.isSafeInteger(ran) || !Number.isSafeInteger(completed) || ran >= completed || command.length > 32_768) return command;
+  try {
+    const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+    const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+      Buffer.from(assignmentCallProbe, 'utf16le').toString('base64')], {
+      input: Buffer.from(JSON.stringify({ command, ran, completed })).toString('base64'),
+      encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    if (!output.trim()) return command;
+    const offsets = JSON.parse(output);
+    if (!Array.isArray(offsets) || !offsets.every(offset => Number.isSafeInteger(offset) && command[offset] === '&')) return command;
+    const characters = command.split('');
+    for (const offset of offsets) characters[offset] = ' ';
+    return characters.join('');
+  } catch { return command; }
 }
 
 const shellEvidenceID = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id) ? id : 'unknown';
@@ -433,7 +500,7 @@ function endedShells(history, shells, closing = false) {
       need(typeof input.command === 'string', 'Unknown shell command' + call);
       need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
         shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
-      const reason = detachedReason(input.command);
+      const reason = detachedReason(input.command, tool);
       need(!reason, 'Detached command status unknown; no ownership transfer' + call + ': ' + reason);
     }
   }

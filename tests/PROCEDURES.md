@@ -9,6 +9,10 @@ node tests/package-smoke.mjs <absolute-codex-exe> <absolute-new-evidence-directo
 node tests/plugin-git-update.mjs <absolute-codex-exe>
 ```
 
+On Windows, set `DUET_TEST_POWERSHELL_EVENTS=1` when running `tests/history.test.mjs`
+to verify native PowerShell event correlation. The test requires read access to
+the Windows PowerShell event log and runs a harmless command outside executor workspaces.
+
 The plugin Git test uses a disposable local HTTP Git repository and isolated
 CODEX_HOME. It installs v1 with the real Codex CLI, arms a detached observer
 against the offline engine fixture, publishes v2 only to that local repository,

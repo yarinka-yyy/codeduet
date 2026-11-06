@@ -276,8 +276,12 @@ identity: arbitrary API/plugin metadata is not proof of origin. Unsupported hist
 diagnostics name only known API types; arbitrary type values are not echoed.
 Foreground shell checks distinguish numeric stream redirection (2>&1) and
 PowerShell call operators at statement/block starts from a trailing background
-ampersand. Detached launchers, including Start-Process with an unverified wait/
-kill branch, remain blocked; no general shell parser or process monitor is added.
+ampersand. For an ampersand on the right of an assignment, the Windows PowerShell
+parser reads the recorded text as data. The helper accepts the parsed invocation
+only when the Windows PowerShell event log shows one matching start and stop for
+the exact command, process and tool time interval. Missing or inaccessible events,
+other shell dialects and parse errors leave the ampersand unclassified. Detached
+launchers, including Start-Process with an unverified wait/kill branch, remain blocked.
 
 An adopt failure inside the helper reports adoption.bindingState unchanged
 until the final binding save is attempted; afterwards it is unconfirmed.
