@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -47,4 +47,20 @@ export function ownerLiveness(owner, probe = probeProcess) {
     return { status: 'unknown', reason: 'process-query-unavailable' };
   return current.start === owner.start ? { status: 'live', reason: 'same-process-start' } :
     { status: 'dead', reason: 'pid-reused' };
+}
+
+export function localWindowsBootTime(path) {
+  if (process.platform !== 'win32') return null;
+  try {
+    const drive = /^[A-Za-z]:/.exec(realpathSync(path))?.[0];
+    if (!drive) return null;
+    const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+    const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; if ([IO.DriveInfo]::new('${drive}').DriveType -ne 'Fixed') { exit 1 }; ` +
+      '$boot=(Get-CimInstance Win32_OperatingSystem -Property LastBootUpTime).LastBootUpTime; ' +
+      '([DateTimeOffset]($boot.ToUniversalTime())).ToUnixTimeMilliseconds()'],
+    { encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const at = Number(output);
+    return Number.isSafeInteger(at) && at > 0 && at < Date.now() ? at : null;
+  } catch { return null; }
 }

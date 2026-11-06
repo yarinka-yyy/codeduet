@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlink
 import { dirname, join } from 'node:path';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
-import { helper } from '../helper/binding.mjs';
+import { helper, preflight as checkPreflight } from '../helper/binding.mjs';
 import { sha256 } from '../helper/postgres-recovery.mjs';
 
 async function stopped(t) {
@@ -163,8 +163,38 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   assert.match((await run()).result.error, /possible detached launcher start-job/);
   call.state.input.command = command;
   unchanged(f, before, from);
-  const history = JSON.stringify(messages), passed = await run();
-  assert.equal(passed.status, 0, JSON.stringify(passed.result));
+  const token = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const lease = join(stateRoot, 'ownership', 'owner-' + token + '.lock');
+  mkdirSync(dirname(lease), { recursive: true });
+  writeFileSync(lease, JSON.stringify({ schema: 1, token, operation: 'bind', codexChat: old.codexChat,
+    workspace: old.workspace, checkout: old.checkout, sessionID: old.sessionID, assignmentID: old.assignmentID }));
+  assert.equal((await f.call(['ownership', f.workspace, f.plan, token, '--non-git-baseline', baseline])).result.reason,
+    'legacy-bind-needs-local-reboot-proof');
+  assert.match((await run()).result.error, /ownership locked/);
+  const restarted = { ...f.client, engineID: 'offline-restarted-engine' };
+  const recover = boot => helper(restarted, { stateRoot, chatID: old.codexChat, probeBootTime: () => boot })
+    .observationOwner(f.workspace, f.plan, token, { action: 'recover-legacy-bind', nonGitBaseline: baseline });
+  await assert.rejects(recover(0), /confirmed Windows restart/);
+  const createReceipt = join(stateRoot, 'finished-session-replacements', old.messageID + '.json');
+  mkdirSync(dirname(createReceipt), { recursive: true });
+  writeFileSync(createReceipt, '{}');
+  await assert.rejects(recover(Date.now() + 1000), /create may have been reserved/);
+  unlinkSync(createReceipt);
+  f.forms.push({ id: 'frm_waiting', sessionID: old.sessionID });
+  await assert.rejects(recover(Date.now() + 1000), /awaiting a reply/);
+  f.forms.length = 0;
+  assert.ok(existsSync(lease));
+  assert.equal((await recover(Date.now() + 1000)).kind, 'bind-ownership-released');
+  assert.ok(existsSync(join(stateRoot, 'ownership-history', token + '.lock')));
+  unchanged(f, before, from);
+  const options = { sessionID: old.sessionID, messageID: old.messageID, lostCalls: [call.id] };
+  const adapter = helper(restarted, { stateRoot, chatID: old.codexChat });
+  await assert.rejects(adapter.bind(f.workspace, f.plan, baseline, undefined, options), /Engine changed/);
+  call.state.input.command += ' # changed';
+  assert.match((await f.call([...replace, '--recovered-bind', token])).result.error, /history differs/);
+  call.state.input.command = command;
+  const history = JSON.stringify(messages);
+  const passed = { result: await adapter.bind(f.workspace, f.plan, baseline, undefined, { ...options, recoveredBind: token }) };
   assert.equal(passed.result.kind, 'finished-session-replaced');
   assert.equal(passed.result.taskSent, false);
   assert.equal(passed.result.previous.phase, 'FINISHED');
@@ -177,7 +207,10 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   assert.equal(receipt.reason, 'lost-powershell-lifecycle-evidence');
   assert.equal(receipt.gaps[0].hash, sha256(command));
   assert.equal(existsSync(join(stateRoot, 'powershell-invocations', old.messageID + '.json')), false);
-  assert.equal((await f.call(preflight)).result.status, 'pass');
+  const ready = await checkPreflight(restarted, { stateRoot, chatID: old.codexChat, workspace: f.workspace,
+    planPath: f.plan, sessionID: passed.result.sessionID, nonGitBaseline: baseline });
+  assert.equal(ready.status, 'pass');
+  assert.equal(ready.taskSent, false);
   assert.equal((await run()).result.kind, 'rejected');
   assert.deepEqual(f.calls.slice(from).filter(call => call.method === 'POST').map(call => call.route), ['/api/session']);
 });

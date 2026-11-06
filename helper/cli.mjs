@@ -6,16 +6,17 @@ import { context, helper, inspect, listSessions, maintainTasks, preflight, start
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' }, 'lost-powershell-calls': { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' }, 'lost-powershell-calls': { type: 'string' }, 'recovered-bind': { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
-  const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
+  const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover|recover-legacy-bind] [--non-git-baseline <declaration>]';
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
   const transitionUsage = 'transition <workspace> <target-plan> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]';
   const replacing = command === 'replace-finished-session';
   if (replacing && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
     !/^ses_[a-zA-Z0-9]+$/.test(values.session) || !values['lost-powershell-calls']))
-    throw new Error('Usage: replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids>');
-  if (!replacing && values['lost-powershell-calls'] !== undefined) throw new Error('lost-powershell-calls belongs to replace-finished-session');
+    throw new Error('Usage: replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids> [--recovered-bind <lease-token>]');
+  if (!replacing && (values['lost-powershell-calls'] !== undefined || values['recovered-bind'] !== undefined))
+    throw new Error('lost-powershell-calls and recovered-bind belong to replace-finished-session');
   if (command === 'task-maintenance' && args.length !== 3) throw new Error('Usage: cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>');
   if (command === 'start-cycle' && args.length !== 3) throw new Error('Usage: cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>');
   if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
@@ -28,7 +29,7 @@ try {
   }
   if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !replacing && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Assignment kind belongs to submit/transition; correction-count to bind/adopt/preflight; session to preflight/resume-watch/close-assignment/replace-finished-session; cursor to sessions');
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
-    !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
+    !['inspect', 'stop', 'recover', 'recover-legacy-bind'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
   if (values['powershell-event-log'] !== undefined && command !== 'finish') throw new Error('powershell-event-log belongs to finish');
   let postgresRecovery;
@@ -70,8 +71,11 @@ try {
   let connectionError, result;
   if (command === 'task-maintenance') result = maintainTasks(workspace, plan);
   if (command === 'start-cycle') result = startCycle(workspace, plan);
-  if (command === 'ownership') result = await helper(null).observationOwner(workspace, plan, assignment,
-    { action: values.action, nonGitBaseline: values['non-git-baseline'] });
+  if (command === 'ownership') {
+    const ownershipClient = values.action === 'recover-legacy-bind' ? await connect() : null;
+    result = await helper(ownershipClient).observationOwner(workspace, plan, assignment,
+      { action: values.action, nonGitBaseline: values['non-git-baseline'] });
+  }
   try { if (!['ownership', 'task-maintenance', 'start-cycle'].includes(command)) client = await connect(); }
   catch (error) {
     if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
@@ -96,6 +100,7 @@ try {
     if (command === 'bind') result = await adapter.bind(workspace, plan, baseline, importedCount);
     else if (replacing) result = await adapter.bind(workspace, plan, baseline, undefined, {
       sessionID: values.session, messageID: assignment, lostCalls: values['lost-powershell-calls'].split(','),
+      recoveredBind: values['recovered-bind'],
     });
     else if (command === 'retire-legacy') result = await adapter.retireLegacy(workspace, plan, assignment);
     else if (command === 'adopt') result = await adapter.adopt(workspace, plan, assignment, baseline, importedCount);

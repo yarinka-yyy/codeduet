@@ -87,6 +87,40 @@ test('process evidence handles live, absent, PID reuse, denied query, unknown bi
   assert.equal(ownerLiveness({ ...owner, host: '0'.repeat(64) }).status, 'unknown');
   assert.equal(ownerLiveness(undefined).reason, 'legacy-owner-unverifiable');
 });
+for (const route of ['/api/session/active', '/api/session']) test('bind ownership recovery after interruption at ' + route, async t => {
+  const f = await fixture(t), stateRoot = dirname(f.statePath), owners = join(stateRoot, 'ownership');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  f.onRequest = path => path === route ? gate : undefined;
+  const child = spawn(process.execPath, [cli, ...f.bindArgs(0)], { cwd: f.workspace, windowsHide: true,
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, CODEX_THREAD_ID: chatID }, stdio: 'ignore' });
+  const done = new Promise((resolve, reject) => { child.once('close', resolve); child.once('error', reject); });
+  t.after(async () => { release(); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await done; });
+  await until(() => f.calls.some(call => call.route === route));
+  const [name] = readdirSync(owners), path = join(owners, name);
+  const owner = JSON.parse(readFileSync(path, 'utf8'));
+  assert.equal(owner.schema, 2);
+  assert.equal(owner.operation, 'bind');
+  assert.equal(owner.process.pid, child.pid);
+  assert.ok(owner.process.start);
+  const args = ['ownership', f.workspace, f.plan, owner.token, '--non-git-baseline', baseline, '--action'];
+  assert.equal((await f.call([...args, 'inspect'], chatID)).result.ownerStatus, 'live');
+  assert.equal((await f.call([...args, 'recover'], chatID)).result.kind, 'rejected');
+  child.kill('SIGKILL'); await done; release();
+  const before = existsSync(f.statePath) ? readFileSync(f.statePath) : null;
+  const from = f.calls.length, recovered = await f.call([...args, 'recover'], chatID);
+  assert.equal(recovered.result.kind, 'bind-ownership-released', JSON.stringify(recovered.result));
+  assert.equal(recovered.result.ownerStatus, 'dead');
+  assert.equal(f.calls.length, from);
+  assert.ok(!existsSync(path) && existsSync(join(stateRoot, 'ownership-history', owner.token + '.lock')));
+  if (route === '/api/session') {
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.equal(f.state().bindings[0].uncertain, 'create');
+    assert.equal(f.state().plans[0].correctionCount, 0);
+    assert.equal((await f.call(f.bindArgs(0), chatID)).status, 1);
+    assert.equal(f.posts('/api/session'), 1);
+  } else assert.equal(existsSync(f.statePath), false);
+});
 test('normal foreground completion releases ownership and preserves correction nine', async t => {
   const f = await setup(t), from = f.calls.length, run = await foreground(t, f);
   f.finish(f.saved.sessionID); const result = await run.done;

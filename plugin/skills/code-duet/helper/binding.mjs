@@ -7,7 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, recentSessionMessages, closureBoundary, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
 import { validatePostgresRecovery } from './postgres-recovery.mjs';
-import { processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
+import { localWindowsBootTime, processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
 export const WAIT_TIMEOUT_MS = 14_400_000;
 
@@ -20,6 +20,15 @@ const stateLockWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_
 const observationFingerprint = (binding, counter) => createHash('sha256').update(JSON.stringify([
   ...['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID',
     'sessionID', 'assignmentID', 'messageID', 'submittedAt'].map(key => binding[key]), counter])).digest('hex');
+const fingerprintPattern = /^[a-f0-9]{64}$/;
+const leaseTokenPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const historyFingerprint = messages => createHash('sha256').update(JSON.stringify(messages)).digest('hex');
+function bindFingerprint(state, binding) {
+  if (!binding) return createHash('sha256').update('unbound').digest('hex');
+  const { stopReason, diagnostic, ...pins } = binding;
+  const counter = state.plans.find(plan => plan.planPath === binding.planPath)?.correctionCount;
+  return createHash('sha256').update(JSON.stringify([pins, counter])).digest('hex');
+}
 
 function physicalContext(workspace, planPath) {
   need(isAbsolute(workspace) && isAbsolute(planPath), 'Use absolute workspace and plan paths');
@@ -121,14 +130,20 @@ function readOwnerships(root) {
     catch { invalid = true; continue; }
     const token = name.slice(6, -5);
     const fields = ['schema', 'token', 'codexChat', 'workspace', 'checkout', 'sessionID', 'assignmentID', 'operation'];
-    const modern = owner?.schema === 2 && ['wait', 'resume-watch'].includes(owner.operation) &&
-      validProcessOwner(owner.process) && /^msg_[a-zA-Z0-9]+$/.test(owner.messageID) && /^[a-f0-9]{64}$/.test(owner.fingerprint);
-    if (!owner || !(owner.schema === 1 || modern) || owner.token !== token || !text(owner.codexChat) ||
+    const modern = owner?.schema === 2 && validProcessOwner(owner.process) && fingerprintPattern.test(owner.fingerprint);
+    const observation = modern && ['wait', 'resume-watch'].includes(owner.operation) && /^msg_[a-zA-Z0-9]+$/.test(owner.messageID);
+    const bind = modern && owner.operation === 'bind' && isAbsolute(owner.planPath) &&
+      text(owner.workspaceID) && text(owner.checkoutID) &&
+      (owner.messageID === null || /^msg_[a-zA-Z0-9]+$/.test(owner.messageID)) &&
+      (owner.nextFingerprint === undefined || fingerprintPattern.test(owner.nextFingerprint));
+    const extra = observation ? ['process', 'messageID', 'fingerprint'] : bind ?
+      ['process', 'messageID', 'fingerprint', 'nextFingerprint', 'planPath', 'workspaceID', 'checkoutID'] : [];
+    if (!owner || !(owner.schema === 1 || observation || bind) || owner.token !== token || !text(owner.codexChat) ||
       !isAbsolute(owner.workspace) || !isAbsolute(owner.checkout) ||
       !(owner.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(owner.sessionID)) ||
       !(owner.assignmentID === null || text(owner.assignmentID)) ||
       !['bind', 'adopt', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(owner.operation) ||
-      Object.keys(owner).some(key => ![...fields, ...(modern ? ['process', 'messageID', 'fingerprint'] : [])].includes(key))) invalid = true;
+      Object.keys(owner).some(key => ![...fields, ...extra].includes(key))) invalid = true;
     else owners.push({ ...owner, path: join(root, name) });
   }
   return { owners, invalid };
@@ -139,8 +154,8 @@ function saveState(path, state) {
   saveJSON(path, state);
 }
 
-function saveJSON(path, value) {
-  const temporary = path + '.' + randomUUID() + '.tmp';
+function saveJSON(path, value, stagingRoot = dirname(path)) {
+  const temporary = join(stagingRoot, basename(path) + '.' + randomUUID() + '.tmp');
   try {
     writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     renameSync(temporary, path);
@@ -272,6 +287,8 @@ async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess
   need(!requireSuccess || current.session.outcome === 'succeeded', 'Acceptance requires confirmed successful execution');
   const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
   const messages = await assignmentMessages(client, binding);
+  if (invocationCheck?.historyFingerprint) need(historyFingerprint(messages) === invocationCheck.historyFingerprint,
+    'Prior delivery history differs from the legacy bind recovery receipt');
   if (verifyPriorPlan) need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
     JSON.stringify(binding.planPath) + '\n'), 'Prior plan was not confirmed in the current OpenCode history');
   const shells = await client.request(shellRoute);
@@ -1093,12 +1110,13 @@ export function startCycle(workspace, planPath, { stateRoot = resolve(homedir(),
 }
 
 export function helper(client, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
-  probeOwner } = {}) {
+  probeOwner, probeBootTime = localWindowsBootTime } = {}) {
   need(text(chatID), 'Actual CODEX_THREAD_ID is required');
   const statePath = join(stateRoot, 'state.json');
   const locked = operation => withStateLock(stateRoot, operation);
 
   const ownershipRoot = join(stateRoot, 'ownership');
+  const ownershipHistory = join(stateRoot, 'ownership-history');
   const stopRoot = join(stateRoot, 'observation-stop');
   let observingProcess;
   function ownerships() {
@@ -1106,7 +1124,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     if (result.invalid) throw ownershipError();
     return result.owners;
   }
-  function claimOwnership(state, ctx, binding, operation) {
+  function claimOwnership(state, ctx, binding, operation, bindProcess) {
     for (const owner of ownerships()) if (overlaps(ctx.checkout, owner.checkout)) throw ownershipError();
     try { mkdirSync(ownershipRoot, { recursive: true, mode: 0o700 }); }
     catch (error) { throw stateFailure(error, 'state-directory'); }
@@ -1116,6 +1134,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     if (['wait', 'resume-watch'].includes(operation)) Object.assign(value,
       { schema: 2, process: observingProcess, messageID: binding.messageID,
         fingerprint: observationFingerprint(binding, planCounter(state, binding).correctionCount) });
+    if (operation === 'bind') Object.assign(value, { schema: 2, process: bindProcess, planPath: ctx.planPath,
+      workspaceID: ctx.workspaceID, checkoutID: ctx.checkoutID, messageID: binding?.messageID ?? null,
+      fingerprint: bindFingerprint(state, binding) });
     let handle;
     try {
       handle = openSync(path, 'wx', 0o600);
@@ -1127,6 +1148,39 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       throw stateFailure(error, 'state-lock');
     }
     return { path, token };
+  }
+  function pinBindSave(lease, state, binding) {
+    const { path, ...owner } = ownerships().find(item => item.token === lease.token) ?? {};
+    const saved = readState(statePath);
+    const fingerprint = bindFingerprint(saved, saved.bindings.find(item => item.codexChat === chatID));
+    need(path === lease.path && owner.operation === 'bind' && owner.schema === 2 && owner.codexChat === chatID &&
+      [owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Bind ownership or saved binding changed');
+    // Record both sides before the state save, so a crash at either side leaves a verifiable pin.
+    try { saveJSON(path, { ...owner, fingerprint, nextFingerprint: bindFingerprint(state, binding) }, stateRoot); }
+    catch (error) { throw stateFailure(error, 'state-write'); }
+  }
+  function archiveOwner(owner, audit) {
+    try {
+      mkdirSync(ownershipHistory, { recursive: true, mode: 0o700 });
+      const path = join(ownershipHistory, owner.token + '.json'), archived = join(ownershipHistory, owner.token + '.lock');
+      if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(audit),
+        'Recovery evidence changed');
+      else writeFileSync(path, JSON.stringify(audit), { flag: 'wx', mode: 0o600 });
+      need(!existsSync(archived), 'Lease archive already exists');
+      renameSync(owner.path, archived);
+    } catch (error) { if (error?.code) throw stateFailure(error, 'state-write'); throw error; }
+  }
+  function legacyBindProof(token, state, binding) {
+    const receipt = JSON.parse(readFileSync(join(ownershipHistory, token + '.json'), 'utf8'));
+    const archived = JSON.parse(readFileSync(join(ownershipHistory, token + '.lock'), 'utf8'));
+    const { path, ...owner } = receipt.owner ?? {};
+    need(receipt.schema === 1 && receipt.kind === 'legacy-bind-recovery' && owner.schema === 1 && owner.token === token &&
+      owner.operation === 'bind' && ['codexChat', 'workspace', 'checkout', 'sessionID', 'assignmentID'].every(key => owner[key] === binding[key]) &&
+      JSON.stringify(owner) === JSON.stringify(archived) && receipt.messageID === binding.messageID &&
+      receipt.fingerprint === bindFingerprint(state, binding) && fingerprintPattern.test(receipt.historyFingerprint) &&
+      receipt.proof?.status === 'dead' && receipt.proof?.reason === 'windows-restarted-after-lease',
+    'Legacy bind recovery receipt does not match this FINISHED delivery');
+    return receipt.historyFingerprint;
   }
   function releaseOwnership(lease) {
     locked(() => {
@@ -1412,9 +1466,99 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       });
     },
     async observationOwner(workspace, planPath, token, { action = 'inspect', nonGitBaseline } = {}) {
-      need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(token) &&
-        ['inspect', 'stop', 'recover'].includes(action), 'Invalid observation owner/action');
+      need(leaseTokenPattern.test(token) &&
+        ['inspect', 'stop', 'recover', 'recover-legacy-bind'].includes(action), 'Invalid ownership action or token');
       const ctx = context(workspace, planPath, nonGitBaseline);
+      const selectedOwner = ownerships().find(value => value.token === token);
+      if (selectedOwner?.operation === 'bind') {
+        const legacy = selectedOwner.schema === 1;
+        function selectBind(state) {
+          const owners = ownerships();
+          const owner = owners.find(item => item.token === token);
+          need(owner?.operation === 'bind' && owner.schema === selectedOwner.schema && owner.codexChat === chatID &&
+            owner.workspace === ctx.workspace && owner.checkout === ctx.checkout, 'Bind lease is missing or belongs to another chat or checkout');
+          need(owners.filter(item => overlaps(ctx.checkout, item.checkout)).length === 1,
+            'Another operation owns this checkout');
+          const binding = state.bindings.find(item => item.codexChat === chatID);
+          const fingerprint = bindFingerprint(state, binding);
+          const counter = binding ? planCounter(state, binding).correctionCount : null;
+          if (legacy) {
+            need(binding?.uncertain !== 'create', 'Session creation is already uncertain; preserve its binding and do not retry');
+            need(binding && ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath'].every(key => binding[key] === ctx[key]) &&
+              owner.sessionID === binding.sessionID && owner.assignmentID === binding.assignmentID,
+            'Legacy bind lease and saved delivery do not match; creation state cannot be verified');
+            const file = statSync(owner.path);
+            return { owner, binding, fingerprint, counter, fileID: `${file.dev}:${file.ino}`,
+              birth: file.birthtimeMs, written: file.mtimeMs };
+          }
+          need(['workspaceID', 'checkoutID', 'planPath'].every(key => owner[key] === ctx[key]) &&
+            [owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Bind lease pins or saved binding changed');
+          return { owner, binding, fingerprint, counter };
+        }
+        const selected = selectBind(readState(statePath)), { owner, binding, counter } = selected;
+        const proof = legacy ? { status: 'unknown', reason: 'legacy-bind-needs-local-reboot-proof' } :
+          owner.process.start ? ownerLiveness(owner.process, probeOwner) : { status: 'unknown', reason: 'process-start-unavailable' };
+        const result = { kind: 'ownership-status', token, operation: 'bind', ownerStatus: proof.status, reason: proof.reason,
+          processID: owner.process?.pid ?? null, recoveryAllowed: !legacy && proof.status === 'dead',
+          sessionID: binding?.sessionID ?? null, messageID: binding?.messageID ?? null, phase: binding?.phase ?? null,
+          correctionCount: counter, uncertain: binding?.uncertain ?? null, taskSent: false, stateChange: 'unchanged' };
+        if (action === 'inspect') return result;
+        if (legacy && action === 'recover-legacy-bind') {
+          need(client, 'OpenCode connection is required to check legacy bind recovery');
+          need(!binding.uncertain, 'Legacy bind creation may be uncertain; no recovery');
+          need(binding.phase === 'FINISHED' && binding.assignmentID && binding.messageID && !binding.pending,
+            'Legacy bind recovery requires the original FINISHED delivery; create may have been reserved');
+          const receipt = join(stateRoot, 'finished-session-replacements', binding.messageID + '.json');
+          need(!existsSync(receipt), 'A replacement receipt exists; create may have been reserved');
+          const boot = probeBootTime(owner.path);
+          need(Number.isFinite(boot) && selected.birth > 0 && selected.written > 0 &&
+            boot > Math.max(selected.birth, selected.written),
+          'Legacy bind owner is unverifiable; a confirmed Windows restart after the lease was written is required');
+          const checkLocal = state => {
+            const current = selectBind(state);
+            need(JSON.stringify(current) === JSON.stringify(selected), 'Legacy bind lease or saved delivery changed');
+            need(!existsSync(receipt), 'A replacement receipt exists; create may have been reserved');
+            need(!readClosure(stateRoot, binding) && !readTransition(stateRoot, binding.messageID),
+              'Another closure or transition already exists');
+            need(!observerPresent(stateRoot), 'An observer is active or uncertain; no legacy bind recovery');
+            checkoutAvailable(state, ctx, current.binding);
+          };
+          checkLocal(readState(statePath));
+          const quiet = async () => {
+            const snapshot = await observationSnapshot(client, binding);
+            need(!snapshot.active && !snapshot.forms.length && !snapshot.permissions.length && snapshot.session.outcome === 'succeeded' &&
+              Number.isFinite(snapshot.session.time?.idle),
+              'Prior session is active, awaiting a reply or missing a successful outcome');
+            const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(ctx.workspace));
+            need(Array.isArray(shells?.data) && shells.data.every(shell =>
+              ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)),
+            'Project shell is running or unknown');
+          };
+          await quiet();
+          const messages = await assignmentMessages(client, binding);
+          need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
+            JSON.stringify(binding.planPath) + '\n'), 'Saved delivery does not confirm the exact plan in OpenCode');
+          const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
+          need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === messages.at(-1).id,
+            'Prior delivery history changed during legacy bind recovery');
+          await quiet();
+          const restart = { status: 'dead', reason: 'windows-restarted-after-lease', boot, birth: selected.birth, written: selected.written };
+          locked(state => {
+            checkLocal(state);
+            archiveOwner(owner, { schema: 1, kind: 'legacy-bind-recovery', owner, proof: restart, counter,
+              messageID: binding.messageID, fingerprint: selected.fingerprint, historyFingerprint: historyFingerprint(messages) });
+          });
+          return { ...result, kind: 'bind-ownership-released', ownerStatus: restart.status, reason: restart.reason,
+            recoveryAllowed: true, leaseArchived: true };
+        }
+        if (legacy || action !== 'recover' || proof.status !== 'dead') return { ...result, kind: 'rejected' };
+        locked(state => {
+          need(JSON.stringify(selectBind(state)) === JSON.stringify(selected), 'Bind ownership or saved binding changed; no recovery');
+          archiveOwner(owner, { schema: 1, owner, proof, counter, messageID: binding?.messageID ?? null });
+        });
+        return { ...result, kind: 'bind-ownership-released', leaseArchived: true };
+      }
+      need(action !== 'recover-legacy-bind', 'Only an exact legacy bind lease can use recover-legacy-bind');
       function selection(state) {
         const binding = state.bindings.find(value => value.codexChat === chatID);
         need(binding && ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath'].every(key =>
@@ -1449,16 +1593,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const path = join(stopRoot, token);
           if (existsSync(path)) need(readFileSync(path, 'utf8') === token, 'Observation stop marker changed');
           else writeFileSync(path, token, { flag: 'wx', mode: 0o600 });
-        } else {
-          const history = join(stateRoot, 'ownership-history');
-          mkdirSync(history, { recursive: true, mode: 0o700 });
-          const path = join(history, token + '.json');
-          const audit = { schema: 1, owner, proof, counter, messageID: binding.messageID };
-          if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(audit), 'Recovery evidence changed');
-          else writeFileSync(path, JSON.stringify(audit), { flag: 'wx', mode: 0o600 });
-          need(!existsSync(join(history, token + '.lock')), 'Lease archive already exists');
-          renameSync(owner.path, join(history, token + '.lock'));
-        }
+        } else archiveOwner(owner, { schema: 1, owner, proof, counter, messageID: binding.messageID });
         } catch (error) { if (error?.code) throw stateFailure(error, 'state-write'); throw error; }
       });
       if (action === 'recover') return { ...result, kind: 'observation-released', leaseArchived: true };
@@ -1969,22 +2104,26 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       if (replacement) need(/^ses_[a-zA-Z0-9]+$/.test(replacement.sessionID) && /^msg_[a-zA-Z0-9]+$/.test(replacement.messageID) &&
         Array.isArray(replacement.lostCalls) && replacement.lostCalls.length > 0 && replacement.lostCalls.length <= 32 &&
         replacement.lostCalls.every(id => /^call_[a-zA-Z0-9_]{1,120}$/.test(id)) &&
-        new Set(replacement.lostCalls).size === replacement.lostCalls.length, 'Use exact prior session, delivery and PowerShell call IDs');
+        new Set(replacement.lostCalls).size === replacement.lostCalls.length &&
+        (replacement.recoveredBind === undefined || leaseTokenPattern.test(replacement.recoveredBind)),
+      'Use exact prior session, delivery, PowerShell call IDs and legacy bind token');
       need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20,
         'Invalid imported correction count');
+      const bindProcess = processOwner();
       const start = locked(state => {
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         planCounter(state, ctx, importedCount);
         if (replacement) {
           need(existing?.phase === 'FINISHED' && existing.assignmentID && existing.sessionID === replacement.sessionID &&
             existing.messageID === replacement.messageID, 'Only the exact FINISHED delivery in this chat can be replaced');
-          savedContext(existing, ctx);
+          const verifiedHistory = replacement.recoveredBind && legacyBindProof(replacement.recoveredBind, state, existing);
+          savedContext(verifiedHistory ? { ...existing, engineID: client.engineID } : existing, ctx);
           need(!readClosure(stateRoot, existing) && !readTransition(stateRoot, existing.messageID), 'Another closure or transition already exists');
           need(!observerPresent(stateRoot), 'An observer is active or uncertain; no replacement');
           checkoutAvailable(state, ctx, existing);
-          return { ctx, state: structuredClone(state), source: structuredClone(existing),
+          return { ctx, state: structuredClone(state), source: structuredClone(existing), verifiedHistory,
             correctionCount: planCounter(state, existing).correctionCount,
-            lease: claimOwnership(state, ctx, existing, 'bind') };
+            lease: claimOwnership(state, ctx, existing, 'bind', bindProcess) };
         }
         if (existing) {
           if (existing.planPath !== ctx.planPath) {
@@ -1993,16 +2132,16 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             checkoutAvailable(state, ctx, existing);
             return { ctx, state: structuredClone(state), expected: { ...structuredClone(existing),
               correctionCount: state.plans.find(plan => plan.planPath === existing.planPath).correctionCount },
-              lease: claimOwnership(state, ctx, existing, 'bind'), planSwitch: true };
+              lease: claimOwnership(state, ctx, existing, 'bind', bindProcess), planSwitch: true };
           }
           savedContext(existing, ctx);
           checkoutAvailable(state, ctx, existing);
           return { ctx, state: structuredClone(state), expected: { ...structuredClone(existing),
             correctionCount: planCounter(state, ctx).correctionCount },
-            lease: claimOwnership(state, ctx, existing, 'bind'), planSwitch: false };
+            lease: claimOwnership(state, ctx, existing, 'bind', bindProcess), planSwitch: false };
         }
         checkoutAvailable(state, ctx);
-        return { ctx, state: structuredClone(state), lease: claimOwnership(state, ctx, null, 'bind'), planSwitch: false };
+        return { ctx, state: structuredClone(state), lease: claimOwnership(state, ctx, null, 'bind', bindProcess), planSwitch: false };
       });
       return withOwnership(start.lease, async () => {
         if (start.expected && !start.planSwitch) {
@@ -2025,6 +2164,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               planCounter(state, ctx, importedCount);
               binding.planPath = ctx.planPath; binding.phase = 'PREPARING';
               for (const key of ['assignmentID', 'messageID', 'submittedAt', 'nextAssignment']) delete binding[key];
+              pinBindSave(start.lease, state, binding);
               return summary(state, binding, 'reused-plan');
             }).result;
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
@@ -2032,7 +2172,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         let archive;
         if (start.source) {
           const gaps = [], lostCalls = new Set(replacement.lostCalls);
-          const boundary = await checkedClosureBoundary(client, stateRoot, start.source, true, false, { gaps, lostCalls });
+          const boundary = await checkedClosureBoundary(client, stateRoot, start.source, true, !!start.verifiedHistory,
+            { gaps, lostCalls, historyFingerprint: start.verifiedHistory });
           need(gaps.length === lostCalls.size && new Set(gaps.map(call => call.id)).size === lostCalls.size,
             'The listed PowerShell calls do not match the lost evidence; no replacement');
           archive = { schema: 1, source: start.source, correctionCount: start.correctionCount, boundary,
@@ -2060,6 +2201,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               else saveJSON(path, archive);
               state.bindings[state.bindings.indexOf(current)] = binding;
             } else state.bindings.push(binding);
+            pinBindSave(start.lease, state, binding);
             reservationExpected = { ...structuredClone(binding), correctionCount: plan.correctionCount };
             reservationAttempted = true;
             saveState(statePath, state);
@@ -2087,6 +2229,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           expected = commit(expected, (state, binding) => {
             binding.sessionID = response.data.id;
+            pinBindSave(start.lease, state, binding);
             return summary(state, binding, 'create-pending');
           }).expected;
         } catch (error) {
@@ -2111,6 +2254,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           return commit(expected, (state, binding) => {
             delete binding.uncertain; binding.phase = 'PREPARING';
+            pinBindSave(start.lease, state, binding);
             return archive ? { ...summary(state, binding, 'finished-session-replaced'), taskSent: false,
               previous: { phase: 'FINISHED', sessionID: start.source.sessionID, messageID: start.source.messageID,
                 correctionCount: start.correctionCount, reason: archive.reason } } : summary(state, binding, 'created');
