@@ -152,16 +152,20 @@ selection starts the next cycle at zero; do not silently continue or send a 21st
 correction in the old cycle. Do not substitute the
 ordinary two-failure correction threshold or weaken scope/acceptance criteria.
 
-For a next accepted connected block: checkpoint the acceptance and remaining
-gates, call next ... block, then submit --kind block with a fresh assignment ID.
-For releasing this confirmed-ended assignment: checkpoint its actual acceptance
-or explicit handoff, then finish <workspace> <plan>. FINISHED releases only this
-adapter assignment, not the whole MD plan. Missing gates keep the plan ACTIVE
-(or BLOCKED with a reason), never DONE. finish sends no engine prompt.
+For the next authorized block or plan, checkpoint the actual result and run
+preflight for the destination plan in the chat that will continue. When preflight
+offers `transition`, use the reported prior message ID and the recorded disposition.
+Use `accepted` only after review confirms acceptance. If the user explicitly leaves
+the prior work without acceptance, record `blocked` for a BLOCKED result or
+`without-acceptance` otherwise. Starting another task alone does not decide review.
+When preflight reports a blocker, keep the old owner and resolve that fact before dispatch.
 
-A later plan in the same physical workspace reuses the pair: finish the previous
-assignment, update the canonical files, then bind the new plan. Counts for both
-plans remain; other workspaces/checkouts are not silently substituted.
+`transition` prepares the authorized block or plan in the same physical workspace
+from either chat, with the existing OpenCode session. Repeat preflight, then submit
+separately with a fresh ID and the prepared kind. A new plan starts with `initial`.
+The previous plan's history, status and correction count are preserved. No manual
+`finish` or counter reset is part of this route. Use `finish` for a standalone
+release after review when there is no next Code Duet assignment to prepare.
 
 ## Handoff to or from the ordinary route
 

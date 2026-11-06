@@ -28,22 +28,28 @@ Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
 pair, bind a new OpenCode session in the selected workspace unless the user
 explicitly selected an existing recipient; only then read
 [existing-session routing](references/existing-session.md). Late entry in an
-already-used Codex chat is supported. The user creates fresh Codex chats
-manually; never spoof identity or rotate chats.
+already-used Codex chat is supported. When the user asks for a new chat, use the
+host's chat creation feature if available and pass the authorized task and checkpoint.
+Otherwise continue in the requested chat once it exists. Use its real identity.
 Before the ordinary helper route, run [read-only preflight](helper/PROTOCOL.md#preflight)
 for the selected workspace and plan. It uses the current chat's saved pair, or
 proposes a new bind; pass --session only when the user explicitly selected that
 exact existing recipient. A preflight snapshot does not grant dispatch authority;
-adopt and submit repeat their own fresh checks. Use inspect for diagnosis when no
+adopt and submit repeat their own fresh checks. If preflight returns a
+[transition](helper/PROTOCOL.md#transition), handle it from the destination chat
+as part of the authorized next assignment. Preserve the previous checkpoint and
+count. Acceptance requires review; `blocked` or `without-acceptance` requires
+the user's explicit decision to leave the previous work unaccepted. Use inspect for diagnosis when no
 plan is ready or after an error; do not require it in addition to a complete preflight.
 Before that preflight, run `node helper/cli.mjs task-maintenance <absolute-workspace>
 <absolute-plan.md>` to update this task's activity and perform local lifecycle
 maintenance. This sends no OpenCode request. It restores a requested archived
 counter before preflight, and skips active or uncertain ownership.
-For a new explicit user selection of Code Duet, after maintenance and before
-preflight run `node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>`.
+For a new explicit user selection of Code Duet, after maintenance run
+`node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>` if this is a
+new correction cycle. Use preflight first when continuing an existing assignment or changing plans.
 It starts this selection's correction count at zero and saves the previous count.
-Never run it for an observer wake, automatic continuation, or an active/uncertain
+Never run it as part of a transition, for an observer wake, automatic continuation, or an active/uncertain
 assignment. If it refuses, preserve the owner and resolve that task first.
 
 Use only opencode-go/deepseek-v4.1-flash with existing/default options. Never

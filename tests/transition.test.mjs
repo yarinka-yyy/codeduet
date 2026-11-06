@@ -1,0 +1,128 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fixture, baseline } from './http-fixture.mjs';
+
+const oldChat = 'offline-http-chat-A', newChat = 'offline-http-chat-B';
+const baselineArgs = ['--non-git-baseline', baseline];
+
+async function artex(t, scenario = 'ended') {
+  const f = await fixture(t, undefined, '2.2.5');
+  const target = join(dirname(f.plan), '002-windows-native.md');
+  writeFileSync(f.plan, baseline + '\n\nB1a: BLOCKED. Linux acceptance discontinued.\n');
+  writeFileSync(target, baseline + '\n\nWindows stage 1: TODO.\n');
+  assert.equal((await f.call(f.bindArgs(5))).status, 0);
+  const sessionID = f.state().bindings[0].sessionID;
+  if (scenario === 'uncertain') f.fault = 'drop';
+  const old = await f.call(['submit', f.workspace, f.plan, 'B1a-tool-output-fix-01', f.packet,
+    '--kind', 'correction', ...baselineArgs]);
+  assert.equal(old.status, scenario === 'uncertain' ? 1 : 0, JSON.stringify(old));
+  f.fault = null;
+  if (!['uncertain', 'active'].includes(scenario)) {
+    f.finish(sessionID);
+    f.messages.get(sessionID).at(-2).content[0].text = 'BLOCKED: Linux acceptance is unavailable.';
+    const waited = await f.call(['wait', f.workspace, f.plan, '--timeout-ms', '3000', ...baselineArgs]);
+    assert.equal(waited.result.phase, 'REVIEWING', JSON.stringify(waited));
+  }
+  const source = f.state().bindings[0];
+  return Object.assign(f, { source, target, sessionID,
+    preflight: ['preflight', f.workspace, target, ...baselineArgs],
+    transition: ['transition', f.workspace, target, source.messageID, 'blocked', ...baselineArgs],
+    submit: ['submit', f.workspace, target, 'windows-stage-1', f.packet, ...baselineArgs],
+    prompt: `/api/session/${sessionID}/prompt` });
+}
+
+for (const chat of [oldChat, newChat]) {
+  test(`ARTEX: advance from BLOCKED to the Windows plan from ${chat}`, async t => {
+    const f = await artex(t), before = readFileSync(f.statePath), oldPlan = readFileSync(f.plan);
+    const history = structuredClone(f.messages.get(f.sessionID)), callCount = f.calls.length;
+    const report = (await f.call(f.preflight, chat)).result;
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.transition.status, 'ready', JSON.stringify(report));
+    assert.equal(report.transition.messageID, f.source.messageID);
+    assert.deepEqual(readFileSync(f.statePath), before);
+    const args = [report.transition.command, ...report.transition.args, 'blocked', ...report.transition.options];
+    const prepared = await f.call(args, chat);
+    assert.equal(prepared.status, 0, JSON.stringify(prepared));
+    assert.equal(prepared.result.previous.disposition, 'blocked');
+    assert.equal(prepared.result.previous.correctionCount, 6);
+    assert.deepEqual((await f.call(args, chat)).result, prepared.result);
+    assert.ok(f.calls.slice(callCount).every(call => call.method === 'GET'));
+    assert.deepEqual(f.messages.get(f.sessionID), history);
+    assert.deepEqual(readFileSync(f.plan), oldPlan);
+    const receipt = JSON.parse(readFileSync(join(dirname(f.statePath), 'assignment-transitions', f.source.messageID + '.json')));
+    assert.deepEqual(receipt.source, f.source);
+    assert.deepEqual(f.state().bindings.map(item => [item.codexChat, item.planPath]), [[chat, f.target]]);
+    const ready = await f.call(f.preflight, chat);
+    assert.equal(ready.status, 0, JSON.stringify(ready));
+    assert.equal(ready.result.correctionCount.effective, 0);
+    assert.equal((await f.call([ready.result.nextCommand.command, ...ready.result.nextCommand.args], chat)).status, 0);
+    assert.equal((await f.call(f.submit, chat)).result.kind, 'admitted');
+    assert.equal((await f.call(f.submit, chat)).status, 1);
+    assert.deepEqual((await f.call(args, chat)).result, prepared.result);
+    assert.equal(f.posts(f.prompt), 2);
+    assert.equal(f.posts('/api/session'), 1);
+    assert.deepEqual(f.state().plans.map(plan => plan.correctionCount), [6, 0]);
+  });
+}
+
+for (const scenario of ['active', 'uncertain', 'pending question', 'no terminal idle']) {
+  test(`ARTEX: ${scenario} keeps the original owner and prevents new execution`, async t => {
+    const f = await artex(t, scenario);
+    if (scenario === 'pending question') f.forms = [{ sessionID: f.sessionID, id: 'frm_pending' }];
+    if (scenario === 'no terminal idle') f.messages.get(f.sessionID).pop();
+    const before = readFileSync(f.statePath), callCount = f.calls.length;
+    const report = await f.call(f.preflight, newChat);
+    assert.equal(report.result.transition.status, 'blocked', JSON.stringify(report));
+    assert.match(report.result.transition.reason, /active|awaiting|uncertain|terminal idle/i);
+    assert.equal((await f.call(f.transition, newChat)).status, 1);
+    assert.equal((await f.call(['bind', f.workspace, f.target, ...baselineArgs], newChat)).status, 1);
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.ok(f.calls.slice(callCount).every(call => call.method === 'GET'));
+  });
+}
+
+test('competing transitions and concurrent submits have one winner', async t => {
+  const f = await artex(t);
+  const outcomes = await Promise.all([f.call(f.transition, oldChat), f.call(f.transition, newChat)]);
+  assert.deepEqual(outcomes.map(item => item.status).sort(), [0, 1], JSON.stringify(outcomes));
+  const winner = f.state().bindings[0].codexChat, loser = winner === oldChat ? newChat : oldChat;
+  assert.equal((await f.call(['bind', f.workspace, f.target, ...baselineArgs], loser)).status, 1);
+  assert.equal((await f.call(f.transition, loser)).status, 1);
+  const sends = await Promise.all([f.call(f.submit, winner), f.call(f.submit, winner), f.call(f.submit, loser)]);
+  assert.equal(sends.filter(item => item.result.kind === 'admitted').length, 1, JSON.stringify(sends));
+  assert.equal(f.posts(f.prompt), 2);
+  assert.equal(f.state().bindings.length, 1);
+});
+
+test('same-plan continuation requires a disposition and keeps the correction count until submit', async t => {
+  const f = await artex(t);
+  const args = ['transition', f.workspace, f.plan, f.source.messageID];
+  assert.equal((await f.call([...args, ...baselineArgs])).status, 1);
+  const prepared = await f.call([...args, 'without-acceptance', '--kind', 'correction', ...baselineArgs]);
+  assert.equal(prepared.status, 0, JSON.stringify(prepared));
+  assert.equal(f.state().plans[0].correctionCount, 6);
+  assert.equal((await f.call(['submit', f.workspace, f.plan, 'B1a-follow-up', f.packet, '--kind', 'correction',
+    ...baselineArgs])).result.kind, 'admitted');
+  assert.equal(f.state().plans[0].correctionCount, 7);
+});
+
+test('a changed OpenCode registration needs the exact prior plan and delivered history', async t => {
+  const f = await artex(t);
+  const previous = f.state();
+  previous.bindings[0].engineID = 'previous-opencode-instance';
+  writeFileSync(f.statePath, JSON.stringify(previous));
+  const records = f.messages.get(f.sessionID), text = records[0].text;
+  records[0].text = `Assignment ID: ${f.source.assignmentID}\nCanonical plan: "other"\n`;
+  const rejected = await f.call(f.transition, newChat);
+  assert.match(rejected.result.error, /Prior plan was not confirmed/);
+  assert.deepEqual(f.state(), previous);
+  records[0].text = text;
+  const prepared = await f.call(f.transition, newChat);
+  assert.equal(prepared.status, 0, JSON.stringify(prepared));
+  assert.equal(prepared.result.engineChanged, true);
+  assert.equal(f.state().bindings[0].engineID, f.source.engineID);
+  assert.equal((await f.call(f.submit, newChat)).result.kind, 'admitted');
+  assert.equal(f.posts(f.prompt), 2);
+});

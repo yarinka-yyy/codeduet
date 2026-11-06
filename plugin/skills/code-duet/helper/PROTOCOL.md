@@ -32,6 +32,7 @@ node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-i
 node helper/cli.mjs next <absolute-workspace> <absolute-plan.md> <block|correction>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assignment-id> <absolute-packet-file> --kind <block|correction>
 node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
+node helper/cli.mjs transition <absolute-workspace> <target-plan.md> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]
 node helper/cli.mjs retire-legacy <absolute-workspace> <old-plan.md> <lease-token>
 node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
@@ -609,6 +610,32 @@ The binding becomes `PREPARING` for `correction` on the same session. Run
 preflight and submit the separately authorized packet with a fresh ID and
 `--kind correction`. No `next`, rebind or counter reset is needed. Submit
 rechecks the closed history boundary, then reserves the ordinary correction.
+
+## transition
+
+For authorized next work in the same physical workspace, run preflight in the
+destination Codex chat. A `transition` report identifies the prior delivery and
+count. When `ready`, add the actual review disposition to its `args` and append
+its `options`. The report uses GETs and leaves ownership unchanged. `accepted`
+requires advisor review. `blocked` preserves a BLOCKED result when the user
+explicitly ends work without acceptance. Use `without-acceptance` for another
+explicit waiver. The helper neither edits plans nor confers acceptance.
+
+`transition` rechecks the exact saved delivery, engine and physical workspace,
+terminal history, forms, permissions, tools and shells under the checkout lease.
+It refuses active execution, pending input, uncertain delivery and conflicting
+ownership. A changed engine registration requires the current validated server to
+prove the same session, message, assignment and canonical plan in its history.
+It archives the source binding, disposition and correction count in
+`assignment-transitions/<prior-message-id>.json` before preparing the destination
+binding on the existing OpenCode session. Neither count changes. The same request
+returns its recorded result, and a competing destination is refused. A staged
+transition requires repeating the same command after resolving the reported error.
+
+Rerun preflight and send the separately authorized packet with a fresh assignment
+ID. For a new plan use `initial`. For the same plan use `block` by default or
+select `--kind correction` at transition and submit. Submit rechecks the pinned
+history and uses the existing single-delivery guard and correction reservation.
 
 ## Deliberate boundaries
 

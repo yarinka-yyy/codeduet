@@ -10,15 +10,18 @@ try {
   const [command, workspace, plan, assignment, packet] = args;
   const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
+  const transitionUsage = 'transition <workspace> <target-plan> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]';
   if (command === 'task-maintenance' && args.length !== 3) throw new Error('Usage: cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>');
   if (command === 'start-cycle' && args.length !== 3) throw new Error('Usage: cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>');
   if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (command === 'close-assignment' && args.length !== 5) throw new Error('Usage: cli.mjs ' + closeUsage);
-  if (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment'].includes(command) ||
-    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3, 'close-assignment': 5 })[command])) {
+  if (command === 'transition' && (args.length !== 5 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
+    !['accepted', 'blocked', 'without-acceptance'].includes(packet))) throw new Error('Usage: cli.mjs ' + transitionUsage);
+  if (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment', 'transition'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3, 'close-assignment': 5, transition: 5 })[command])) {
     throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>] | retire-legacy <workspace> <old-plan> <lease-token>; paths must be absolute');
   }
-  if (values.kind !== undefined && command !== 'submit' || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Assignment kind belongs to submit; correction-count to bind/adopt/preflight; session to preflight/resume-watch/close-assignment; cursor to sessions');
+  if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Assignment kind belongs to submit/transition; correction-count to bind/adopt/preflight; session to preflight/resume-watch/close-assignment; cursor to sessions');
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
     !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
@@ -57,7 +60,7 @@ try {
     { action: values.action, nonGitBaseline: values['non-git-baseline'] });
   try { if (!['ownership', 'task-maintenance', 'start-cycle'].includes(command)) client = await connect(); }
   catch (error) {
-    if (['inspect', 'preflight', 'close-assignment'].includes(command)) connectionError = error;
+    if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
     else {
       try { if (!['sessions', 'retire-legacy'].includes(command)) result = await helper(null).connectionLost(error); }
       catch (stateError) {
@@ -82,6 +85,8 @@ try {
     else if (command === 'submit') result = await adapter.submit(workspace, plan, assignment, packet, baseline, values.kind ?? 'initial');
     else if (command === 'next') result = await adapter.next(workspace, plan, assignment, baseline);
     else if (command === 'finish') result = await adapter.finish(workspace, plan, baseline);
+    else if (command === 'transition') result = await adapter.transition(workspace, plan, assignment, packet,
+      { kind: values.kind, nonGitBaseline: baseline, connectionError });
     else if (command === 'close-assignment') result = await adapter.closeAssignment(workspace, plan,
       { sessionID: values.session, assignmentID: assignment, messageID: packet }, connectionError);
     else if (['wait', 'resume-watch'].includes(command)) {
@@ -101,7 +106,7 @@ try {
   else console.log(JSON.stringify(result));
   if (command === 'ownership') {
     if (['rejected', 'observation-stop-pending'].includes(result.kind)) process.exitCode = 1;
-  } else if (result.phase === 'STOPPED' || command === 'close-assignment' && result.ownershipReleaseFailure ||
+  } else if (result.phase === 'STOPPED' || ['close-assignment', 'transition'].includes(command) && result.ownershipReleaseFailure ||
     ['stopped', 'connection-unavailable', 'correction-limit', 'rejected'].includes(result.kind) ||
     result.kind === 'preflight' && result.status !== 'pass') process.exitCode = 1;
 } catch (error) {

@@ -294,7 +294,8 @@ test('old STOPPED binding remains unchanged and blocks a new preflight route', a
   const result = await f.call(preflightArgs(f));
   assert.equal(result.status, 1); assert.equal(result.result.status, 'blocked');
   assert.ok(result.result.checks.some(item => item.name === 'saved-phase' && item.status === 'blocked'));
-  assert.match(result.result.nextStep, /Resolve the listed blockers/);
+  assert.equal(result.result.transition.status, 'blocked');
+  assert.match(result.result.nextStep, /No confirmed delivered assignment/);
   assert.deepEqual(readFileSync(f.statePath), before);
   assert.equal(f.calls.filter(call => call.method === 'POST').length, posts);
   assert.equal(bound.result.sessionID, state.bindings[0].sessionID);

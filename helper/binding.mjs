@@ -171,6 +171,35 @@ function sameBoundary(a, b) {
   return ['lastMessageID', 'idleAt', 'variant'].every(key => a[key] === b[key]);
 }
 
+const transitionPath = (root, messageID) => join(root, 'assignment-transitions', messageID + '.json');
+function readTransition(root, messageID) {
+  if (!/^msg_[a-zA-Z0-9]+$/.test(messageID ?? '')) return null;
+  const path = transitionPath(root, messageID);
+  if (!existsSync(path)) return null;
+  const receipt = JSON.parse(readFileSync(path, 'utf8'));
+  need(receipt?.schema === 1 && receipt.source?.messageID === messageID && text(receipt.chatID) && text(receipt.engineID) &&
+    typeof receipt.planPath === 'string' && isAbsolute(receipt.planPath) &&
+    ['initial', 'block', 'correction'].includes(receipt.kind) &&
+    ['accepted', 'blocked', 'without-acceptance'].includes(receipt.disposition) &&
+    typeof receipt.boundary?.lastMessageID === 'string' && Number.isSafeInteger(receipt.boundary.idleAt) &&
+    (receipt.boundary.variant === null || text(receipt.boundary.variant) && receipt.boundary.variant.length <= 80),
+  'Invalid assignment transition receipt');
+  validateState({ schema: 1, bindings: [receipt.source], plans: [{ workspace: receipt.source.workspace,
+    planPath: receipt.source.planPath, correctionCount: receipt.correctionCount }] });
+  return receipt;
+}
+
+function preparedTransition(root, binding) {
+  if (binding.phase !== 'PREPARING') return null;
+  const receipt = readTransition(root, binding.messageID);
+  return receipt && receipt.chatID === binding.codexChat && receipt.planPath === binding.planPath && receipt.engineID === binding.engineID &&
+    ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'sessionID', 'assignmentID', 'submittedAt']
+      .every(key => receipt.source[key] === binding[key]) ? receipt : null;
+}
+
+const blocksCheckout = (root, binding) => binding.uncertain ||
+  !['PREPARING', 'FINISHED'].includes(binding.phase) || !!preparedTransition(root, binding);
+
 async function matchingSession(client, binding) {
   const response = await client.request('/api/session/' + binding.sessionID);
   const session = response?.data;
@@ -199,6 +228,36 @@ export async function observationSnapshot(client, binding) {
     need(text(other?.data?.location?.directory) && !overlaps(binding.checkout, realpathSync(other.data.location.directory)), 'Another executor in this checkout; no ownership transfer');
   }
   return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
+}
+
+async function checkedClosureBoundary(client, binding, requireSuccess = false, verifyPriorPlan = false) {
+  const quiet = current => !current.active && !current.forms.length && !current.permissions.length;
+  const current = await observationSnapshot(client, binding);
+  need(quiet(current), 'Session is active or awaiting a reply; no closure or dispatch');
+  need(!requireSuccess || current.session.outcome === 'succeeded', 'Acceptance requires confirmed successful execution');
+  const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
+  const messages = await assignmentMessages(client, binding);
+  if (verifyPriorPlan) need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
+    JSON.stringify(binding.planPath) + '\n'), 'Prior plan was not confirmed in the current OpenCode history');
+  const boundary = closureBoundary(binding, messages, current.session, await client.request(shellRoute));
+  const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
+  need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
+    'History changed during closure verification');
+  const confirmed = await observationSnapshot(client, binding);
+  need(quiet(confirmed) && confirmed.session.outcome === current.session.outcome &&
+    JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
+    JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model), 'Session changed during closure verification');
+  return boundary;
+}
+
+function checkTransitionSource(binding, ctx) {
+  need(!binding.uncertain, 'Prior assignment mutation is uncertain; keep its owner');
+  need(!binding.pending && binding.phase !== 'WAITING_FOR_ANSWER', 'Prior assignment is awaiting a reply; keep its owner');
+  need(['EXECUTING', 'REVIEWING', 'STOPPED', 'FINISHED'].includes(binding.phase) && binding.sessionID &&
+    binding.assignmentID && !binding.nextAssignment, 'No confirmed delivered assignment to transition');
+  const source = observationContext(ctx.workspace, binding.planPath);
+  need(['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key => source[key] === ctx[key] && source[key] === binding[key]) &&
+    source.planPath === binding.planPath, 'Prior assignment workspace/plan identity changed');
 }
 
 // Explicit paged discovery, independent of binding and without a store/lock.
@@ -267,7 +326,7 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
       if (binding.uncertain) result.blockers.push('Prior mutation uncertain; no retry');
       if (plan.correctionCount >= 20) result.blockers.push('Twenty corrections exhausted; select Code Duet again to start a new cycle');
       if (state.bindings.some(other => other !== binding && overlaps(binding.checkout, other.checkout) &&
-        (!['PREPARING', 'FINISHED'].includes(other.phase) || other.uncertain))) result.blockers.push('Another helper owns this checkout');
+        blocksCheckout(stateRoot, other))) result.blockers.push('Another helper owns this checkout');
       if (client && binding.sessionID) {
         need(binding.engineID === client.engineID, 'Engine changed; saved session is unverified');
         need(realpathSync(binding.planPath) === binding.planPath && statSync(binding.planPath).isFile() &&
@@ -502,7 +561,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   if (state && ctx) {
     const conflicts = state.bindings.filter(item => item !== savedBinding &&
       (overlaps(ctx.checkout, item.checkout) || ctx.checkoutID === item.checkoutID) &&
-      (!['PREPARING', 'FINISHED'].includes(item.phase) || item.uncertain));
+      blocksCheckout(stateRoot, item));
     add('saved-writers', conflicts.length ? 'blocked' : 'pass', conflicts.length ?
       'Another helper binding owns this checkout' : 'No active saved helper binding overlaps this checkout');
     if (selectedSessionID && state.bindings.some(item => item !== savedBinding && item.sessionID === selectedSessionID)) {
@@ -609,8 +668,9 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
           const messages = historyResult.value;
           need(Array.isArray(messages), 'Unknown candidate history');
           if (candidateBinding?.assignmentID) {
-            const closed = candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
-              readClosure(stateRoot, candidateBinding);
+            const closed = preparedTransition(stateRoot, candidateBinding) ??
+              (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
+                readClosure(stateRoot, candidateBinding));
             if (closed) need(sameBoundary(closed.boundary, closureBoundary(candidateBinding, messages, liveSession, shells)),
               'History changed since closure; no dispatch');
             else {
@@ -696,6 +756,29 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   const nonGitArgs = !isGit && text(nonGitBaseline) ? ['--non-git-baseline', nonGitBaseline] : [];
   const permanentRequest = checks.find(item => item.diagnostic?.category === 'request-http' &&
     item.diagnostic.httpStatus >= 400 && item.diagnostic.httpStatus < 500);
+  let transition;
+  if (client && state && ctx && hasChatID && !explicitSession && blockers.length) {
+    const priorOwners = state.bindings.filter(item =>
+      (overlaps(ctx.checkout, item.checkout) || ctx.checkoutID === item.checkoutID) && blocksCheckout(stateRoot, item));
+    if (priorOwners.length === 1 && (!savedBinding || savedBinding === priorOwners[0])) {
+      const prior = priorOwners[0];
+      const evidence = { planPath: prior.planPath, phase: prior.phase, sessionID: prior.sessionID,
+        assignmentID: prior.assignmentID ?? null, messageID: prior.messageID ?? null,
+        correctionCount: state.plans.find(item => item.planPath === prior.planPath).correctionCount };
+      try {
+        checkTransitionSource(prior, ctx);
+        need(checks.some(item => item.name === 'ownership' && item.status === 'pass'), 'Checkout lease is active or unknown');
+        need(!readClosure(stateRoot, prior), 'Prior closure is staged; resolve it before a transition');
+        const engineChanged = prior.engineID !== client.engineID;
+        await checkedClosureBoundary(client, { ...prior, adoption: undefined }, false, engineChanged);
+        transition = { ...evidence, status: 'ready', command: 'transition', args: [workspacePath, planRealPath, prior.messageID],
+          engineChanged, options: nonGitArgs, dispositions: [...(['REVIEWING', 'FINISHED'].includes(prior.phase) ? ['accepted'] : []),
+            'blocked', 'without-acceptance'] };
+      } catch (error) {
+        transition = { ...evidence, status: 'blocked', reason: errorReason(error) };
+      }
+    }
+  }
   let nextStep, nextCommand = null;
   if (!connected && connectionDiagnostic?.category === 'engine-version') nextStep =
     'OpenCode version mismatch: expected ' + connectionDiagnostic.expectedVersions.join(' or ') + ', observed ' +
@@ -710,6 +793,9 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       ' with HTTP ' + diagnostic.httpStatus + (diagnostic.errorCode ? ' (' + diagnostic.errorCode + ')' : '') +
       '. Do not retry the unchanged request. Check and correct this API request/cursor before rerunning preflight; no task was sent.';
   }
+  else if (transition?.status === 'ready') nextStep =
+    'Resolve the prior review or record the owner’s explicit decision to leave it without acceptance. For authorized next work run transition with that disposition, then rerun preflight.';
+  else if (transition?.status === 'blocked') nextStep = transition.reason;
   else if (blockers.length) nextStep = 'Resolve the listed blockers and rerun preflight; this call sent no task.';
   else if (status === 'unknown') nextStep = !connected ? 'Restore the OpenCode connection and rerun preflight.' :
     !hasChatID ? 'Run from the real Codex chat with its actual CODEX_THREAD_ID, then rerun preflight.' :
@@ -750,6 +836,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     recipient: { selected: !!selectedSessionID, sessionID: selectedSessionID ?? null,
       source: explicitSession ? 'explicit' : savedBinding ? 'saved-pair' : 'none' },
     checks, blockers: [...new Set(blockers)], unknowns: [...new Set(unknowns)], legacyCandidates,
+    ...(transition ? { transition } : {}),
     nextStep, nextCommand, taskSent: false, snapshotOnly: true, stateChange: 'unchanged',
     storeWriteAccess: 'unknown until an authorized write command; request normal host approval if the store is outside writable roots',
   };
@@ -1076,7 +1163,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   function checkoutAvailable(state, ctx, own) {
     for (const other of state.bindings) {
       if (other !== own && (overlaps(ctx.checkout, other.checkout) || ctx.checkoutID === other.checkoutID)) {
-        need(['PREPARING', 'FINISHED'].includes(other.phase) && !other.uncertain,
+        need(!blocksCheckout(stateRoot, other),
           'Prior helper assignment not reviewed/stopped; no new writer');
       }
     }
@@ -1090,6 +1177,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required',
         executorStopped: false, retried: false, stateChange: 'unchanged' } };
       savedContext(binding, ctx, operation === 'resume-watch');
+      need(!readTransition(stateRoot, binding.messageID), 'Transition was staged; repeat the exact transition command');
       if (operation === 'resume-watch') need(!readClosure(stateRoot, binding), 'Closure was staged; repeat the exact close-assignment command');
       if (!binding.assignmentID || !allowedPhases.includes(binding.phase)) {
         const kind = operation === 'reply' && binding.assignmentID && binding.phase === 'EXECUTING' ? 'stale-request' : 'rejected';
@@ -1181,22 +1269,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
     return { lastMessageID: history.idle.id, idleAt: current.session.time.idle };
-  }
-  async function checkedClosureBoundary(binding) {
-    const quiet = current => !current.active && !current.forms.length && !current.permissions.length;
-    const current = await snapshot(binding);
-    need(quiet(current), 'Session is active or awaiting a reply; no closure or dispatch');
-    const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
-    const messages = await assignmentMessages(client, binding);
-    const boundary = closureBoundary(binding, messages, current.session, await client.request(shellRoute));
-    const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
-    need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
-      'History changed during closure verification');
-    const confirmed = await snapshot(binding);
-    need(quiet(confirmed) && confirmed.session.outcome === current.session.outcome &&
-      JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
-      JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model), 'Session changed during closure verification');
-    return boundary;
   }
   async function idleExisting(state, binding) {
     await idleWorkspace(state, binding);
@@ -1376,6 +1448,80 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         } catch (error) { return stoppedOutcome(begun.expected, error); }
       });
     },
+    async transition(workspace, planPath, messageID, disposition, { kind, nonGitBaseline, connectionError } = {}) {
+      need(/^msg_[a-zA-Z0-9]+$/.test(messageID) && ['accepted', 'blocked', 'without-acceptance'].includes(disposition),
+        'Transition requires the exact prior message ID and an explicit review disposition');
+      const ctx = context(workspace, planPath, nonGitBaseline);
+      const result = receipt => ({ kind: 'transition-prepared', workspace: ctx.workspace, planPath: ctx.planPath,
+        sessionID: receipt.source.sessionID, assignmentKind: receipt.kind, taskSent: false,
+        engineChanged: receipt.source.engineID !== receipt.engineID,
+        previous: { planPath: receipt.source.planPath, assignmentID: receipt.source.assignmentID, messageID,
+          disposition: receipt.disposition, correctionCount: receipt.correctionCount } });
+      const start = locked(state => {
+        const receipt = readTransition(stateRoot, messageID);
+        const matches = state.bindings.filter(item => item.messageID === messageID);
+        need(matches.length <= 1, 'Prior delivery identity is ambiguous');
+        const binding = matches[0];
+        if (receipt) {
+          need(receipt.chatID === chatID && receipt.planPath === ctx.planPath && receipt.disposition === disposition &&
+            (!kind || kind === receipt.kind) && ['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key =>
+              receipt.source[key] === ctx[key]), 'Prior assignment already selected for a different transition');
+          if (!binding || preparedTransition(stateRoot, binding)) return { outcome: result(receipt) };
+          need(binding.codexChat === receipt.source.codexChat && binding.planPath === receipt.source.planPath &&
+            binding.sessionID === receipt.source.sessionID, 'Staged transition source changed');
+        }
+        if (connectionError) throw connectionError;
+        need(client && binding, 'No exact saved prior delivery or OpenCode connection');
+        checkTransitionSource(binding, ctx);
+        need(!readClosure(stateRoot, binding), 'Prior closure is staged; resolve it before a transition');
+        need(disposition !== 'accepted' || ['REVIEWING', 'FINISHED'].includes(binding.phase),
+          'Acceptance requires an assignment ready for review');
+        need(!state.bindings.some(item => item !== binding && (item.codexChat === chatID || item.sessionID === binding.sessionID)),
+          'Destination chat or OpenCode session already has another binding');
+        checkoutAvailable(state, ctx, binding);
+        const planSwitch = binding.planPath !== ctx.planPath;
+        const assignmentKind = kind ?? (planSwitch ? 'initial' : 'block');
+        need(planSwitch ? assignmentKind === 'initial' : ['block', 'correction'].includes(assignmentKind),
+          'Use initial for a new plan, or block/correction for the same plan');
+        planCounter(state, ctx);
+        return { source: structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount,
+          assignmentKind, lease: claimOwnership(state, ctx, binding, 'finish') };
+      });
+      if (start.outcome) return start.outcome;
+      return withOwnership(start.lease, async () => {
+        const boundary = await checkedClosureBoundary(client, { ...start.source, adoption: undefined },
+          disposition === 'accepted', start.source.engineID !== client.engineID);
+        let saving = false;
+        try {
+          return locked(state => {
+            const binding = state.bindings.find(item => item.codexChat === start.source.codexChat);
+            need(binding && JSON.stringify(binding) === JSON.stringify(start.source) &&
+              planCounter(state, binding).correctionCount === start.correctionCount &&
+              !state.bindings.some(item => item !== binding && (item.codexChat === chatID || item.sessionID === binding.sessionID)),
+            'Prior assignment or destination changed during transition');
+            checkoutAvailable(state, ctx, binding);
+            planCounter(state, ctx);
+            const receipt = { schema: 1, source: start.source, correctionCount: start.correctionCount, boundary,
+              chatID, planPath: ctx.planPath, engineID: client.engineID, kind: start.assignmentKind, disposition };
+            const path = transitionPath(stateRoot, messageID);
+            mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+            // Keep the source before moving ownership. A staged retry must verify the live boundary again.
+            saveJSON(path, receipt);
+            Object.assign(binding, { codexChat: chatID, planPath: ctx.planPath, engineID: client.engineID, phase: 'PREPARING' });
+            delete binding.stopReason; delete binding.diagnostic;
+            if (binding.adoption) Object.assign(binding.adoption, boundary);
+            if (receipt.kind !== 'initial') binding.nextAssignment = receipt.kind;
+            saving = true;
+            saveState(statePath, state);
+            return result(receipt);
+          });
+        } catch (error) {
+          if (saving) error.stateOutcome = unconfirmedOutcome({ ...start.source, correctionCount: start.correctionCount },
+            error, 'Transition persistence unconfirmed; repeat only the same transition');
+          throw error;
+        }
+      });
+    },
     async closeAssignment(workspace, planPath, selection, connectionError) {
       need(selection && typeof selection.sessionID === 'string' && /^ses_[a-zA-Z0-9]+$/.test(selection.sessionID) &&
         typeof selection.assignmentID === 'string' && /^[a-zA-Z0-9._-]{1,120}$/.test(selection.assignmentID) &&
@@ -1399,6 +1545,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         need(binding.phase === 'STOPPED' && binding.assignmentID === selection.assignmentID &&
           binding.messageID === selection.messageID && !binding.pending && !binding.nextAssignment,
         'Only the exact stopped, delivered assignment with no pending request can be closed');
+        need(!readTransition(stateRoot, binding.messageID), 'Transition was staged; repeat the exact transition command');
         checkoutAvailable(state, ctx, binding);
         return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
           lease: claimOwnership(state, ctx, binding, 'next') };
@@ -1406,7 +1553,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
         const expected = start.expected;
-        const boundary = await checkedClosureBoundary({ ...expected, adoption: undefined });
+        const boundary = await checkedClosureBoundary(client, { ...expected, adoption: undefined });
         let saving = false;
         try {
           const saved = commit(expected, (state, binding) => {
@@ -1859,7 +2006,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
         need(binding, 'No binding for this Codex chat');
         savedContext(binding, ctx);
-        if (binding.phase !== 'PREPARING' || binding.assignmentID !== undefined && binding.nextAssignment !== kind) {
+        const transition = preparedTransition(stateRoot, binding);
+        if (binding.phase !== 'PREPARING' || binding.assignmentID !== undefined && (transition?.kind ?? binding.nextAssignment) !== kind) {
           return { outcome: { ...summary(state, binding, 'rejected'),
             error: 'Previous assignment not accepted; no repeat submit', stateChange: 'unchanged', retried: false } };
         }
@@ -1870,7 +2018,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           ...summary(state, binding, 'correction-limit'), error: 'Twenty corrections reached; stop and select Code Duet again for a new cycle',
           stateChange: 'unchanged', retried: false } };
         checkoutAvailable(state, ctx, binding);
-        return { ctx, state: structuredClone(state), closed: readClosure(stateRoot, binding),
+        return { ctx, state: structuredClone(state), closed: transition ?? readClosure(stateRoot, binding),
           expected: { ...structuredClone(binding), correctionCount: plan.correctionCount },
           lease: claimOwnership(state, ctx, binding, 'submit') };
       });
@@ -1878,7 +2026,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       return withOwnership(start.lease, async () => {
         const adoption = start.expected.adoption;
         if (start.closed) {
-          need(sameBoundary(start.closed.boundary, await checkedClosureBoundary(start.expected)),
+          need(sameBoundary(start.closed.boundary, await checkedClosureBoundary(client, start.expected)),
             'History changed since closure; no dispatch');
         } else if (adoption) {
           const current = await idleExisting(start.state, start.expected);
