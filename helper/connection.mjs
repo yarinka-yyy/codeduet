@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
+import { text } from 'node:stream/consumers';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 export const EXECUTOR_MODEL = Object.freeze({ ...MODEL, variant: 'high' });
@@ -41,21 +42,32 @@ function requestDetails(route, body) {
     { page: new URLSearchParams(query).has('cursor') ? 'cursor' : 'first' } : {}) };
 }
 
-async function apiErrorCode(response) {
-  if (response.status !== 400 || !response.body) return undefined;
-  const reader = response.body.getReader(), chunks = []; let size = 0;
+function httpResponse(url, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    // Use a fresh socket and avoid Undici's paused-parser crash on socket close.
+    const request = httpRequest(url, { method, headers, signal, agent: false }, response => {
+      const status = response.statusCode;
+      resolve({ status, ok: status >= 200 && status < 300,
+        body: Readable.toWeb(response, { strategy: { highWaterMark: response.readableHighWaterMark,
+          size: chunk => chunk.byteLength } }) });
+    });
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+async function apiErrorCode(body) {
+  if (!body) return undefined;
+  const chunks = []; let size = 0;
   try {
-    while (true) {
-      const part = await reader.read();
-      if (part.done) break;
-      size += part.value.byteLength;
+    for await (const chunk of body) {
+      size += chunk.byteLength;
       if (size > 8192) return undefined;
-      chunks.push(part.value);
+      chunks.push(chunk);
     }
     const tag = JSON.parse(Buffer.concat(chunks).toString('utf8'))?._tag;
     return ['InvalidCursorError', 'InvalidRequestError'].includes(tag) ? tag : undefined;
   } catch { return undefined; }
-  finally { await reader.cancel().catch(() => {}); }
 }
 const eventType = /^(?:(?:session\.)?(?:execution\.(?:started|running|succeeded|failed|interrupted)|step\.(?:ended|failed|retry))|(?:form|permission)\.(?:created|updated|replied|resolved)|tool\.(?:success|failed)|(?:server|location)\.(?:shutdown|disposed)|other)$/;
 export function validateDiagnostic(value) {
@@ -116,7 +128,7 @@ export function localEndpoint(value) {
 }
 
 export async function connect({ registrationPath = resolve(homedir(), '.local/state/opencode/service.json'),
-  fetchImpl = fetch, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  fetchImpl = httpResponse, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
   const startedAt = now();
   let attempts = 0, lastError;
@@ -153,28 +165,34 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
         const controller = new AbortController();
         let timedOut = false;
         const abortFromParent = () => controller.abort(parentSignal.reason);
-        parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+        if (parentSignal?.aborted) abortFromParent();
+        else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
         const timer = setTimer(() => {
           timedOut = true;
           controller.abort(new DOMException('Request timed out', 'TimeoutError'));
         }, timeoutMs);
         try {
+          const payload = body === undefined ? undefined : JSON.stringify(body);
           const response = await fetchImpl(base + route, {
-            method: body === undefined ? 'GET' : 'POST',
-            // Native Windows evidence probes can outlast an idle pooled connection.
-            headers: { Authorization: auth, 'Content-Type': 'application/json', Connection: 'close' },
-            body: body === undefined ? undefined : JSON.stringify(body),
+            method: details.method,
+            headers: { Authorization: auth, 'Content-Type': 'application/json',
+              ...(payload === undefined ? {} : { 'Content-Length': String(Buffer.byteLength(payload)) }) },
+            body: payload,
             signal: controller.signal, redirect: 'error',
           });
           if (!response.ok) {
-            const errorCode = await apiErrorCode(response);
+            const errorCode = response.status === 400 ? await apiErrorCode(response.body) : undefined;
             if (response.status !== 400) await response.body?.cancel().catch(() => {});
             throw diagnosticError('Engine HTTP ' + response.status + (body === undefined ? '' : '; mutation uncertain, do not retry'),
               'request-http', 'request', { ...details, elapsedMs: Math.max(0, now() - requestStarted), httpStatus: response.status,
                 ...(errorCode ? { errorCode } : {}) });
           }
-          if (response.status === 204) return undefined;
-          try { return await response.json(); }
+          if (response.status === 204) {
+            await response.body?.cancel().catch(() => {});
+            return undefined;
+          }
+          const raw = response.body ? await text(response.body) : '';
+          try { return JSON.parse(raw); }
           catch (error) {
             throw diagnosticError(body === undefined ? 'Invalid engine JSON' : 'Mutation response invalid; do not retry',
               timedOut ? 'request-timeout' : 'request-json', 'request',

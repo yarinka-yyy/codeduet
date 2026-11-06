@@ -34,6 +34,10 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
       calls.push({ method: request.method, route });
       await f.onRequest?.(route);
       const send = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
+      const truncated = () => {
+        response.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': 256 });
+        response.end('{"data":');
+      };
       const rejection = f.rejectRequest?.(request.method, route);
       if (rejection) { response.statusCode = 400; return send(rejection); }
       if (route === '/api/info') {
@@ -64,7 +68,8 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
       }
       if (route === '/api/session' && request.method === 'POST') {
         const session = { id: 'ses_http' + (sessions.size + 1), title: body.title, location: body.location, model: body.model, time: {} };
-        sessions.set(session.id, session); return send({ data: session });
+        sessions.set(session.id, session);
+        return f.fault === 'create-truncated' ? truncated() : send({ data: session });
       }
       if (route.endsWith('/model') && request.method === 'POST') {
         const session = sessions.get(sessionID);
@@ -99,6 +104,7 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
         return send({ data: { id: requestID, sessionID } });
       }
       if (route.includes('/message?')) {
+        if (f.fault === 'history-truncated') return truncated();
         const query = new URL(route, 'http://localhost').searchParams;
         if (query.has('cursor') && query.has('order')) {
           response.statusCode = 400; return send({ _tag: 'InvalidCursorError', message: secret });

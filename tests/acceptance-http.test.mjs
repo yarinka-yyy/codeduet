@@ -1,7 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
-import { fixture, model } from './http-fixture.mjs';
+import { baseline, fixture, model } from './http-fixture.mjs';
+
+test('native CLI reads a long history and reports an incomplete HTTP body as a read failure', async t => {
+  const f = await fixture(t, undefined, '2.2.5');
+  const { status, result: { sessionID } } = await f.call(f.bindArgs(0));
+  assert.equal(status, 0);
+  f.messages.set(sessionID, [
+    { id: 'msg_user', type: 'user', text: 'Existing fixture request' },
+    { id: 'msg_long', type: 'assistant', model,
+      content: [{ type: 'text', text: 'Строка журнала\n'.repeat(50_000) }] },
+  ]);
+  const args = ['preflight', f.workspace, f.plan, '--non-git-baseline', baseline];
+  const saved = readFileSync(f.statePath), from = f.calls.length;
+  const complete = await f.call(args);
+  assert.match(complete.result.checks.find(check => check.name === 'history').reason, /Untracked history/);
+  f.fault = 'history-truncated';
+  const incomplete = await f.call(args);
+  assert.equal(incomplete.status, 1);
+  assert.equal(incomplete.result.taskSent, false);
+  const diagnostic = incomplete.result.checks.find(check => check.name === 'history').diagnostic;
+  assert.equal(diagnostic.category, 'request-read');
+  assert.equal(diagnostic.operation, 'session.message.list');
+  assert.equal(diagnostic.page, 'first');
+  assert.deepEqual(readFileSync(f.statePath), saved);
+  assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+});
+
+test('an incomplete create response preserves uncertainty and does not retry the POST', async t => {
+  const f = await fixture(t);
+  f.fault = 'create-truncated';
+  const failed = await f.call(f.bindArgs(0));
+  assert.equal(failed.status, 1);
+  assert.equal(failed.result.diagnostic.category, 'request-read');
+  assert.equal(failed.result.diagnostic.operation, 'session.create');
+  assert.match(failed.result.error, /mutation uncertain/);
+  assert.equal(f.state().bindings[0].phase, 'STOPPED');
+  assert.equal(f.state().bindings[0].uncertain, 'create');
+  assert.equal(f.state().plans[0].correctionCount, 0);
+  assert.equal((await f.call(f.bindArgs(0))).status, 1);
+  assert.equal(f.posts('/api/session'), 1);
+  assert.equal(f.sessions.size, 1);
+});
 
 for (const fault of ['drop', 'http429']) test('native CLI ' + fault + ' preserves one possibly delivered correction and refuses retry/new writer', async t => {
   const f = await fixture(t);
