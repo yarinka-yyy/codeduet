@@ -6,22 +6,27 @@ import { context, helper, inspect, listSessions, maintainTasks, preflight, start
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' }, 'lost-powershell-calls': { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
   const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
   const transitionUsage = 'transition <workspace> <target-plan> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]';
+  const replacing = command === 'replace-finished-session';
+  if (replacing && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
+    !/^ses_[a-zA-Z0-9]+$/.test(values.session) || !values['lost-powershell-calls']))
+    throw new Error('Usage: replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids>');
+  if (!replacing && values['lost-powershell-calls'] !== undefined) throw new Error('lost-powershell-calls belongs to replace-finished-session');
   if (command === 'task-maintenance' && args.length !== 3) throw new Error('Usage: cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>');
   if (command === 'start-cycle' && args.length !== 3) throw new Error('Usage: cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>');
   if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (command === 'close-assignment' && args.length !== 5) throw new Error('Usage: cli.mjs ' + closeUsage);
   if (command === 'transition' && (args.length !== 5 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
     !['accepted', 'blocked', 'without-acceptance'].includes(packet))) throw new Error('Usage: cli.mjs ' + transitionUsage);
-  if (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment', 'transition'].includes(command) ||
-    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3, 'close-assignment': 5, transition: 5 })[command])) {
+  if (!replacing && (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment', 'transition'].includes(command) ||
+    !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3, 'close-assignment': 5, transition: 5 })[command]))) {
     throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>] | retire-legacy <workspace> <old-plan> <lease-token>; paths must be absolute');
   }
-  if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Assignment kind belongs to submit/transition; correction-count to bind/adopt/preflight; session to preflight/resume-watch/close-assignment; cursor to sessions');
+  if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !replacing && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Assignment kind belongs to submit/transition; correction-count to bind/adopt/preflight; session to preflight/resume-watch/close-assignment/replace-finished-session; cursor to sessions');
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
     !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
@@ -71,7 +76,7 @@ try {
   catch (error) {
     if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
     else {
-      try { if (!['sessions', 'retire-legacy'].includes(command)) result = await helper(null).connectionLost(error); }
+      try { if (!replacing && !['sessions', 'retire-legacy'].includes(command)) result = await helper(null).connectionLost(error); }
       catch (stateError) {
         error.persistenceFailure = diagnose(stateError, 'state-io', 'state-write');
       }
@@ -89,6 +94,9 @@ try {
     const adapter = helper(client);
     const baseline = values['non-git-baseline'];
     if (command === 'bind') result = await adapter.bind(workspace, plan, baseline, importedCount);
+    else if (replacing) result = await adapter.bind(workspace, plan, baseline, undefined, {
+      sessionID: values.session, messageID: assignment, lostCalls: values['lost-powershell-calls'].split(','),
+    });
     else if (command === 'retire-legacy') result = await adapter.retireLegacy(workspace, plan, assignment);
     else if (command === 'adopt') result = await adapter.adopt(workspace, plan, assignment, baseline, importedCount);
     else if (command === 'submit') result = await adapter.submit(workspace, plan, assignment, packet, baseline, values.kind ?? 'initial');

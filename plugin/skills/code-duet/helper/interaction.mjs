@@ -423,6 +423,7 @@ $offsets = @($ast.FindAll({ param($node)
   $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq 'Ampersand'
 }, $true) | ForEach-Object { $_.Extent.StartOffset } | Sort-Object -Unique)
 if (!$offsets.Count) { exit }
+if ($call.syntaxOnly) { ConvertTo-Json -Compress -InputObject $offsets; exit }
 $start = [DateTimeOffset]::FromUnixTimeMilliseconds($call.ran).LocalDateTime
 $end = [DateTimeOffset]::FromUnixTimeMilliseconds($call.completed).LocalDateTime
 $exe = Join-Path $PSHOME 'powershell.exe'
@@ -451,6 +452,22 @@ if ($matchesByProcess.Count -eq 2 -and $matchesByProcess[0].Id -eq 403 -and $mat
   ConvertTo-Json -Compress -InputObject @{ offsets=$offsets; events=@($matchesByProcess[1],$matchesByProcess[0]) }
 }`;
 
+function invocationProbe(input) {
+  const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(invocationCallProbe, 'utf16le').toString('base64')], {
+    input: Buffer.from(JSON.stringify(input)).toString('base64'),
+    encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  return output.trim() ? JSON.parse(output) : undefined;
+}
+
+function maskInvocationOffsets(command, offsets) {
+  const characters = command.split('');
+  for (const offset of offsets) characters[offset] = ' ';
+  return characters.join('');
+}
+
 function maskVerifiedInvocationCalls(command, tool, saved, check) {
   const { ran, completed } = tool.time ?? {};
   if (process.platform !== 'win32' || !process.env.SystemRoot || tool.name !== 'shell' ||
@@ -470,13 +487,7 @@ function maskVerifiedInvocationCalls(command, tool, saved, check) {
     proof.events[0].at <= proof.events[1].at && proof.events[0].record < proof.events[1].record;
   const probe = archive => {
     try {
-      const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
-      const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-        Buffer.from(invocationCallProbe, 'utf16le').toString('base64')], {
-        input: Buffer.from(JSON.stringify({ command: original, ran, completed, archive })).toString('base64'),
-        encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      const proof = output.trim() && JSON.parse(output);
+      const proof = invocationProbe({ command: original, ran, completed, archive });
       return valid(proof) ? proof : undefined;
     } catch { return undefined; }
   };
@@ -484,12 +495,44 @@ function maskVerifiedInvocationCalls(command, tool, saved, check) {
   const proof = matching ?? probe() ?? (check?.archive ? probe(check.archive) : undefined);
   if (!proof) return command;
   check?.verified?.push({ ...identity, offsets: proof.offsets, events: proof.events });
-  const characters = command.split('');
-  for (const offset of proof.offsets) characters[offset] = ' ';
-  return characters.join('');
+  return maskInvocationOffsets(command, proof.offsets);
 }
 
 const shellEvidenceID = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id) ? id : 'unknown';
+
+// shortcut: only the portable PostgreSQL clients have an independent process check for this handoff.
+function maskLegacyPostgresCalls(command, tool, recovery) {
+  const original = tool.state.input.command;
+  if (process.platform !== 'win32' || !process.env.SystemRoot || tool.name !== 'shell' ||
+    tool.state.status !== 'completed' || tool.state.metadata?.status !== 'completed' || tool.state.metadata.exit !== 0 ||
+    tool.state.metadata.timeout || !Number.isSafeInteger(tool.time?.ran) || !Number.isSafeInteger(tool.time?.completed) ||
+    tool.time.ran >= tool.time.completed || original.length > 32_768 ||
+    /\\(?:!|i(?:r|nclude)?\b|copy\b|gexec\b)|\bprogram\b/i.test(original)) return command;
+  const run = dirname(dirname(recovery.dataDirectory)), bin = join(run, 'tools', 'pgsql', 'bin');
+  const definitions = [...original.matchAll(/^\s*\$bin[ \t]*=[ \t]*(.+)\r?$/gmi)];
+  if (definitions.length !== 1) return command;
+  const definition = definitions[0][1].trim();
+  const literal = definition.match(/^'([^']+)'$/)?.[1];
+  const declaredRun = original.match(/^\$run[ \t]*=[ \t]*'([^']+)'\r?$/mi)?.[1];
+  const knownDirectory = literal && isAbsolute(literal) && !relative(bin, literal) ||
+    /^Join-Path \$run 'tools[\\/]pgsql[\\/]bin'$/i.test(definition) && declaredRun &&
+    isAbsolute(declaredRun) && !relative(run, declaredRun);
+  if (!knownDirectory) return command;
+  try {
+    const offsets = invocationProbe({ command: original, syntaxOnly: true });
+    if (!Array.isArray(offsets)) return command;
+    const eligible = offsets.filter(offset => {
+      if (!Number.isSafeInteger(offset) || command[offset] !== '&') return false;
+      const tail = original.slice(offset), prefix = original.slice(0, offset);
+      if (/^&[ \t]+\(Join-Path \$bin 'pg_isready\.exe'\)(?=[ \t\r\n]|$)/i.test(tail)) return true;
+      const psql = tail.match(/^& \(Join-Path \$bin 'psql\.exe'\) -X -w -h 127\.0\.0\.1 -p (\d+) -U \$cred\.\w+ -d (?:postgres|\$cred\.database)(?: -v ON_ERROR_STOP=1)? -(?:q|At)[ \t]*(?=\r?\n|$)/i);
+      if (psql && /\|[ \t]*$/.test(prefix)) return Number(psql[1]) === recovery.port;
+      return /^& \(Join-Path \$bin \$e\) --version[ \t]*(?=\r?\n|$)/i.test(tail) &&
+        /foreach \(\$e in 'postgres\.exe','initdb\.exe','pg_ctl\.exe','psql\.exe','pg_isready\.exe'\) \{[ \t]*\r?\n[ \t]*\$out[ \t]*=[ \t]*$/i.test(prefix);
+    });
+    return maskInvocationOffsets(command, eligible);
+  } catch { return command; }
+}
 
 function endedShells(history, shells, closing = false, invocationCheck) {
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
@@ -523,8 +566,13 @@ function endedShells(history, shells, closing = false, invocationCheck) {
         shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
       const recovered = postgres.get(tool.id);
       const command = recovered?.command ?? input.command;
-      const reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),
+      let reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),
         postgres.size > 0);
+      if (reason === 'unclassified or background ampersand' && postgres.size && invocationCheck?.lostCalls?.has(tool.id)) {
+        reason = detachedReason(command, source => maskLegacyPostgresCalls(source, tool, history.recoveryBinding.postgresRecovery), true);
+        if (!reason) invocationCheck.gaps.push({ id: tool.id, messageID: tool.messageID, ran: tool.time?.ran,
+          completed: tool.time?.completed, hash: createHash('sha256').update(input.command).digest('hex') });
+      }
       need(!reason, 'Detached command status unknown; no ownership transfer' + call + ': ' + reason);
     }
   }
@@ -534,7 +582,7 @@ function endedShells(history, shells, closing = false, invocationCheck) {
   return timeline;
 }
 
-export function closureBoundary(binding, messages, session, shells) {
+export function closureBoundary(binding, messages, session, shells, invocationCheck) {
   const modelRef = model => model?.providerID === MODEL.providerID && model?.id === MODEL.id &&
     (model.variant === undefined || typeof model.variant === 'string' && model.variant.length <= 80);
   const terminal = item => item?.type === 'idle' && ['succeeded', 'failed', 'interrupted'].includes(item.outcome) &&
@@ -546,14 +594,15 @@ export function closureBoundary(binding, messages, session, shells) {
   const exchange = late < 0 ? messages : messages.slice(0, late);
   const ended = exchange.at(-1);
   need(exchange.length > 1 && terminal(ended), 'No correlated terminal idle for the delivered assignment');
-  const history = inspectMessages(binding, exchange, { adopting: true });
+  const history = inspectMessages(invocationCheck?.lostCalls ? { ...binding, legacyPostgresClients: true } : binding, exchange, { adopting: true });
   need(exchange.slice(1, -1).every(item => item.type === 'assistant' ?
     Number.isSafeInteger(item.time?.completed) && item.time.completed <= ended.time.created :
     Number.isSafeInteger(item.time?.created) && item.time.created <= ended.time.created &&
     (item.type !== 'compaction' || ['completed', 'failed'].includes(item.status))) &&
     history.tools.every(tool => ['completed', 'error'].includes(tool.state?.status) &&
       Number.isSafeInteger(tool.time?.completed) && tool.time.completed <= ended.time.created), 'Unfinished operation in delivered assignment');
-  endedShells(history, shells, true);
+  if (invocationCheck?.lostCalls) completion(history, session, shells, invocationCheck);
+  else endedShells(history, shells, true);
   let idle = ended, lastTime = ended.time.created, compacting = false, selected;
   for (const item of late < 0 ? [] : messages.slice(late)) {
     const time = item.time?.created;

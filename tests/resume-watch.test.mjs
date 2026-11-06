@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
@@ -116,6 +116,70 @@ test('PostgreSQL recovery opens review with the timeout and reuses the receipt o
   assert.equal(f.state().plans[0].correctionCount, 9);
   assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
   assert.equal(readFileSync(evidence.log, 'utf8'), logText);
+});
+
+test('legacy FINISHED delivery can move to an empty session without bypassing active work', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
+}, async t => {
+  const { f, evidence, file, args } = await postgresFixture(t);
+  writeFileSync(file, JSON.stringify(evidence));
+  const reviewed = await f.call(args, undefined, 20000);
+  assert.equal(reviewed.result.phase, 'REVIEWING', JSON.stringify(reviewed.result));
+  const finished = await f.call(['finish', f.workspace, f.plan, '--non-git-baseline', baseline], undefined, 20000);
+  assert.equal(finished.result.phase, 'FINISHED', JSON.stringify(finished.result));
+  const old = f.state().bindings[0], messages = f.messages.get(old.sessionID);
+  const ran = messages[1].time.completed, completed = messages.at(-1).time.created;
+  // Fixture for a delivery finished by a release that did not retain invocation proof.
+  const command = "$run='" + dirname(dirname(evidence.dataDirectory)) + "'\n$bin=Join-Path $run 'tools/pgsql/bin'\n" +
+    "$sql | & (Join-Path $bin 'psql.exe') -X -w -h 127.0.0.1 -p " + evidence.port + " -U $cred.role -d postgres -q";
+  const call = { id: 'call_lost', type: 'tool', name: 'shell', time: { ran, completed }, state: {
+    status: 'completed', input: { command }, metadata: { status: 'completed', exit: 0 },
+  } };
+  messages.splice(-2, 0, { id: 'msg_lost', type: 'assistant', model, time: { completed }, content: [call] });
+  const before = readFileSync(f.statePath), stateRoot = dirname(f.statePath), from = f.calls.length;
+  const replace = ['replace-finished-session', f.workspace, f.plan, old.messageID, '--session', old.sessionID,
+    '--lost-powershell-calls', call.id, '--non-git-baseline', baseline];
+  const run = () => f.call(replace, undefined, 20000);
+  const preflight = ['preflight', f.workspace, f.plan, '--non-git-baseline', baseline];
+  assert.match((await f.call(preflight, undefined, 20000)).result.checks.find(x => x.name === 'history').reason, /call_lost/);
+  const active = join(stateRoot, 'observers', 'fixture', 'active');
+  mkdirSync(dirname(active), { recursive: true }); writeFileSync(active, 'fixture');
+  assert.match((await run()).result.error, /observer is active or uncertain/);
+  unlinkSync(active);
+  f.forms.push({ id: 'frm_waiting', sessionID: old.sessionID });
+  assert.match((await run()).result.error, /pending forms/);
+  f.forms.length = 0;
+  f.shells = [{ id: 'sh_running', status: 'running' }];
+  assert.match((await run()).result.error, /Project shell still running/);
+  f.shells = [];
+  const pidFile = join(evidence.dataDirectory, 'postmaster.pid');
+  writeFileSync(pidFile, '301');
+  assert.match((await run()).result.error, /process, listener or PID file still present/);
+  unlinkSync(pidFile);
+  call.state.input.command = command + ' -f external.sql';
+  assert.match((await run()).result.error, /unclassified or background ampersand/);
+  call.state.input.command = command;
+  call.state.input.command += '\nStart-Job { Get-Date }';
+  assert.match((await run()).result.error, /possible detached launcher start-job/);
+  call.state.input.command = command;
+  unchanged(f, before, from);
+  const history = JSON.stringify(messages), passed = await run();
+  assert.equal(passed.status, 0, JSON.stringify(passed.result));
+  assert.equal(passed.result.kind, 'finished-session-replaced');
+  assert.equal(passed.result.taskSent, false);
+  assert.equal(passed.result.previous.phase, 'FINISHED');
+  assert.equal(passed.result.correctionCount, 9);
+  assert.notEqual(passed.result.sessionID, old.sessionID);
+  assert.equal(JSON.stringify(f.messages.get(old.sessionID)), history);
+  const receipt = JSON.parse(readFileSync(join(stateRoot, 'finished-session-replacements', old.messageID + '.json'), 'utf8'));
+  assert.deepEqual(receipt.source, old);
+  assert.equal(receipt.correctionCount, 9);
+  assert.equal(receipt.reason, 'lost-powershell-lifecycle-evidence');
+  assert.equal(receipt.gaps[0].hash, sha256(command));
+  assert.equal(existsSync(join(stateRoot, 'powershell-invocations', old.messageID + '.json')), false);
+  assert.equal((await f.call(preflight)).result.status, 'pass');
+  assert.equal((await run()).result.kind, 'rejected');
+  assert.deepEqual(f.calls.slice(from).filter(call => call.method === 'POST').map(call => call.route), ['/api/session']);
 });
 
 test('CLI wait and resume-watch accept four hours and reject larger or invalid deadlines without mutation', async t => {

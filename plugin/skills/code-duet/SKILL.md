@@ -24,6 +24,11 @@ without accepting it, follow [close-assignment](helper/PROTOCOL.md#close-assignm
 Close it before preflight or a new correction. Treat a subsequent submit as
 separate work that requires its own authorization and packet.
 
+For an explicit request to replace a FINISHED session after loss of PowerShell
+evidence, use [replace-finished-session](helper/PROTOCOL.md#replace-a-finished-session-with-lost-powershell-evidence)
+in the original chat. Check the newly created empty session with preflight.
+Replacement alone grants no authority to submit.
+
 Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
 pair, bind a new OpenCode session in the selected workspace unless the user
 explicitly selected an existing recipient; only then read

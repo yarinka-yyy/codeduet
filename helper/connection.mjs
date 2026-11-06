@@ -161,7 +161,8 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
         try {
           const response = await fetchImpl(base + route, {
             method: body === undefined ? 'GET' : 'POST',
-            headers: { Authorization: auth, 'Content-Type': 'application/json' },
+            // Native Windows evidence probes can outlast an idle pooled connection.
+            headers: { Authorization: auth, 'Content-Type': 'application/json', Connection: 'close' },
             body: body === undefined ? undefined : JSON.stringify(body),
             signal: controller.signal, redirect: 'error',
           });

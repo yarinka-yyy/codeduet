@@ -260,16 +260,27 @@ export async function observationSnapshot(client, binding) {
   return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
 }
 
-async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess = false, verifyPriorPlan = false) {
+async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess = false, verifyPriorPlan = false, invocationCheck) {
   const quiet = current => !current.active && !current.forms.length && !current.permissions.length;
   const current = await observationSnapshot(client, binding);
+  if (invocationCheck?.lostCalls) {
+    need(!current.active, 'Prior session is still active; no replacement');
+    need(!current.forms.length, 'Prior session has pending forms; no replacement');
+    need(!current.permissions.length, 'Prior session has pending permissions; no replacement');
+  }
   need(quiet(current), 'Session is active or awaiting a reply; no closure or dispatch');
   need(!requireSuccess || current.session.outcome === 'succeeded', 'Acceptance requires confirmed successful execution');
   const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
   const messages = await assignmentMessages(client, binding);
   if (verifyPriorPlan) need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
     JSON.stringify(binding.planPath) + '\n'), 'Prior plan was not confirmed in the current OpenCode history');
-  const boundary = closureBoundary(withShellEvidence(stateRoot, binding), messages, current.session, await client.request(shellRoute));
+  const shells = await client.request(shellRoute);
+  const boundary = closureBoundary(withShellEvidence(stateRoot, binding), messages, current.session, shells, invocationCheck);
+  if (invocationCheck?.lostCalls) {
+    const [latest, latestShells] = await Promise.all([assignmentMessages(client, binding), client.request(shellRoute)]);
+    need(JSON.stringify(latest) === JSON.stringify(messages) && JSON.stringify(latestShells) === JSON.stringify(shells),
+      'History or project shells changed during replacement verification');
+  }
   const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
   need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
     'History changed during closure verification');
@@ -1036,6 +1047,12 @@ export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir
   });
 }
 
+function observerPresent(stateRoot) {
+  const observers = join(stateRoot, 'observers');
+  return existsSync(observers) && readdirSync(observers, { withFileTypes: true }).some(entry =>
+    entry.name.startsWith('external-') || entry.isDirectory() && existsSync(join(observers, entry.name, 'active')));
+}
+
 // Called only for a new explicit selection, never for an observer wake-up.
 export function startCycle(workspace, planPath, { stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID } = {}) {
   need(text(chatID), 'Actual CODEX_THREAD_ID is required');
@@ -1050,10 +1067,7 @@ export function startCycle(workspace, planPath, { stateRoot = resolve(homedir(),
     }
     const owners = readOwnerships(join(stateRoot, 'ownership'));
     need(!owners.invalid && !owners.owners.some(owner => overlaps(ctx.checkout, owner.checkout)), 'A task owner is active or unknown; no counter reset');
-    const observers = join(stateRoot, 'observers');
-    need(!existsSync(observers) || !readdirSync(observers, { withFileTypes: true }).some(entry =>
-      entry.name.startsWith('external-') || entry.isDirectory() && existsSync(join(observers, entry.name, 'active'))),
-      'An observer is active or uncertain; no counter reset');
+    need(!observerPresent(stateRoot), 'An observer is active or uncertain; no counter reset');
     for (const binding of state.bindings.filter(item => item.planPath === ctx.planPath)) {
       need(binding.workspace === ctx.workspace && ['PREPARING', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.uncertain && !binding.pending,
         'Assignment is active or uncertain; no counter reset');
@@ -1950,13 +1964,28 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         throw error;
       }
     },
-    async bind(workspace, planPath, nonGitBaseline, importedCount) {
+    async bind(workspace, planPath, nonGitBaseline, importedCount, replacement) {
       const ctx = context(workspace, planPath, nonGitBaseline);
+      if (replacement) need(/^ses_[a-zA-Z0-9]+$/.test(replacement.sessionID) && /^msg_[a-zA-Z0-9]+$/.test(replacement.messageID) &&
+        Array.isArray(replacement.lostCalls) && replacement.lostCalls.length > 0 && replacement.lostCalls.length <= 32 &&
+        replacement.lostCalls.every(id => /^call_[a-zA-Z0-9_]{1,120}$/.test(id)) &&
+        new Set(replacement.lostCalls).size === replacement.lostCalls.length, 'Use exact prior session, delivery and PowerShell call IDs');
       need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20,
         'Invalid imported correction count');
       const start = locked(state => {
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         planCounter(state, ctx, importedCount);
+        if (replacement) {
+          need(existing?.phase === 'FINISHED' && existing.assignmentID && existing.sessionID === replacement.sessionID &&
+            existing.messageID === replacement.messageID, 'Only the exact FINISHED delivery in this chat can be replaced');
+          savedContext(existing, ctx);
+          need(!readClosure(stateRoot, existing) && !readTransition(stateRoot, existing.messageID), 'Another closure or transition already exists');
+          need(!observerPresent(stateRoot), 'An observer is active or uncertain; no replacement');
+          checkoutAvailable(state, ctx, existing);
+          return { ctx, state: structuredClone(state), source: structuredClone(existing),
+            correctionCount: planCounter(state, existing).correctionCount,
+            lease: claimOwnership(state, ctx, existing, 'bind') };
+        }
         if (existing) {
           if (existing.planPath !== ctx.planPath) {
             savedContext({ ...existing, planPath: ctx.planPath }, ctx);
@@ -2000,16 +2029,37 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             }).result;
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
         }
+        let archive;
+        if (start.source) {
+          const gaps = [], lostCalls = new Set(replacement.lostCalls);
+          const boundary = await checkedClosureBoundary(client, stateRoot, start.source, true, false, { gaps, lostCalls });
+          need(gaps.length === lostCalls.size && new Set(gaps.map(call => call.id)).size === lostCalls.size,
+            'The listed PowerShell calls do not match the lost evidence; no replacement');
+          archive = { schema: 1, source: start.source, correctionCount: start.correctionCount, boundary,
+            reason: 'lost-powershell-lifecycle-evidence', gaps };
+        }
         await idleWorkspace(start.state, ctx);
         let reservationAttempted = false, reservationExpected, reserved;
         try {
           reserved = locked(state => {
-            need(!state.bindings.some(binding => binding.codexChat === chatID), 'Binding appeared during create preparation');
-            checkoutAvailable(state, ctx);
+            const current = state.bindings.find(binding => binding.codexChat === chatID);
+            if (archive) {
+              need(unchanged(current, { ...start.source, correctionCount: start.correctionCount }, state),
+                'Finished delivery changed during replacement');
+              need(!observerPresent(stateRoot), 'An observer is active or uncertain; no replacement');
+            } else need(!current, 'Binding appeared during create preparation');
+            checkoutAvailable(state, ctx, current);
             const plan = planCounter(state, ctx, importedCount);
             const binding = { codexChat: chatID, ...ctx, engineID: client.engineID,
               sessionID: null, phase: 'STOPPED', uncertain: 'create' };
-            state.bindings.push(binding);
+            if (archive) {
+              const path = join(stateRoot, 'finished-session-replacements', start.source.messageID + '.json');
+              mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+              if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(archive),
+                'A different replacement record already exists');
+              else saveJSON(path, archive);
+              state.bindings[state.bindings.indexOf(current)] = binding;
+            } else state.bindings.push(binding);
             reservationExpected = { ...structuredClone(binding), correctionCount: plan.correctionCount };
             reservationAttempted = true;
             saveState(statePath, state);
@@ -2027,6 +2077,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             title: 'Code Duet: ' + basename(ctx.workspace), location: { directory: ctx.workspace }, model: EXECUTOR_MODEL,
           });
           need(/^ses_[a-zA-Z0-9]+$/.test(response?.data?.id), 'Creation uncertain; no retry');
+          if (archive) need(!start.state.bindings.some(binding => binding.sessionID === response.data.id),
+            'OpenCode did not return a fresh session; no retry');
         } catch (error) {
           error.stateOutcome = stoppedOutcome(expected, error, 'stopped');
           throw error;
@@ -2042,7 +2094,16 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             'Session created; saved session identity is unconfirmed, inspect the store');
           throw error;
         }
-        try { need((await sessionMatches(expected)).model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High'); }
+        try {
+          if (archive) {
+            const current = await observationSnapshot(client, expected);
+            const head = await client.request(`/api/session/${expected.sessionID}/message?limit=1&order=desc`);
+            need(!current.active && !current.forms.length && !current.permissions.length &&
+              current.session.outcome === undefined && current.session.time?.idle === undefined &&
+              Array.isArray(head?.data) && head.data.length === 0, 'Replacement session is not empty and idle; no retry');
+            need(current.session.model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High');
+          } else need((await sessionMatches(expected)).model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High');
+        }
         catch (error) {
           error.stateOutcome = stoppedOutcome(expected, error, 'stopped');
           throw error;
@@ -2050,7 +2111,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           return commit(expected, (state, binding) => {
             delete binding.uncertain; binding.phase = 'PREPARING';
-            return summary(state, binding, 'created');
+            return archive ? { ...summary(state, binding, 'finished-session-replaced'), taskSent: false,
+              previous: { phase: 'FINISHED', sessionID: start.source.sessionID, messageID: start.source.messageID,
+                correctionCount: start.correctionCount, reason: archive.reason } } : summary(state, binding, 'created');
           }).result;
         } catch (error) {
           error.stateOutcome = unconfirmedOutcome(expected, error,

@@ -34,11 +34,11 @@ function pidFileAbsent(path) {
   catch (error) { if (error.code === 'ENOENT') return true; throw error; }
 }
 
-function postgresIdle(port) {
+function postgresIdle(port, includeClients) {
   need(process.platform === 'win32' && process.env.SystemRoot, 'PostgreSQL recovery requires a Windows process check');
   const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
   const script = `$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';
-    $pg = Get-Process | Where-Object ProcessName -in 'postgres','pg_ctl';
+    $pg = Get-Process | Where-Object ProcessName -in 'postgres','pg_ctl'${includeClients ? ",'psql','initdb','pg_isready'" : ''};
     $listener = Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq ${port};
     if (!$pg -and !$listener) { 'idle' }`;
   const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
@@ -117,6 +117,7 @@ export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresI
     if (typeof command === 'string' && [...command.matchAll(wrapper)].length)
       need(recovered.has(tool.id), 'PostgreSQL recovery is missing a wrapper launch in call ' + tool.id);
   }
-  need(pidFileAbsent(data) && probe(evidence.port) && pidFileAbsent(data), 'PostgreSQL process, listener or PID file still present');
+  need(pidFileAbsent(data) && probe(evidence.port, binding.legacyPostgresClients) && pidFileAbsent(data),
+    'PostgreSQL process, listener or PID file still present');
   return recovered;
 }

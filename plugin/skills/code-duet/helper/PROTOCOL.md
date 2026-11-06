@@ -617,6 +617,26 @@ with the existing baseline option if required. The helper applies the same
 event checks to the archived Windows PowerShell log when live evidence is
 missing. Unmatched or missing events leave the saved phase and count intact.
 
+## Replace a finished session with lost PowerShell evidence
+
+`replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids>`
+
+Run only on explicit instruction from the owner, in the original Codex chat,
+with the existing non-Git baseline option if required. The source must be the
+exact FINISHED delivery with a successful, stable terminal boundary. Every
+listed call must match an unresolved invocation in the history. This route
+currently covers portable PostgreSQL clients backed by a valid PostgreSQL
+recovery receipt. It rechecks historical server shutdowns and current server,
+client, listener and PID-file status. Other launcher checks, pending requests,
+observers, active shells and ownership conflicts still block replacement.
+
+The helper archives the FINISHED binding, counter and gaps under
+`finished-session-replacements/<prior-message-id>.json`. It does not change the
+old OpenCode transcript or create PowerShell event proof. It creates one empty
+High session for the same plan and retains its counter. An uncertain create
+stops the new binding without replay. Run preflight for the new session.
+Replacement sends no prompt and does not authorize the next assignment.
+
 ## close-assignment
 
 `node <skill>/helper/cli.mjs close-assignment <workspace> <plan> <assignment-id> <message-id> --session <session-id>`
