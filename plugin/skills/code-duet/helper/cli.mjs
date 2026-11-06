@@ -6,7 +6,7 @@ import { context, helper, inspect, listSessions, maintainTasks, preflight, start
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' } } });
   const [command, workspace, plan, assignment, packet] = args;
   const ownershipUsage = 'ownership <workspace> <plan> <lease-token> [--action inspect|stop|recover] [--non-git-baseline <declaration>]';
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
@@ -25,6 +25,7 @@ try {
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
     !['inspect', 'stop', 'recover'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
+  if (values['powershell-event-log'] !== undefined && command !== 'finish') throw new Error('powershell-event-log belongs to finish');
   let postgresRecovery;
   if (values['postgres-evidence'] !== undefined) {
     const path = values['postgres-evidence'];
@@ -92,7 +93,7 @@ try {
     else if (command === 'adopt') result = await adapter.adopt(workspace, plan, assignment, baseline, importedCount);
     else if (command === 'submit') result = await adapter.submit(workspace, plan, assignment, packet, baseline, values.kind ?? 'initial');
     else if (command === 'next') result = await adapter.next(workspace, plan, assignment, baseline);
-    else if (command === 'finish') result = await adapter.finish(workspace, plan, baseline);
+    else if (command === 'finish') result = await adapter.finish(workspace, plan, baseline, values['powershell-event-log']);
     else if (command === 'transition') result = await adapter.transition(workspace, plan, assignment, packet,
       { kind: values.kind, nonGitBaseline: baseline, connectionError });
     else if (command === 'close-assignment') result = await adapter.closeAssignment(workspace, plan,

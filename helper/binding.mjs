@@ -149,7 +149,7 @@ function saveJSON(path, value) {
 
 const closurePath = (root, messageID) => join(root, 'assignment-closures', messageID + '.json');
 const postgresPath = (root, messageID) => join(root, 'postgres-recoveries', messageID + '.json');
-const postgresOwner = binding => createHash('sha256').update(JSON.stringify(
+const deliveryFingerprint = binding => createHash('sha256').update(JSON.stringify(
   ['workspaceID', 'checkoutID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt'].map(key => binding[key]),
 )).digest('hex');
 function withPostgresRecovery(root, binding) {
@@ -157,9 +157,25 @@ function withPostgresRecovery(root, binding) {
   const path = postgresPath(root, binding.messageID);
   if (!existsSync(path)) return binding;
   const receipt = JSON.parse(readFileSync(path, 'utf8'));
-  need(receipt?.owner === postgresOwner(binding) && Array.isArray(receipt.timeline) &&
+  need(receipt?.owner === deliveryFingerprint(binding) && Array.isArray(receipt.timeline) &&
     validatePostgresRecovery(receipt.evidence).messageID === binding.messageID, 'Invalid or foreign PostgreSQL recovery receipt');
   return { ...binding, postgresRecovery: receipt.evidence, postgresTimeline: receipt.timeline };
+}
+const invocationPath = (root, messageID) => join(root, 'powershell-invocations', messageID + '.json');
+function withShellEvidence(root, binding) {
+  binding = withPostgresRecovery(root, binding);
+  if (!/^msg_[a-zA-Z0-9]+$/.test(binding.messageID ?? '')) return binding;
+  const path = invocationPath(root, binding.messageID);
+  if (!existsSync(path)) return binding;
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  need(saved?.owner === deliveryFingerprint(binding) && Array.isArray(saved.calls), 'Invalid or foreign PowerShell invocation proof');
+  return { ...binding, invocationProofs: saved.calls };
+}
+function saveInvocationProofs(root, binding, calls) {
+  if (!calls.length) return;
+  const path = invocationPath(root, binding.messageID);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJSON(path, { owner: deliveryFingerprint(binding), calls });
 }
 const closureOwner = binding => createHash('sha256').update(JSON.stringify([
   ...['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID']
@@ -253,7 +269,7 @@ async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess
   const messages = await assignmentMessages(client, binding);
   if (verifyPriorPlan) need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
     JSON.stringify(binding.planPath) + '\n'), 'Prior plan was not confirmed in the current OpenCode history');
-  const boundary = closureBoundary(withPostgresRecovery(stateRoot, binding), messages, current.session, await client.request(shellRoute));
+  const boundary = closureBoundary(withShellEvidence(stateRoot, binding), messages, current.session, await client.request(shellRoute));
   const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
   need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
     'History changed during closure verification');
@@ -685,10 +701,11 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
             const closed = preparedTransition(stateRoot, candidateBinding) ??
               (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
                 readClosure(stateRoot, candidateBinding));
-            if (closed) need(sameBoundary(closed.boundary, closureBoundary(candidateBinding, messages, liveSession, shells)),
+            const boundHistory = withShellEvidence(stateRoot, candidateBinding);
+            if (closed) need(sameBoundary(closed.boundary, closureBoundary(boundHistory, messages, liveSession, shells)),
               'History changed since closure; no dispatch');
             else {
-              const history = inspectMessages(withPostgresRecovery(stateRoot, candidateBinding), messages);
+              const history = inspectMessages(boundHistory, messages);
               need(!history.kind, 'Saved assignment history failed or was interrupted');
               if (['FINISHED', 'REVIEWING'].includes(candidateBinding.phase) ||
                 candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment) completion(history, liveSession, shells);
@@ -1271,14 +1288,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(plan.workspace === ctx.workspace && (importedCount === undefined || plan.correctionCount === importedCount), 'Plan workspace/count conflicts with saved history');
     return plan;
   }
-  async function reviewedResult(binding) {
+  async function reviewedResult(binding, invocationCheck) {
     const current = await snapshot(binding);
     need(!current.active && !current.forms.length && !current.permissions.length && current.session.outcome === 'succeeded' &&
       current.session.time?.idle >= binding.submittedAt, 'Executor has not ended this assignment');
-    const history = inspectMessages(withPostgresRecovery(stateRoot, binding), await assignmentMessages(client, binding));
+    const history = inspectMessages(withShellEvidence(stateRoot, binding), await assignmentMessages(client, binding));
     need(!history.kind, 'Failed/interrupted assignment cannot be released');
     const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace));
-    completion(history, current.session, shells);
+    completion(history, current.session, shells, invocationCheck);
     const confirmed = await snapshot(binding);
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
@@ -1298,7 +1315,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
     if (messages.length) {
       need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
-      const history = inspectMessages({ workspace: binding.workspace, messageID: messages[0].id }, messages, { adopting: true });
+      const previous = messages[0].id === binding.messageID ? withShellEvidence(stateRoot, binding) :
+        { workspace: binding.workspace, messageID: messages[0].id };
+      const history = inspectMessages(previous, messages, { adopting: true });
       need(!history.kind, 'Existing session failed/interrupted; no automatic recovery');
       completion(history, session, shells);
     } else need(session.outcome === undefined && session.time.idle === undefined, 'Existing history/status mismatch');
@@ -1443,8 +1462,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       if (begun.outcome) return begun.outcome;
       return withOwnership(begun.lease, async () => {
         try {
-          const boundary = await reviewedResult(begun.expected);
+          const verified = [];
+          const boundary = await reviewedResult(begun.expected, { verified });
           return commit(begun.expected, (state, binding) => {
+            saveInvocationProofs(stateRoot, binding, verified);
             if (binding.adoption) Object.assign(binding.adoption, boundary);
             binding.nextAssignment = kind; binding.phase = 'PREPARING';
             return summary(state, binding, 'prepared');
@@ -1452,14 +1473,21 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         } catch (error) { return stoppedOutcome(begun.expected, error); }
       });
     },
-    async finish(workspace, planPath, nonGitBaseline) {
-      const begun = beginObserved(workspace, planPath, nonGitBaseline, ['REVIEWING', 'FINISHED'], 'finish');
+    async finish(workspace, planPath, nonGitBaseline, archive) {
+      if (archive !== undefined) need(isAbsolute(archive) && /\.evtx$/i.test(archive) &&
+        statSync(archive).isFile(), 'Use an absolute path to a Windows PowerShell .evtx archive');
+      const begun = beginObserved(workspace, planPath, nonGitBaseline, archive ? ['FINISHED'] : ['REVIEWING', 'FINISHED'], 'finish');
       if (begun.outcome) return begun.outcome;
       return withOwnership(begun.lease, async () => {
         try {
-          await reviewedResult(begun.expected);
-          return commit(begun.expected, (state, binding) => { binding.phase = 'FINISHED'; return summary(state, binding, 'released'); }).result;
-        } catch (error) { return stoppedOutcome(begun.expected, error); }
+          const verified = [];
+          await reviewedResult(begun.expected, { verified, archive });
+          return commit(begun.expected, (state, binding) => {
+            saveInvocationProofs(stateRoot, binding, verified);
+            binding.phase = 'FINISHED';
+            return summary(state, binding, 'released');
+          }).result;
+        } catch (error) { return archive ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
       });
     },
     async transition(workspace, planPath, messageID, disposition, { kind, nonGitBaseline, connectionError } = {}) {
@@ -1685,7 +1713,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             const refresh = stream.takeFailureHint();
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) {
               messages = await assignmentMessages(client, expected);
-              history = inspectMessages(postgresRecovery ? { ...expected, postgresRecovery } : withPostgresRecovery(stateRoot, expected), messages);
+              const boundHistory = withShellEvidence(stateRoot, expected);
+              history = inspectMessages(postgresRecovery ? { ...boundHistory, postgresRecovery } : boundHistory, messages);
             }
             if (stream.fault || combined.aborted) continue;
             locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected, state),
@@ -1736,7 +1765,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 delete binding.pending; binding.phase = 'REVIEWING';
                 if (postgresRecovery) {
                   const path = postgresPath(stateRoot, binding.messageID);
-                  const receipt = { owner: postgresOwner(binding), evidence: postgresRecovery, timeline: result.result.postgresRecovery };
+                  const receipt = { owner: deliveryFingerprint(binding), evidence: postgresRecovery, timeline: result.result.postgresRecovery };
                   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
                   if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(receipt),
                     'A different PostgreSQL recovery receipt already exists');
@@ -2068,7 +2097,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const current = await idleExisting(start.state, start.expected);
           need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === adoption[key]),
             'Existing session changed since preparation; no dispatch');
-        }
+        } else if (start.expected.assignmentID) await reviewedResult(start.expected);
         const session = await sessionMatches(start.expected);
         await noForms(start.expected);
         await idleWorkspace(start.state, ctx);

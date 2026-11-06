@@ -312,6 +312,7 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
   const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors,
+    invocationProofs: binding.invocationProofs,
     ...(binding.postgresRecovery ? { recoveryBinding: binding } : {}) };
   // Keep history failure separate from current executor activity; preserve tools for questions.
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
@@ -355,7 +356,7 @@ export function validateAnswer(request, payload) {
   }
 }
 
-export function completion(history, session, shells) {
+export function completion(history, session, shells, invocationCheck) {
   need(!history.kind, 'Failed/interrupted exchange cannot complete');
   const { final, idle, tools } = history;
   need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
@@ -376,7 +377,7 @@ export function completion(history, session, shells) {
   need(tools.every(tool => (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
     (readOnlyToolError(tool) || recovered.some(value => value.id === tool.id && value.messageID === tool.messageID))) &&
     Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed), 'Outstanding/unknown tool operation');
-  const postgres = endedShells(history, shells);
+  const postgres = endedShells(history, shells, false, invocationCheck);
   const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   need(output.trim(), 'Empty final response');
   return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
@@ -388,7 +389,7 @@ export function completion(history, session, shells) {
 
 const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
 
-function detachedReason(command, tool, postgresRecovery) {
+function detachedReason(command, maskInvocationCalls, postgresRecovery) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
   const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
   // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
@@ -407,11 +408,10 @@ function detachedReason(command, tool, postgresRecovery) {
     .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
   const loneAmpersand = /(^|[^&])&([^&]|$)/;
   if (loneAmpersand.test(normalize(command)) &&
-    (!/[=|]\s*&/.test(command) || loneAmpersand.test(normalize(maskVerifiedInvocationCalls(command, tool)))))
+    (!/[=|]\s*&/.test(command) || loneAmpersand.test(normalize(maskInvocationCalls(command)))))
     return 'unclassified or background ampersand';
 }
 
-// shortcut: recover Windows PowerShell calls only while their exact engine lifecycle events are available.
 const invocationCallProbe = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -421,59 +421,77 @@ $ast = [System.Management.Automation.Language.Parser]::ParseInput($call.command,
 if ($errors.Count) { exit }
 $offsets = @($ast.FindAll({ param($node)
   $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq 'Ampersand'
-}, $true) | ForEach-Object { $_.Extent.StartOffset })
+}, $true) | ForEach-Object { $_.Extent.StartOffset } | Sort-Object -Unique)
 if (!$offsets.Count) { exit }
 $start = [DateTimeOffset]::FromUnixTimeMilliseconds($call.ran).LocalDateTime
 $end = [DateTimeOffset]::FromUnixTimeMilliseconds($call.completed).LocalDateTime
 $exe = Join-Path $PSHOME 'powershell.exe'
 $prefix = "$exe -NoLogo -NoProfile -NonInteractive -Command "
 # The event query can round timestamps. Check the exact millisecond window below.
-$events = @(Get-WinEvent -FilterHashtable @{ LogName='Windows PowerShell'; ProviderName='PowerShell';
-  Id=400,403; StartTime=$start.AddSeconds(-1); EndTime=$end.AddSeconds(1) } -MaxEvents 257)
+$filter = @{ ProviderName='PowerShell'; Id=400,403; StartTime=$start.AddSeconds(-1); EndTime=$end.AddSeconds(1) }
+if ($call.archive) { $filter.Path = $call.archive } else { $filter.LogName = 'Windows PowerShell' }
+$events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents 257)
 if ($events.Count -ge 257) { exit }
 $matchesByProcess = @($events | ForEach-Object {
   $at = ([DateTimeOffset]$_.TimeCreated).ToUnixTimeMilliseconds()
   $context = ([string]$_.Properties[2].Value).Replace([Environment]::NewLine, [string][char]10)
   $applicationField = [regex]::Match($context, '(?ms)^[ \t]*HostApplication=(.*)\n[ \t]*EngineVersion=')
-  if ($at -ge $call.ran -and $at -le $call.completed -and $applicationField.Success) {
+  if ($_.LogName -eq 'Windows PowerShell' -and $at -ge $call.ran -and $at -le $call.completed -and $applicationField.Success) {
     $application = $applicationField.Groups[1].Value
     if ($application.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
         $application.Substring($prefix.Length) -ceq $call.command.Replace([Environment]::NewLine, [string][char]10) -and
         $context.Substring(0, $applicationField.Index) -match '(?im)^[ \t]*HostId=([0-9a-f-]{36})$') {
-      [pscustomobject]@{ Id=$_.Id; ProcessId=$_.ProcessId; HostId=$Matches[1] }
+      [pscustomobject]@{ id=$_.Id; at=$at; record=$_.RecordId; pid=$_.ProcessId; host=$Matches[1] }
     }
   }
 })
 if ($matchesByProcess.Count -eq 2 -and $matchesByProcess[0].Id -eq 403 -and $matchesByProcess[1].Id -eq 400 -and
-  $matchesByProcess[0].ProcessId -gt 0 -and $matchesByProcess[0].ProcessId -eq $matchesByProcess[1].ProcessId -and
-  $matchesByProcess[0].HostId -eq $matchesByProcess[1].HostId) {
-  ConvertTo-Json -Compress -InputObject $offsets
+  $matchesByProcess[0].pid -gt 0 -and $matchesByProcess[0].pid -eq $matchesByProcess[1].pid -and
+  $matchesByProcess[0].host -eq $matchesByProcess[1].host) {
+  ConvertTo-Json -Compress -InputObject @{ offsets=$offsets; events=@($matchesByProcess[1],$matchesByProcess[0]) }
 }`;
 
-function maskVerifiedInvocationCalls(command, tool) {
+function maskVerifiedInvocationCalls(command, tool, saved, check) {
   const { ran, completed } = tool.time ?? {};
   if (process.platform !== 'win32' || !process.env.SystemRoot || tool.name !== 'shell' ||
     tool.state.status !== 'completed' || tool.state.metadata?.status !== 'completed' ||
     !Number.isSafeInteger(ran) || !Number.isSafeInteger(completed) || ran >= completed || command.length > 32_768) return command;
-  try {
-    const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
-    const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-      Buffer.from(invocationCallProbe, 'utf16le').toString('base64')], {
-      input: Buffer.from(JSON.stringify({ command: tool.state.input.command, ran, completed })).toString('base64'),
-      encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    if (!output.trim()) return command;
-    const offsets = JSON.parse(output);
-    if (!Array.isArray(offsets) || !offsets.every(offset => Number.isSafeInteger(offset) && command[offset] === '&')) return command;
-    const characters = command.split('');
-    for (const offset of offsets) characters[offset] = ' ';
-    return characters.join('');
-  } catch { return command; }
+  const original = tool.state.input.command;
+  const identity = { id: tool.id, messageID: tool.messageID, ran, completed,
+    hash: createHash('sha256').update(original).digest('hex') };
+  const valid = proof => Array.isArray(proof?.offsets) && proof.offsets.length > 0 &&
+    proof.offsets.every((offset, index) => Number.isSafeInteger(offset) && command[offset] === '&' &&
+      (index === 0 || offset > proof.offsets[index - 1])) &&
+    Array.isArray(proof.events) && proof.events.length === 2 && proof.events.every((event, index) =>
+      event?.id === (index === 0 ? 400 : 403) && Number.isSafeInteger(event.at) && event.at >= ran && event.at <= completed &&
+      Number.isSafeInteger(event.record) && event.record > 0 && Number.isSafeInteger(event.pid) && event.pid > 0 &&
+      typeof event.host === 'string' && /^[a-f0-9-]{36}$/i.test(event.host)) &&
+    proof.events[0].pid === proof.events[1].pid && proof.events[0].host === proof.events[1].host &&
+    proof.events[0].at <= proof.events[1].at && proof.events[0].record < proof.events[1].record;
+  const probe = archive => {
+    try {
+      const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+      const output = execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        Buffer.from(invocationCallProbe, 'utf16le').toString('base64')], {
+        input: Buffer.from(JSON.stringify({ command: original, ran, completed, archive })).toString('base64'),
+        encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65_536, stdio: ['pipe', 'pipe', 'ignore'],
+      });
+      const proof = output.trim() && JSON.parse(output);
+      return valid(proof) ? proof : undefined;
+    } catch { return undefined; }
+  };
+  const matching = saved?.find(proof => proof && Object.keys(identity).every(key => proof[key] === identity[key]) && valid(proof));
+  const proof = matching ?? probe() ?? (check?.archive ? probe(check.archive) : undefined);
+  if (!proof) return command;
+  check?.verified?.push({ ...identity, offsets: proof.offsets, events: proof.events });
+  const characters = command.split('');
+  for (const offset of proof.offsets) characters[offset] = ' ';
+  return characters.join('');
 }
 
 const shellEvidenceID = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id) ? id : 'unknown';
 
-function endedShells(history, shells, closing = false) {
+function endedShells(history, shells, closing = false, invocationCheck) {
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
   const unfinishedIndex = shells.data.findIndex(shell => !['exited', 'timeout', 'killed'].includes(shell?.status) || !Number.isFinite(shell?.time?.completed));
   if (unfinishedIndex >= 0) {
@@ -505,7 +523,8 @@ function endedShells(history, shells, closing = false) {
         shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
       const recovered = postgres.get(tool.id);
       const command = recovered?.command ?? input.command;
-      const reason = detachedReason(command, tool, postgres.size > 0);
+      const reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),
+        postgres.size > 0);
       need(!reason, 'Detached command status unknown; no ownership transfer' + call + ': ' + reason);
     }
   }

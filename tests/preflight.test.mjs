@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { execFile, execFileSync } from 'node:child_process';
+import childProcess, { execFile, execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +38,87 @@ async function finishedPair(f, count = 7) {
   assert.equal(finished.status, 0, JSON.stringify(finished.result));
   return sessionID;
 }
+
+test('finished PowerShell proof survives event rollover and stays bound to the exact delivery', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POWERSHELL_EVENTS !== '1',
+}, async t => {
+  const f = await fixture(t), stateRoot = dirname(f.statePath), chatID = 'offline-http-chat-A';
+  const bound = await f.call(f.bindArgs(0));
+  const sessionID = bound.result.sessionID, route = '/api/session/' + sessionID + '/prompt';
+  const submitted = await f.call(['submit', f.workspace, f.plan, 'powershell-proof', f.packet, '--non-git-baseline', baseline]);
+  assert.equal(submitted.status, 0);
+  const command = "# " + randomUUID() + "\n$out = & (Join-Path $env:SystemRoot 'System32/where.exe') /?\n$out";
+  const exe = join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const ran = Date.now();
+  execFileSync(exe, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], { timeout: 5000, stdio: 'ignore', windowsHide: true });
+  const completed = Date.now(), call = { type: 'tool', name: 'shell', id: 'call_powershell', time: { ran, completed },
+    state: { status: 'completed', input: { command }, metadata: { status: 'completed', exit: 0 } } };
+  const messages = f.messages.get(sessionID);
+  messages.push({ id: 'msg_powershell', type: 'assistant', model, time: { completed }, content: [call] });
+  f.finish(sessionID);
+  assert.equal((await f.call(['wait', f.workspace, f.plan, '--non-git-baseline', baseline])).result.phase, 'REVIEWING');
+  const finished = await f.call(['finish', f.workspace, f.plan, '--non-git-baseline', baseline]);
+  assert.equal(finished.result.phase, 'FINISHED', JSON.stringify(finished.result));
+  const saved = f.state(), receipt = join(stateRoot, 'powershell-invocations', saved.bindings[0].messageID + '.json');
+  const proof = JSON.parse(readFileSync(receipt, 'utf8')).calls[0];
+  assert.deepEqual(proof.events.map(event => event.id), [400, 403]);
+  assert.equal(proof.id, call.id);
+  assert.ok(!readFileSync(receipt, 'utf8').includes(command));
+  const archive = join(f.root, 'powershell.evtx');
+  const query = '/q:*[System[(EventRecordID=' + proof.events[0].record + ' or EventRecordID=' + proof.events[1].record + ')]]';
+  execFileSync(join(process.env.SystemRoot, 'System32/wevtutil.exe'), ['epl', 'Windows PowerShell', archive, query],
+    { timeout: 5000, windowsHide: true });
+  const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+  const adapter = helper(client, { stateRoot, chatID });
+  const check = () => preflight(client, { stateRoot, chatID, workspace: f.workspace, planPath: f.plan, nonGitBaseline: baseline });
+  const run = childProcess.execFileSync;
+  t.mock.method(childProcess, 'execFileSync', function (file, args, options) {
+    if (file === exe && args.includes('-EncodedCommand') && options?.input &&
+      !JSON.parse(Buffer.from(options.input, 'base64').toString('utf8')).archive) return '';
+    return run.call(this, file, args, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    const before = readFileSync(f.statePath);
+    assert.equal((await check()).status, 'pass');
+    for (const key of ['command', 'id', 'delivery']) {
+      if (key === 'command') call.state.input.command = command + '\nGet-Date &';
+      if (key === 'id') call.id = 'call_changed';
+      if (key === 'delivery') {
+        const different = structuredClone(saved);
+        different.bindings[0].messageID = messages[0].id = 'msg_differentDelivery';
+        writeFileSync(f.statePath, JSON.stringify(different));
+      }
+      const result = await check();
+      assert.equal(result.status, 'blocked');
+      assert.match(result.checks.find(item => item.name === 'history').reason, /background ampersand/);
+      call.state.input.command = command;
+      call.id = proof.id;
+      messages[0].id = saved.bindings[0].messageID;
+      writeFileSync(f.statePath, before);
+    }
+    f.shells = [{ id: 'sh_running', status: 'running' }];
+    assert.match((await check()).checks.find(item => item.name === 'history').reason, /Project shell still running/);
+    f.shells = [];
+    renameSync(receipt, receipt + '.fixture');
+    assert.equal((await check()).status, 'blocked');
+    const invalidArchive = join(f.root, 'invalid.evtx');
+    writeFileSync(invalidArchive, 'No lifecycle events');
+    assert.equal((await adapter.finish(f.workspace, f.plan, baseline, invalidArchive)).kind, 'rejected');
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.equal(existsSync(receipt), false);
+    assert.equal((await adapter.finish(f.workspace, f.plan, baseline, archive)).kind, 'released');
+    assert.equal((await check()).status, 'pass');
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.equal((await adapter.next(f.workspace, f.plan, 'block', baseline)).kind, 'prepared');
+    call.state.input.command = command + '\nGet-Date &';
+    await assert.rejects(adapter.submit(f.workspace, f.plan, 'following-block', f.packet, baseline, 'block'), /background ampersand/);
+    assert.equal(f.posts(route), 1);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
 
 test('CLI preflight combines independent blockers and repeat runs leave all state untouched', async t => {
   const f = await fixture(t), pair = await f.call(f.bindArgs(7));

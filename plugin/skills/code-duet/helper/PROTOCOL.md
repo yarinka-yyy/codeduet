@@ -31,7 +31,7 @@ node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-co
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <assignment-id> <absolute-packet-file>
 node helper/cli.mjs next <absolute-workspace> <absolute-plan.md> <block|correction>
 node helper/cli.mjs submit <absolute-workspace> <absolute-plan.md> <fresh-assignment-id> <absolute-packet-file> --kind <block|correction>
-node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md>
+node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md> [--powershell-event-log <absolute-file.evtx>]
 node helper/cli.mjs transition <absolute-workspace> <target-plan.md> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]
 node helper/cli.mjs retire-legacy <absolute-workspace> <old-plan.md> <lease-token>
 node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>
@@ -606,6 +606,16 @@ are missing. Only the advisor can mark all required work DONE.
 FINISHED can explicitly continue via next in the same plan, or bind can select
 a new plan after checking the previous assignment. Neither resets counters.
 STOPPED has no automatic recovery; next/finish do not bypass it.
+
+On a successful finish or next, the helper saves verified Windows PowerShell
+invocation offsets and the matching event 400/403 metadata. The receipt binds
+the exact delivery, tool call, command hash and tool time window. Subsequent
+history checks still verify completion and detect any other background work.
+For an older FINISHED delivery, the owner chat can run
+`finish <workspace> <plan> --powershell-event-log <absolute-file.evtx>`
+with the existing baseline option if required. The helper applies the same
+event checks to the archived Windows PowerShell log when live evidence is
+missing. Unmatched or missing events leave the saved phase and count intact.
 
 ## close-assignment
 
