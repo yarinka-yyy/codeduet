@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MODEL } from '../helper/connection.mjs';
-import { inspectMessages, completion } from '../helper/interaction.mjs';
+import { inspectMessages, completion, closureBoundary } from '../helper/interaction.mjs';
 
 // Native 2.1.4 shapes: synthetic input, then manual compaction after a final/idle.
 function exchange() {
@@ -20,6 +20,17 @@ function exchange() {
 }
 const inspect = (messages, adopting = true) => inspectMessages({ messageID: 'msg_user' }, messages, { adopting });
 const complete = history => completion(history, { time: { idle: 41 } }, { data: [] });
+
+function checkShell(command, { input = {}, metadata = {}, shells = [] } = {}) {
+  const messages = exchange().filter(message => message.type !== 'synthetic');
+  Object.assign(messages[1].content[0], { id: 'call_shell_check', name: 'shell', state: {
+    status: 'completed', input: { command, ...input }, metadata: { status: 'completed', ...metadata },
+  } });
+  const binding = { messageID: 'msg_user', submittedAt: 1 };
+  const session = { model: MODEL, outcome: 'succeeded', time: { idle: 41 } };
+  return [() => completion(inspectMessages(binding, messages), session, { data: shells }),
+    () => closureBoundary(binding, messages, session, { data: shells })];
+}
 
 test('completed native compaction and prior synthetic preserve the final, all tools and source history', () => {
   const messages = exchange(), before = structuredClone(messages), history = inspect(messages);
@@ -79,18 +90,40 @@ for (const command of [
   'cd C:/fixture; & $tool test 2>&1',
   'if ($true) { & "C:/fixture/tool.exe" test }',
   '& tool.exe test 2>&1',
+  "$env:GOTOOLCHAIN='local'\r\n  & $go version\r\n& $node --version",
+  "$nodeDir='C:/fixture'\n& (Join-Path $nodeDir 'npm.cmd') --version",
+  "Write-Output 'start verification'",
+  'Write-Output ok # Start-Job is forbidden',
+  'printf ok && npm test 2>&1',
 ]) test('foreground shell syntax does not become background: ' + command, () => {
-  const messages = exchange(), tool = messages[1].content[0];
-  Object.assign(tool, { name: 'shell', state: { status: 'completed', input: { command }, metadata: { status: 'completed' } } });
-  assert.equal(complete(inspect(messages)).kind, 'completed-for-review');
+  const [finish, close] = checkShell(command);
+  assert.equal(finish().kind, 'completed-for-review');
+  assert.equal(close().idleAt, 41);
 });
 
-for (const command of [
-  'dotnet build 2>&1 &', 'cd C:/fixture; & $tool test; sleep 10 &',
-  '$p=Start-Process tool.exe -PassThru; if (!$p.WaitForExit(1000)) { $p.Kill() }',
-  'Start-Job { build }', 'nohup build', 'python -c "subprocess.Popen(args)"',
-]) test('redirection or invocation normalization cannot hide detached work: ' + command, () => {
-  const messages = exchange(), tool = messages[1].content[0];
-  Object.assign(tool, { name: 'shell', state: { status: 'completed', input: { command }, metadata: { status: 'completed' } } });
-  assert.throws(() => complete(inspect(messages)), /Detached command status unknown/);
+for (const [command, reason] of [
+  ['dotnet build 2>&1 &', 'ampersand'],
+  ['cd C:/fixture; & $tool test; sleep 10 &', 'ampersand'],
+  ['Write-Output ok\n& (Join-Path $nodeDir "tool.exe") &', 'ampersand'],
+  ['sleep 10 \\\n& echo done', 'ampersand'],
+  ['$p=Start-Process tool.exe -PassThru; if (!$p.WaitForExit(1000)) { $p.Kill() }', 'start-process'],
+  ['Start-Job { build }', 'start-job'],
+  ['nohup build', 'nohup'],
+  ['python -c "subprocess.Popen(PRIVATE_INPUT)"', 'popen'],
+  ['Write-Output "$(Start-Job { build })"', 'start-job'],
+  ['cmd /c "start tool.exe"', 'start'],
+]) test('redirection or invocation normalization cannot hide detached work: ' + reason, () => {
+  for (const check of checkShell(command)) assert.throws(check, error => {
+    assert.match(error.message, /Detached command status unknown.*call_shell_check/);
+    assert.ok(error.message.endsWith(reason));
+    assert.ok(!error.message.includes('PRIVATE_INPUT'));
+    return true;
+  });
+});
+
+test('shell evidence still blocks pending and untracked background operations', () => {
+  for (const check of checkShell('go version', { metadata: { shellID: 'sh_check' }, shells: [{ id: 'sh_check', status: 'running' }] }))
+    assert.throws(check, /Project shell still running.*call_shell_check/);
+  for (const check of checkShell('go version', { input: { background: true } }))
+    assert.throws(check, /Background operation status unknown.*call_shell_check/);
 });

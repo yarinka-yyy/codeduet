@@ -381,13 +381,42 @@ export function completion(history, session, shells) {
     ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
 }
 
+const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
+
+function detachedReason(command) {
+  // shortcut: only exempt simple output data when the engine omits the shell dialect.
+  const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
+  // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
+  const launcherSource = outputData.test(command) ? '' : command.replace(
+    /^([ \t]*rg[ \t]+-n[ \t]+)'[\w .:-]*(\|[\w:.-]+(?:\|[\w:.-]+)*)?'(?=[ \t])/i,
+    (pattern, prefix, alternatives) => detachedLauncher.test(alternatives ?? '') ? pattern : prefix + 'quoted');
+  const launcher = launcherSource.match(detachedLauncher);
+  if (launcher) return 'possible detached launcher ' + launcher[0].toLowerCase();
+
+  // A physical line cannot start a Bash background operator unless the line continues a command.
+  const separateLines = !/[\\^`]\r?\n/.test(command);
+  const unquoted = (separateLines ? command.replace(/(^|\r?\n)[ \t]*&[ \t]*(?=\(|['"\$\w])/g, '$1') : command)
+    .replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
+    .replace(/\b\d+>&\d+\b/g, 'redirect')
+    .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
+  if (/(^|[^&])&([^&]|$)/.test(unquoted)) return 'unclassified or background ampersand';
+}
+
+const shellEvidenceID = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id) ? id : 'unknown';
+
 function endedShells(history, shells, closing = false) {
   need(shells?.data && Array.isArray(shells.data), 'Unknown project shell status');
-  need(shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
+  const unfinishedIndex = shells.data.findIndex(shell => !['exited', 'timeout', 'killed'].includes(shell?.status) || !Number.isFinite(shell?.time?.completed));
+  if (unfinishedIndex >= 0) {
+    const unfinished = shells.data[unfinishedIndex];
+    const tool = history.tools.find(tool => unfinished?.id && tool.state.metadata?.shellID === unfinished.id);
+    throw new Error('Project shell still running or unknown (' + (tool ? 'call ' + shellEvidenceID(tool.id) : 'shell ' + shellEvidenceID(unfinished?.id)) + ')');
+  }
   // Detached processes cannot be certified by a completed launcher. Stop instead of supervising the OS.
   for (const tool of history.tools) {
     const input = tool.state.input ?? {};
     const shellID = tool.state.metadata?.shellID;
+    const call = ' (call ' + shellEvidenceID(tool.id) + ')';
     const listed = typeof shellID === 'string' ? shells.data.filter(shell => shell.id === shellID) : [];
     const launch = history.backgroundShells?.get(shellID);
     const notice = launch && launch.toolID === tool.id && launch.messageID === tool.messageID ? launch.notice : undefined;
@@ -395,23 +424,17 @@ function endedShells(history, shells, closing = false) {
       shell.command === input.command && shell.exit === notice.metadata.exit && shell.signal === undefined &&
       Number.isFinite(shell.time.started) && shell.time.started >= launch.ran &&
       shell.time.completed >= shell.time.started && shell.time.completed <= notice.time.created),
-      'Project shell disagrees with completion notice');
+      'Project shell disagrees with completion notice' + call);
     const shellEnded = listed.length === 1 || Boolean(notice && (!closing ||
       notice.metadata.state === 'completed' && Number.isSafeInteger(notice.metadata.exit)));
     need(!/background/i.test(tool.name) && (!(input.background === true || tool.state.metadata?.background === true) ||
-      shellEnded), 'Background operation status unknown; no ownership transfer');
+      shellEnded), 'Background operation status unknown; no ownership transfer' + call);
     if (/^(bash|shell|exec|terminal|powershell)$/.test(tool.name)) {
-      need(typeof input.command === 'string', 'Unknown shell command');
+      need(typeof input.command === 'string', 'Unknown shell command' + call);
       need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
-        shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status');
-      const command = input.command;
-      const unquoted = command.replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
-        .replace(/\b\d+>&\d+\b/g, 'redirect')
-        .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
-      // A single-quoted PowerShell rg pattern is search data, even when it names a launcher.
-      const launcherSource = closing ? command.replace(/(^|[;|])(\s*rg\s+-n\s+)'(?:''|[^'\r\n])*'/gi, '$1$2quoted') : command;
-      need(!/Start-Process|Start-Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\b(?:cmd\s+\/c\s+)?start\s/i.test(launcherSource) &&
-        !/(^|[^&])&([^&]|$)/.test(unquoted), 'Detached command status unknown; no ownership transfer');
+        shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
+      const reason = detachedReason(input.command);
+      need(!reason, 'Detached command status unknown; no ownership transfer' + call + ': ' + reason);
     }
   }
 }

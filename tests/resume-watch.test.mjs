@@ -33,6 +33,13 @@ function unchanged(f, before, callsFrom) {
 
 test('explicit CLI resumes the same completed assignment without POST, new binding or counter reset', async t => {
   const f = await stopped(t), saved = f.state(), callsFrom = f.calls.length;
+  const now = Date.now();
+  f.messages.get(f.resume.sessionID).push({ id: 'msg_shell', type: 'assistant', model, time: { completed: now }, content: [
+    { id: 'call_shell', type: 'tool', name: 'shell', time: { completed: now }, state: {
+      status: 'completed', metadata: { status: 'completed', exit: 0 },
+      input: { command: "$env:GOTOOLCHAIN='local'\n& $go version\n& (Join-Path $nodeDir 'npm.cmd') --version" },
+    } },
+  ] });
   f.finish(f.resume.sessionID);
   const result = await f.call(f.args);
   assert.equal(result.status, 0, JSON.stringify(result));
