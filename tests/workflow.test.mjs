@@ -7,7 +7,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { helper } from '../helper/binding.mjs';
-import { MODEL } from '../helper/connection.mjs';
+import { diagnosticError, MODEL } from '../helper/connection.mjs';
 
 const source = fileURLToPath(new URL('./fixtures/workflow/', import.meta.url));
 const baseline = 'Baseline: isolated offline workflow fixture';
@@ -205,6 +205,34 @@ test('questions and next preparation do not consume corrections; accepted next b
   assert.equal(f.state().plans[0].correctionCount, 1); assert.equal(f.promptCount(), 3);
 });
 
+for (const phase of ['EXECUTING', 'REVIEWING', 'FINISHED']) test('engine restart rebinds only the exact delivery in ' + phase, async t => {
+  const f = await setup(t, { count: 3 });
+  const original = await f.submit(), { sessionID, messageID } = original;
+  if (phase !== 'EXECUTING') await complete(f);
+  if (phase === 'FINISHED') await f.finish();
+  f.client.engineID = 'restarted-engine';
+  const rebind = (id, session) => f.adapter.rebindEngine(f.workspace, f.plan, id, session, baseline);
+  const before = f.state();
+  await assert.rejects(rebind(messageID, 'ses_other'), /No exact delivered assignment/);
+  const prompt = f.client.timelines.get(sessionID)[0], originalText = prompt.text;
+  prompt.text += 'changed';
+  await assert.rejects(rebind(messageID, sessionID), /checksum|fingerprint|changed|delivery/i);
+  assert.deepEqual(f.state(), before);
+  prompt.text = originalText;
+  const result = await rebind(messageID, sessionID);
+  assert.equal(result.kind, 'engine-rebound');
+  assert.equal(result.phase, phase);
+  assert.equal(result.correctionCount, 3);
+  assert.equal(result.taskSent, false);
+  assert.equal(f.promptCount(), 1);
+  assert.equal(f.state().bindings[0].engineID, f.client.engineID);
+  if (phase === 'FINISHED') {
+    await f.next('block');
+    assert.equal((await f.submit('post-restart-block', 'block')).sessionID, sessionID);
+    assert.equal(f.promptCount(), 2);
+  }
+});
+
 test('fresh offline chat and explicit same-pair continuation preserve count', async t => {
   const f = await setup(t, { count: 18 }); await f.submit('fix-19', 'correction'); await complete(f); await f.finish();
   assert.equal((await f.next('block')).correctionCount, 19);
@@ -291,6 +319,27 @@ test('plan switch rechecks old execution and keeps the old binding stopped if it
 });
 
 for (const action of ['next', 'finish']) {
+  test(action + ' preserves the confirmed review state after a temporary history read error', async t => {
+    const f = await setup(t, { count: 7 });
+    await f.submit(); await complete(f);
+    if (action === 'finish') await f.finish();
+    const before = f.state(), run = action === 'finish' ? f.finish : () => f.next('block');
+    const request = f.client.request;
+    f.client.request = function (route, ...args) {
+      if (route.includes('/message?')) throw diagnosticError('Temporary history read failure', 'request-read', 'history', { method: 'GET' });
+      return request.call(this, route, ...args);
+    };
+    const rejected = await run();
+    assert.equal(rejected.kind, 'rejected');
+    assert.equal(rejected.phase, action === 'finish' ? 'FINISHED' : 'REVIEWING');
+    assert.deepEqual(f.state(), before);
+    f.client.request = request;
+    const resumed = await run();
+    assert.equal(resumed.kind, action === 'finish' ? 'released' : 'prepared');
+    assert.equal(resumed.messageID, before.bindings[0].messageID);
+    assert.equal(resumed.correctionCount, 7);
+    assert.equal(f.promptCount(), 1);
+  });
   test(action + ' cannot release an active assignment or accept an executor final alone', async t => {
     const f = await setup(t); await f.submit();
     const result = action === 'next' ? await f.next('block') : await f.finish();

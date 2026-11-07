@@ -57,9 +57,7 @@ test('finished PowerShell proof survives event rollover and stays bound to the e
   messages.push({ id: 'msg_powershell', type: 'assistant', model, time: { completed }, content: [call] });
   f.finish(sessionID);
   assert.equal((await f.call(['wait', f.workspace, f.plan, '--non-git-baseline', baseline])).result.phase, 'REVIEWING');
-  const finished = await f.call(['finish', f.workspace, f.plan, '--non-git-baseline', baseline]);
-  assert.equal(finished.result.phase, 'FINISHED', JSON.stringify(finished.result));
-  const saved = f.state(), receipt = join(stateRoot, 'powershell-invocations', saved.bindings[0].messageID + '.json');
+  const receipt = join(stateRoot, 'powershell-invocations', f.state().bindings[0].messageID + '.json');
   const proof = JSON.parse(readFileSync(receipt, 'utf8')).calls[0];
   assert.deepEqual(proof.events.map(event => event.id), [400, 403]);
   assert.equal(proof.id, call.id);
@@ -79,6 +77,9 @@ test('finished PowerShell proof survives event rollover and stays bound to the e
   });
   syncBuiltinESMExports();
   try {
+    const finished = await adapter.finish(f.workspace, f.plan, baseline);
+    assert.equal(finished.phase, 'FINISHED', JSON.stringify(finished));
+    const saved = f.state();
     const before = readFileSync(f.statePath);
     assert.equal((await check()).status, 'pass');
     for (const key of ['command', 'id', 'delivery']) {
@@ -339,6 +340,43 @@ test('explicit candidate reports invalid history, pending forms and running back
   assert.equal(existsSync(f.statePath), false);
 });
 
+test('malformed shell records leave independent preflight checks intact', async t => {
+  const f = await fixture(t);
+  const bound = await f.call(f.bindArgs(0));
+  assert.equal(bound.status, 0, JSON.stringify(bound.result));
+  const start = f.calls.length;
+  for (const entry of [null, {}, 'exited']) {
+    f.shells = [entry];
+    const { result } = await f.call(preflightArgs(f));
+    const checks = Object.fromEntries(result.checks.map(check => [check.name, check]));
+    assert.equal(result.taskSent, false);
+    assert.equal(checks.background.status, 'unknown');
+    assert.equal(checks.history.status, 'unknown');
+    assert.equal(checks.session.status, 'pass');
+    assert.equal(checks.forms.status, 'pass');
+  }
+  assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+});
+
+for (const replacement of [false, true]) {
+  test('preflight resamples activity after a foreign session disappears, new writer: ' + replacement, async t => {
+    const f = await fixture(t);
+    f.active.ses_disappearing = { type: 'running' };
+    f.onRequest = route => {
+      if (route !== '/api/session/ses_disappearing') return;
+      delete f.active.ses_disappearing;
+      if (replacement) {
+        f.active.ses_replacement = { type: 'running' };
+        f.sessions.set('ses_replacement', { id: 'ses_replacement', location: { directory: f.workspace } });
+      }
+    };
+    const { result } = await f.call(preflightArgs(f));
+    assert.equal(result.status, replacement ? 'blocked' : 'pass', JSON.stringify(result));
+    assert.equal(result.checks.find(check => check.name === 'execution').status, replacement ? 'blocked' : 'pass');
+    assert.equal(result.taskSent, false);
+  });
+}
+
 test('preflight verifies a workspace nested inside its physical Git checkout', async t => {
   const f = await fixture(t), checkout = join(f.root, 'git checkout'), workspace = join(checkout, 'nested workspace');
   const plan = join(workspace, 'plans', '001-git.md');
@@ -348,6 +386,14 @@ test('preflight verifies a workspace nested inside its physical Git checkout', a
   const result = await f.call(['preflight', workspace, plan, '--correction-count', '0'], 'offline-http-git-chat');
   assert.equal(result.status, 0); assert.equal(result.result.status, 'pass');
   assert.equal(result.result.workspace.checkout, checkout);
+  f.onRequest = route => {
+    if (route.startsWith('/api/shell?')) {
+      const directory = new URL(route, 'http://localhost').searchParams.get('location[directory]');
+      f.shells = directory === checkout ? [{ id: 'sh_checkout', status: 'running' }] : [];
+    }
+  };
+  const busy = await f.call(['preflight', workspace, plan, '--correction-count', '0'], 'offline-http-git-chat');
+  assert.equal(busy.result.checks.find(check => check.name === 'background').status, 'blocked');
   assert.equal(result.result.checks.find(item => item.name === 'git-checkout').status, 'pass');
   assert.equal(result.result.checks.find(item => item.name === 'baseline').status, 'pass');
   assert.equal(existsSync(f.statePath), false); assert.equal(f.posts('/api/session'), 0);

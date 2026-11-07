@@ -46,10 +46,10 @@ as part of the authorized next assignment. Preserve the previous checkpoint and
 count. Acceptance requires review; `blocked` or `without-acceptance` requires
 the user's explicit decision to leave the previous work unaccepted. Use inspect for diagnosis when no
 plan is ready or after an error; do not require it in addition to a complete preflight.
-Before that preflight, run `node helper/cli.mjs task-maintenance <absolute-workspace>
-<absolute-plan.md>` to update this task's activity and perform local lifecycle
-maintenance. This sends no OpenCode request. It restores a requested archived
-counter before preflight, and skips active or uncertain ownership.
+Run read-only preflight even if local lifecycle maintenance failed. Use
+`node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>` to
+record use and restore an archived counter when preflight requests it. Maintenance
+sends no OpenCode request and skips active or uncertain ownership.
 For a new explicit user selection of Code Duet, after maintenance run
 `node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>` if this is a
 new correction cycle. Use preflight first when continuing an existing assignment or changing plans.

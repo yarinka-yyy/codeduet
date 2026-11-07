@@ -12,7 +12,7 @@ const defaultCli = fileURLToPath(new URL('../helper/cli.mjs', import.meta.url));
 export const baseline = 'Baseline: disposable native HTTP acceptance fixture';
 export const model = { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', enabled: true, status: 'active' };
 
-export async function fixture(t, cli = defaultCli, version = '2.1.4') {
+export async function fixture(t, cli = defaultCli, version = '2.2.0') {
   const temporary = realpathSync(tmpdir()), root = mkdtempSync(join(temporary, 'duet-http-'));
   const home = join(root, 'empty-user'), workspace = join(root, 'workspace space & test');
   mkdirSync(join(home, '.local', 'state', 'opencode'), { recursive: true });
@@ -77,6 +77,7 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
         session.model = body.model;
         messages.set(sessionID, [...(messages.get(sessionID) ?? []), { id: 'msg_selectedHigh', type: 'model-switched',
           previous, model: session.model, time: { created: Date.now() } }]);
+        if (f.fault === 'model-ack-lost') return truncated();
         response.writeHead(204); response.end(); return;
       }
       if (route.endsWith('/prompt') && request.method === 'POST') {
@@ -84,6 +85,7 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
         if (f.fault === 'http429') { response.writeHead(429); response.end(secret); return; }
         messages.set(sessionID, [...(messages.get(sessionID) ?? []), { id: body.id, type: 'user', text: body.text }]);
         f.active[sessionID] = { type: 'running' };
+        if (f.fault === 'prompt-ack-lost') return truncated();
         return send({ data: { id: body.id, sessionID } });
       }
       if (route.endsWith('/reply') && request.method === 'POST') {
@@ -114,7 +116,11 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
         const offset = Number(query.get('cursor') ?? 0), limit = Number(query.get('limit') ?? 100);
         return send({ data: reversed.slice(offset, offset + limit), cursor: { next: String(offset + limit) } });
       }
-      if (route.startsWith('/api/session/')) return send({ data: sessions.get(sessionID) });
+      if (route.startsWith('/api/session/')) {
+        const session = sessions.get(sessionID);
+        if (!session) response.statusCode = 404;
+        return send({ data: session });
+      }
       response.writeHead(404); response.end();
     } catch { response.writeHead(500); response.end(); }
   });
@@ -128,6 +134,7 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
     url: 'http://127.0.0.1:' + server.address().port, password: secret }));
   const registrationBefore = readFileSync(registration);
   f.call = (args, chatID = 'offline-http-chat-A', timeoutMs = 10_000, extraEnv = {}) => new Promise((resolve, reject) => {
+    if (args[0] === 'submit' && !args.includes('--manual-observation') && !args.includes('--codex-exe')) args = [...args, '--manual-observation'];
     const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, windowsHide: true,
       env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_THREAD_ID: chatID, ...extraEnv },
       signal: AbortSignal.timeout(timeoutMs), stdio: ['ignore', 'pipe', 'pipe'] });
@@ -146,15 +153,18 @@ export async function fixture(t, cli = defaultCli, version = '2.1.4') {
     });
   });
   f.bindArgs = count => ['bind', workspace, plan, '--correction-count', String(count), '--non-git-baseline', baseline];
-  f.submitArgs = ['submit', workspace, plan, 'correction-20', packet, '--kind', 'correction', '--non-git-baseline', baseline];
+  f.submitArgs = ['submit', workspace, plan, 'correction-20', packet, '--kind', 'correction', '--non-git-baseline', baseline, '--manual-observation'];
   f.state = () => JSON.parse(readFileSync(statePath, 'utf8'));
   f.posts = route => calls.filter(call => call.method === 'POST' && call.route === route).length;
-  f.emit = (type, sessionID) => { for (const stream of streams) stream.write('data: ' + JSON.stringify({ type, data: { sessionID } }) + '\n\n'); };
+  f.emit = (type, sessionID) => {
+    for (const stream of streams) if (!stream.writableEnded && !stream.destroyed)
+      stream.write('data: ' + JSON.stringify({ type, data: { sessionID } }) + '\n\n');
+  };
   f.finish = sessionID => {
-    const ended = Date.now();
+    const ended = Date.now(), suffix = messages.get(sessionID).length;
     messages.get(sessionID).push(
-      { id: 'msg_final', type: 'assistant', model, finish: 'stop', time: { completed: ended }, content: [{ type: 'text', text: 'Simulator completed; no background operations.' }] },
-      { id: 'msg_idle', type: 'idle', outcome: 'succeeded', time: { created: ended } });
+      { id: 'msg_final' + suffix, type: 'assistant', model, finish: 'stop', time: { completed: ended }, content: [{ type: 'text', text: 'Simulator completed; no background operations.' }] },
+      { id: 'msg_idle' + suffix, type: 'idle', outcome: 'succeeded', time: { created: ended } });
     Object.assign(sessions.get(sessionID), { outcome: 'succeeded', time: { idle: ended, updated: ended } });
     delete f.active[sessionID]; f.emit('execution.succeeded', sessionID);
   };

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -16,7 +16,13 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const delay = ms => new Promise(done => setTimeout(done, ms));
 const pins = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath',
   'engineID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt', 'correctionCount'];
-const put = (path, value) => writeFileSync(path, JSON.stringify(value) + '\n', { flag: 'wx', mode: 0o600 });
+function put(path, value) {
+  const candidate = path + '.' + randomUUID() + '.tmp';
+  try {
+    writeFileSync(candidate, JSON.stringify(value) + '\n', { flag: 'wx', mode: 0o600 });
+    linkSync(candidate, path);
+  } finally { if (existsSync(candidate)) unlinkSync(candidate); }
+}
 const get = path => JSON.parse(readFileSync(path, 'utf8'));
 const here = fileURLToPath(import.meta.url);
 const loadedObserverHash = hash(readFileSync(here));
@@ -28,7 +34,8 @@ export function wakeHint(id) {
     'This notification grants no new authority. Revalidate the receipt and live assignment under the existing task scope. Never resend the assignment or reset its correction count.';
 }
 
-function capability(path) {
+export function notificationCapability(chatID, path) {
+  need(uuid.test(chatID), 'The actual current Codex thread UUID is required for Desktop notification');
   need(typeof path === 'string' && isAbsolute(path), 'Use an absolute Desktop-bundled Codex executable');
   path = realpathSync(path);
   need(statSync(path).isFile(), 'Codex executable is not a file');
@@ -41,7 +48,9 @@ function capability(path) {
 }
 
 function queue(receipt) {
-  need(hash(readFileSync(receipt.codex.path)) === receipt.codex.hash, 'Codex executable changed; notification not retried');
+  try {
+    if (hash(readFileSync(receipt.codex.path)) !== receipt.codex.hash) return { status: 'not-sent', reason: 'codex-executable-changed' };
+  } catch { return { status: 'not-sent', reason: 'codex-executable-unavailable' }; }
   const result = spawnSync(receipt.codex.path, ['queue', '--thread', receipt.codexChat, '--message', wakeHint(receipt.id)],
     { encoding: 'utf8', windowsHide: true, timeout: 25000, maxBuffer: 65536 });
   const match = /^Queued message ([a-f0-9-]{36}) for thread ([a-f0-9-]{36})\.\s*$/.exec(result.stdout ?? '');
@@ -51,7 +60,7 @@ function queue(receipt) {
 
 // Injectable boundaries are for isolated engine fixtures; the CLI always uses the real store/chat.
 export function observer({ stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
-  connectEngine = connect, deliver = queue, launch, checkCapability = capability } = {}) {
+  connectEngine = connect, deliver = queue, launch, checkCapability = path => notificationCapability(chatID, path) } = {}) {
   need(uuid.test(chatID), 'The actual current Codex thread UUID is required');
   const directory = join(stateRoot, 'observers', hash(chatID)), active = join(directory, 'active');
   const pathFor = id => { need(uuid.test(id), 'Invalid observer receipt'); return join(directory, id); };
@@ -90,11 +99,15 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     if (!id) return { kind: 'observer-status', state: 'absent', executorStopped: false };
     const value = receipt(id), dir = pathFor(id);
     const read = name => existsSync(join(dir, name)) ? get(join(dir, name)) : null;
-    const notification = read('notify-result.json'), result = read('result.json');
+    const attempted = !!read('notify-attempt.json'), notification = read('notify-result.json'), result = read('result.json'), started = read('started.json');
+    const receiptHash = hash(readFileSync(join(dir, 'receipt.json'))), slot = existsSync(active) ? get(active) : null;
+    const startup = !started && slot?.id === id ? ownerLiveness(slot.receiptHash === receiptHash ? slot.launcher : null) : undefined;
     return { kind: 'observer-status', id, codexChat: chatID, workspace: value.workspace, planPath: value.planPath,
       sessionID: value.sessionID, assignmentID: value.assignmentID, messageID: value.messageID,
-      correctionCount: value.correctionCount, mode: value.mode ?? 'bound', started: read('started.json'), ready: !!read('ready.json'),
-      result, notification, attempted: existsSync(join(dir, 'notify-attempt.json')),
+      correctionCount: value.correctionCount, mode: value.mode ?? 'bound', started, ready: !!read('ready.json'),
+      ...(startup ? { startup: { ...startup, spawnReserved: !!read('spawn-intent.json') } } : {}),
+      result, notification: notification ?? (attempted ? { status: 'uncertain' } : null), attempted,
+      ...(result ? { manualCommand: { command: 'consume', args: [id] } } : {}),
       cancelled: existsSync(join(dir, 'cancel.json')), consumed: existsSync(join(dir, 'consumed.json')),
       exited: !!read('exited.json'), taskSent: false, executorStopped: false };
   }
@@ -116,24 +129,30 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     'No eligible delivered assignment; explicit resume is required for STOPPED');
     const codex = checkCapability(codexExe), id = randomUUID(), dir = pathFor(id);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    let launched = false;
+    let reserved = false, launched = false;
     try {
+      mkdirSync(dir, { mode: 0o700 });
+      const snapshot = join(dir, 'code-duet');
+      const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
+      const before = packageFiles.map(file => hash(readFileSync(join(sourceRoot, file))));
+      need(before[packageFiles.indexOf('helper/observer.mjs')] === loadedObserverHash, 'Observer package changed before startup');
+      packageSkill(snapshot);
+      need(packageFiles.every((file, index) => hash(readFileSync(join(snapshot, file))) === before[index] &&
+        hash(readFileSync(join(sourceRoot, file))) === before[index]), 'Package changed during observer startup');
+      const value = external ? saved : Object.fromEntries(pins.map(key => [key, saved[key]]));
+      const receiptPath = join(dir, 'receipt.json');
+      put(receiptPath, { schema: 1, id, ...value, codex, timeoutMs, resume, ...(nonGitBaseline ? { nonGitBaseline } : {}) });
       withStateLock(stateRoot, () => {
-        put(active, { id }); // Unknown or live slots are never replaced.
-        try {
-          mkdirSync(dir, { mode: 0o700 });
-          const snapshot = join(dir, 'code-duet');
-          const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
-          const before = packageFiles.map(file => hash(readFileSync(join(sourceRoot, file))));
-          need(before[packageFiles.indexOf('helper/observer.mjs')] === loadedObserverHash, 'Observer package changed before startup');
-          packageSkill(snapshot);
-          need(packageFiles.every((file, index) => hash(readFileSync(join(snapshot, file))) === before[index] &&
-            hash(readFileSync(join(sourceRoot, file))) === before[index]), 'Package changed during observer startup');
-          const value = external ? saved : Object.fromEntries(pins.map(key => [key, saved[key]]));
-          put(join(dir, 'receipt.json'), { schema: 1, id, ...value, codex, timeoutMs, resume, ...(nonGitBaseline ? { nonGitBaseline } : {}) });
-          if (external) put(externalSlot(saved), { id, codexChat: chatID });
-        } catch (error) { release(id); throw error; }
+        if (external) externalUnchanged(saved, stateRoot);
+        else {
+          const current = binding();
+          need(pins.every(key => current[key] === value[key]), 'Observer pins/count changed before startup');
+        }
+        put(active, { id, launcher: processOwner(), receiptHash: hash(readFileSync(receiptPath)) });
+        reserved = true;
+        if (external) put(externalSlot(saved), { id, codexChat: chatID });
       });
+      put(join(dir, 'spawn-intent.json'), { at: Date.now() });
       if (launch) { await launch(id); launched = true; }
       else {
         const child = spawn(process.execPath, [join(dir, 'code-duet', 'helper', 'observer.mjs'), 'worker', id],
@@ -152,16 +171,19 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         await delay(100);
       }
       throw new Error('Observer startup unconfirmed; inspect status, do not launch another observer');
-    } catch (error) { if (!launched) withStateLock(stateRoot, () => release(id)); throw error; }
+    } catch (error) { if (reserved && !launched) withStateLock(stateRoot, () => release(id)); throw error; }
   }
   async function worker(id) {
     const value = receipt(id), dir = pathFor(id);
     const owner = processOwner();
     withStateLock(stateRoot, () => {
       need(existsSync(active) && get(active).id === id, 'Observer slot changed');
+      const slot = get(active), receiptHash = hash(readFileSync(join(dir, 'receipt.json')));
+      need(slot.receiptHash === undefined || slot.receiptHash === receiptHash && existsSync(join(dir, 'spawn-intent.json')),
+        'Observer launch reservation changed');
       need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled before startup');
       put(join(dir, 'started.json'), { pid: process.pid, process: owner, at: Date.now(),
-        receiptHash: hash(readFileSync(join(dir, 'receipt.json'))) });
+        receiptHash });
     });
     const abort = new AbortController();
     const interrupt = () => abort.abort();
@@ -190,6 +212,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     }
     try {
       put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
+        ...(result.result?.shellOutcomes?.length ? { shellOutcomes: result.result.shellOutcomes } : {}),
         ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
         ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
         ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
@@ -204,7 +227,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         // At most one attempt: a crash or missing queue response is never permission to send again.
         let notification;
         try { notification = await deliver(value); } catch { notification = { status: 'uncertain', exitCode: null }; }
-        need(['sent', 'uncertain'].includes(notification?.status), 'Unknown queue result');
+        need(['sent', 'uncertain', 'not-sent'].includes(notification?.status), 'Unknown queue result');
         put(join(dir, 'notify-result.json'), notification);
       }
     } finally { put(join(dir, 'exited.json'), { at: Date.now() }); }
@@ -218,35 +241,55 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     }
     need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled; notification grants no action');
     need(existsSync(join(dir, 'result.json')), 'No event receipt; inspect status');
+    const exitedPath = join(dir, 'exited.json'), startedPath = join(dir, 'started.json'), receiptPath = join(dir, 'receipt.json');
+    const started = existsSync(startedPath) ? get(startedPath) : null;
+    const workerEnded = () => existsSync(exitedPath) || started?.receiptHash === hash(readFileSync(receiptPath)) &&
+      ownerLiveness(started.process).status === 'dead';
     const end = Date.now() + 25000;
-    while (!existsSync(join(dir, 'exited.json')) && Date.now() < end) await delay(100);
-    need(existsSync(join(dir, 'exited.json')), 'Observer has not released observation; inspect status');
+    if (!workerEnded()) {
+      while (!existsSync(exitedPath) && Date.now() < end) await delay(100);
+      need(workerEnded(), 'Observer has not released observation; inspect status');
+    }
+    const attempt = join(dir, 'consume-attempt.json'), token = randomUUID();
+    const previous = existsSync(attempt) ? get(attempt) : null;
+    const takeover = previous && ownerLiveness(previous.process).status === 'dead';
     withStateLock(stateRoot, () => {
       need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled; notification grants no action');
+      need(!existsSync(join(dir, 'consumed.json')) && existsSync(active) && get(active).id === id, 'Observer result already consumed or slot changed');
       same(value);
-      put(join(dir, 'consume-attempt.json'), { at: Date.now() });
+      if (takeover && existsSync(attempt) && JSON.stringify(get(attempt)) === JSON.stringify(previous)) unlinkSync(attempt);
+      put(attempt, { token, process: processOwner(), at: Date.now() });
     });
-    const event = get(join(dir, 'result.json'));
-    let executorCheck;
-    if (event.kind === 'observer-error' && value.mode === 'external') {
-      try {
-        const current = await externalOutcome(await connectEngine(), stateRoot, value);
-        executorCheck = { status: 'checked', kind: current.kind, executorActivity: current.executorActivity,
-          exchangeOutcome: current.exchangeOutcome, reviewAllowed: false, dispatchAllowed: false };
-      } catch (error) { executorCheck = { status: 'unavailable', diagnostic: diagnose(error, 'unknown', 'snapshot') }; }
+    try {
+      const event = get(join(dir, 'result.json'));
+      let executorCheck;
+      if (event.kind === 'observer-error' && value.mode === 'external') {
+        try {
+          const current = await externalOutcome(await connectEngine(), stateRoot, value);
+          executorCheck = { status: 'checked', kind: current.kind, executorActivity: current.executorActivity,
+            exchangeOutcome: current.exchangeOutcome, reviewAllowed: false, dispatchAllowed: false };
+        } catch (error) { executorCheck = { status: 'unavailable', diagnostic: diagnose(error, 'unknown', 'snapshot') }; }
+      }
+      const result = event.kind === 'observer-error' ? { ...event, executorStopped: false, ...(executorCheck ? { executorCheck } : {}) } : value.mode === 'external' ?
+        await externalOutcome(await connectEngine(), stateRoot, value) :
+        await helper(await connectEngine(), { stateRoot, chatID }).wait(value.workspace, value.planPath,
+          { nonGitBaseline: value.nonGitBaseline, once: true });
+      if (result.kind === 'retryable-read') return { ...result, receiptID: id, taskSent: false,
+        manualCommand: { command: 'consume', args: [id] } };
+      withStateLock(stateRoot, () => {
+        need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled during consume; no action');
+        same(value);
+        put(join(dir, 'consumed.json'), { at: Date.now(), kind: result.kind });
+        release(id);
+        unlinkSync(attempt);
+      });
+      return { ...result, ...(event.exchangeFailure ? { observedExchangeFailure: event.exchangeFailure } : {}),
+        receiptID: id, observerEvent: event.kind, observerState: 'ended', taskSent: false, rearm: result.kind === 'observing' };
+    } finally {
+      if (existsSync(attempt)) withStateLock(stateRoot, () => {
+        if (existsSync(attempt) && get(attempt).token === token) unlinkSync(attempt);
+      });
     }
-    const result = event.kind === 'observer-error' ? { ...event, executorStopped: false, ...(executorCheck ? { executorCheck } : {}) } : value.mode === 'external' ?
-      await externalOutcome(await connectEngine(), stateRoot, value) :
-      await helper(await connectEngine(), { stateRoot, chatID }).wait(value.workspace, value.planPath,
-        { nonGitBaseline: value.nonGitBaseline, once: true });
-    withStateLock(stateRoot, () => {
-      need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled during consume; no action');
-      same(value);
-      put(join(dir, 'consumed.json'), { at: Date.now(), kind: result.kind });
-      release(id);
-    });
-    return { ...result, ...(event.exchangeFailure ? { observedExchangeFailure: event.exchangeFailure } : {}),
-      receiptID: id, observerEvent: event.kind, observerState: 'ended', taskSent: false, rearm: result.kind === 'observing' };
   }
   async function cancel(id) {
     receipt(id); const dir = pathFor(id);
@@ -256,16 +299,20 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       const startedPath = join(dir, 'started.json'), receiptPath = join(dir, 'receipt.json');
       const startedBytes = existsSync(startedPath) ? readFileSync(startedPath, 'utf8') : null;
       const started = startedBytes ? JSON.parse(startedBytes) : null, receiptHash = hash(readFileSync(receiptPath));
-      if (!existsSync(exited)) workerOwner = ownerLiveness(started?.receiptHash === receiptHash ? started.process : null);
+      const slot = !started && existsSync(active) ? get(active) : null;
+      const process = started?.receiptHash === receiptHash ? started.process :
+        slot?.id === id && slot.receiptHash === receiptHash ? slot.launcher : null;
+      if (!existsSync(exited)) workerOwner = ownerLiveness(process);
       withStateLock(stateRoot, () => {
         if (!existsSync(cancelled)) put(cancelled, { at: Date.now() });
         if (!existsSync(exited) && workerOwner?.status === 'dead') {
-          need(hash(readFileSync(receiptPath)) === receiptHash && readFileSync(startedPath, 'utf8') === startedBytes,
+          const latestStarted = existsSync(startedPath) ? readFileSync(startedPath, 'utf8') : null;
+          need(hash(readFileSync(receiptPath)) === receiptHash && latestStarted === startedBytes &&
+            (started || existsSync(active) && JSON.stringify(get(active)) === JSON.stringify(slot)),
             'Worker evidence changed; cancellation unconfirmed');
-          // Recheck under the same lock used by arm/start/release. Unknown ownership stays refused.
-          const confirmed = ownerLiveness(started.process);
-          if (confirmed.status === 'dead') put(exited, { at: Date.now(), kind: 'dead-worker',
-            process: started.process, receiptHash, reason: confirmed.reason });
+          // A late worker cannot start after its exact slot was retired under this lock.
+          put(exited, { at: Date.now(), kind: started ? 'dead-worker' : 'startup-fenced', process,
+            receiptHash, reason: workerOwner.reason });
         }
         if (existsSync(exited)) release(id);
       });
@@ -302,7 +349,7 @@ if (process.argv[1] && resolve(process.argv[1]) === here) {
     if (result) {
       console.log(JSON.stringify(result));
       if (result.kind === 'observer-start-failed' || command === 'consume' &&
-        (result.phase === 'STOPPED' || result.kind === 'observer-error')) process.exitCode = 1;
+        (result.phase === 'STOPPED' || ['observer-error', 'retryable-read'].includes(result.kind))) process.exitCode = 1;
     }
   } catch (error) {
     console.error(JSON.stringify({ kind: 'observer-rejected', error: error.message, taskSent: false, retried: false }));

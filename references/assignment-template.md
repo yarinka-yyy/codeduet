@@ -5,6 +5,12 @@ Do not create another plan or copy the whole conversation. Store the resulting
 packet inside the physical workspace. The advisor records route/baseline in
 the plan before dispatch; the executor does not edit that checkpoint.
 
+Start the packet with one machine-readable line. Use JSON escaping for paths.
+
+```text
+Code Duet packet: {"planPath":"<exact absolute plan>","assignmentID":"<fresh ID>","kind":"<initial|block|correction>"}
+```
+
 - Assignment ID: <fresh ID, different from the reviewed assignment>.
 - Kind: <initial | block | correction>; correction count before send: <0..20>;
   corrective submission requires fewer than 20 prior corrections.

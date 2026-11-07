@@ -8,7 +8,7 @@ import { connect, MODEL } from '../helper/connection.mjs';
 function fixture(t) {
   const parent = realpathSync(tmpdir()), root = mkdtempSync(join(parent, 'duet-retry-'));
   const registrationPath = join(root, 'service.json');
-  const registration = { id: 'offline-engine', version: '2.1.4', url: 'http://127.0.0.1:1234', password: 'PRIVATE_RETRY_CANARY' };
+  const registration = { id: 'offline-engine', version: '2.2.0', url: 'http://127.0.0.1:1234', password: 'PRIVATE_RETRY_CANARY' };
   writeFileSync(registrationPath, JSON.stringify(registration));
   t.after(() => { assert.ok(resolve(root).startsWith(parent + sep)); rmSync(root, { recursive: true }); });
   return { root, registrationPath, registration };
@@ -27,8 +27,30 @@ function clock() {
   };
 }
 
-const goodInfo = () => Response.json({ version: '2.1.4' });
+const goodInfo = () => Response.json({ version: '2.2.0' });
 const goodModel = () => Response.json({ data: [{ ...MODEL, enabled: true, status: 'active' }] });
+
+test('partial registration and transient GET recover, while POST is never repeated', async t => {
+  const f = fixture(t), time = clock();
+  writeFileSync(f.registrationPath, '{"id":');
+  let gets = 0, posts = 0;
+  const client = await connect({ registrationPath: f.registrationPath, now: time.now,
+    sleep: async ms => { await time.sleep(ms); writeFileSync(f.registrationPath, JSON.stringify(f.registration)); },
+    setTimer: time.setTimer, clearTimer: time.clearTimer,
+    fetchImpl: async (url, init) => {
+      if (url.endsWith('/info')) return goodInfo();
+      if (url.endsWith('/model')) return goodModel();
+      if (init.method === 'POST') { posts++; return new Response('', { status: 503 }); }
+      gets++;
+      return gets === 1 ? new Response('', { status: 429 }) : gets === 2 ? new Response('{"data":') : Response.json({ data: [] });
+    },
+  });
+  assert.equal(client.bootstrap.attempts, 2);
+  assert.deepEqual(await client.request('/api/shell'), { data: [] });
+  assert.equal(gets, 3);
+  await assert.rejects(client.request('/api/session', {}), /mutation uncertain/);
+  assert.equal(posts, 1);
+});
 
 test('bootstrap retries only safe GETs, rereads registration, aborts sibling and clears attempt timers', async t => {
   const f = fixture(t), time = clock(), calls = [], authorizations = [], siblingSignals = [];
@@ -201,7 +223,7 @@ test('registration, version, response shape and model mismatch stop after one bo
   writeFileSync(f.registrationPath, JSON.stringify(f.registration));
   for (const response of [
     () => Response.json({}),
-    () => Response.json({ version: '2.1.4' }),
+    () => Response.json({ version: '2.2.6' }),
   ]) {
     let infoCalls = 0, modelCalls = 0;
     await assert.rejects(connect({ registrationPath: f.registrationPath, now: time.now, sleep: time.sleep,

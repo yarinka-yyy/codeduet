@@ -33,6 +33,22 @@ test('archives after 30 days and restores the exact correction count on use', as
   assert.equal(ledger().entries.find(entry => entry.planPath === f.plan).lastUsed, period + 2);
 });
 
+test('preflight shows an archived exact pair and still checks OpenCode with a broken archive journal', async t => {
+  const { f, root, other, run } = await setup(t, 'FINISHED');
+  run(f.plan, 1); run(other, period + 1);
+  const args = ['preflight', f.workspace, f.plan, '--non-git-baseline', baseline];
+  const archived = (await f.call(args)).result;
+  assert.equal(archived.taskArchive.correctionCount, 9);
+  assert.equal(archived.taskArchive.deliveries[0].sessionID, 'ses_test');
+  assert.equal(archived.nextCommand.command, 'task-maintenance');
+  const before = readFileSync(f.statePath);
+  writeFileSync(join(root, 'task-lifecycle.json'), '{');
+  const broken = (await f.call(args)).result;
+  assert.equal(broken.checks.find(check => check.name === 'task-maintenance').status, 'unknown');
+  assert.equal(broken.checks.find(check => check.name === 'connection').status, 'pass');
+  assert.deepEqual(readFileSync(f.statePath), before);
+});
+
 test('removes an untouched archive after another 30 days without deleting project files', async t => {
   const { f, other, run, ledger } = await setup(t);
   const original = readFileSync(f.plan);

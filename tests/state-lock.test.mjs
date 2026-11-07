@@ -5,9 +5,9 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { helper } from '../helper/binding.mjs';
+import { helper, stateLockStatus } from '../helper/binding.mjs';
 import { diagnose } from '../helper/connection.mjs';
 import { baseline, fixture } from './http-fixture.mjs';
 
@@ -34,6 +34,7 @@ test('native EEXIST preserves a foreign lock and state without engine access', a
     return true;
   });
   assert.equal(fs.readFileSync(f.lockPath, 'utf8'), 'FOREIGN_WRITER');
+  assert.equal(stateLockStatus({ stateRoot: f.stateRoot }).ownerStatus, 'unknown');
   assert.equal(fs.readFileSync(f.statePath, 'utf8'), f.original);
   assert.equal(f.calls.length, 0);
 });
@@ -41,10 +42,10 @@ test('native EEXIST preserves a foreign lock and state without engine access', a
 for (const stage of ['state-directory', 'state-lock']) {
   for (const code of ['EACCES', 'EPERM', 'EROFS', 'ERR_ACCESS_DENIED', 'ENOSPC', 'ENOTDIR', 'EEXIST', 'PRIVATE_PATH_CANARY']) {
     test(stage + ' classifies ' + code + ' without leaks or state mutation', async t => {
-      const f = store(t), method = stage === 'state-directory' ? 'mkdirSync' : 'openSync';
+      const f = store(t), method = stage === 'state-directory' ? 'mkdirSync' : 'linkSync';
       const original = fs[method]; let attempts = 0;
       t.mock.method(fs, method, function (path, ...args) {
-        if (path === (stage === 'state-directory' ? f.stateRoot : f.lockPath)) {
+        if (stage === 'state-directory' ? path === f.stateRoot : args[0] === f.lockPath) {
           attempts++;
           throw Object.assign(new Error('PRIVATE_PATH_CANARY password=PRIVATE_SECRET'), { code, path: 'PRIVATE_PATH_CANARY' });
         }
@@ -68,7 +69,7 @@ for (const stage of ['state-directory', 'state-lock']) {
         });
       } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
       if (stage === 'state-lock' && code === 'EEXIST') {
-        assert.ok(attempts > 1 && attempts <= 7); assert.ok(Date.now() - startedAt < 120);
+        assert.ok(attempts > 1 && attempts <= 7); assert.ok(Date.now() - startedAt < 5000);
       } else assert.equal(attempts, 1);
       assert.equal(f.calls.length, 0);
       assert.equal(fs.readFileSync(f.statePath, 'utf8'), f.original);
@@ -76,6 +77,54 @@ for (const stage of ['state-directory', 'state-lock']) {
     });
   }
 }
+
+for (const stage of ['before-write', 'before-rename', 'after-rename']) test('state lock recovery after SIGKILL at ' + stage, async t => {
+  const f = store(t), plan = join(f.root, 'plan.md');
+  fs.writeFileSync(plan, '# Isolated state-write test\n');
+  const module = new URL('../helper/binding.mjs', import.meta.url).href;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { startCycle } from ${JSON.stringify(module)};
+    const [stateRoot, path, workspace, planPath, stage] = process.argv.slice(1);
+    const halt = () => {
+      process.stdout.write('locked');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    };
+    const write = fs.writeFileSync, rename = fs.renameSync;
+    fs.writeFileSync = (target, ...args) => {
+      if (typeof target === 'string' && target.startsWith(path + '.') && stage === 'before-write') halt();
+      return write(target, ...args);
+    };
+    fs.renameSync = (from, to) => {
+      if (to === path && stage === 'before-rename') halt();
+      rename(from, to);
+      if (to === path && stage === 'after-rename') halt();
+    };
+    syncBuiltinESMExports();
+    startCycle(workspace, planPath, { stateRoot, chatID: 'state-lock-crash-fixture' });`,
+  f.stateRoot, f.statePath, f.root, plan, stage], { windowsHide: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  const exited = new Promise((resolve, reject) => { child.once('close', resolve); child.once('error', reject); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; });
+  await Promise.race([new Promise(resolve => child.stdout.once('data', resolve)), exited.then(() => assert.fail('Lock owner exited early'))]);
+  const inspect = options => stateLockStatus({ stateRoot: f.stateRoot, ...options });
+  const live = inspect();
+  assert.equal(live.processID, child.pid);
+  assert.equal(live.ownerStatus, 'live');
+  assert.equal(inspect({ recoverToken: live.token }).kind, 'rejected');
+  assert.equal(inspect({ probeOwner: () => ({ state: 'unknown' }) }).ownerStatus, 'unknown');
+  assert.equal(inspect({ probeOwner: () => ({ state: 'present', start: 'another-process' }) }).reason, 'pid-reused');
+  child.kill('SIGKILL'); await exited;
+  assert.equal(inspect({ recoverToken: '00000000-0000-4000-8000-000000000000' }).kind, 'rejected');
+  assert.equal(inspect({ recoverToken: live.token }).kind, 'state-lock-released');
+  assert.equal(inspect().ownerStatus, 'absent');
+  const persisted = fs.readFileSync(f.statePath, 'utf8');
+  if (stage === 'after-rename') assert.deepEqual(JSON.parse(persisted), {
+    schema: 1, plans: [{ workspace: f.root, planPath: plan, correctionCount: 0 }], bindings: [],
+  });
+  else assert.equal(persisted, f.original);
+  assert.ok(fs.existsSync(join(f.stateRoot, 'state-lock-history', live.token + '.lock')));
+});
 
 const cli = fileURLToPath(new URL('../helper/cli.mjs', import.meta.url));
 async function deniedCLI(f, args) {
@@ -102,6 +151,21 @@ test('native CLI access denial during adoption has a diagnostic, no binding and 
   assert.deepEqual(fs.readdirSync(dirname(f.statePath)), before);
   assert.ok(!fs.existsSync(f.statePath));
   assert.ok(f.calls.length >= 2 && f.calls.every(call => call.method === 'GET'));
+});
+
+test('native process probe denial with a writable store has its own diagnosis', { skip: process.platform !== 'win32' }, async t => {
+  const f = await fixture(t), root = dirname(f.statePath);
+  fs.mkdirSync(root, { recursive: true });
+  const result = await promisify(execFile)(process.execPath,
+    ['--no-warnings', '--permission', '--allow-fs-read=*', '--allow-fs-write=' + root, cli, ...f.bindArgs(0)],
+    { cwd: f.workspace, env: { ...process.env, HOME: f.home, USERPROFILE: f.home, CODEX_THREAD_ID: 'offline-http-chat-A' },
+      windowsHide: true, timeout: 10000 }).catch(error => error);
+  assert.equal(result.code, 1);
+  const outcome = JSON.parse(result.stderr);
+  assert.equal(outcome.diagnostic.category, 'process-identity', JSON.stringify(outcome));
+  assert.equal(outcome.diagnostic.stage, 'process-probe');
+  assert.deepEqual(fs.readdirSync(root), []);
+  assert.ok(f.calls.every(call => call.method === 'GET'));
 });
 
 test('native CLI lock/access failures preserve STOPPED uncertain intent and never repeat its POST', async t => {

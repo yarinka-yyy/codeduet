@@ -4,17 +4,21 @@ import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 import { verifyPostgresRecovery } from './postgres-recovery.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export function fingerprint(request) {
-  return createHash('sha256').update(JSON.stringify(request)).digest('hex');
+  return createHash('sha256').update(JSON.stringify(request, (_key, value) =>
+    value && typeof value === 'object' && !Array.isArray(value) ?
+      Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value)).digest('hex');
 }
 
-export function decodeFrame(frame) {
+export function decodeFrame(frame, ignore = () => false) {
   const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
   if (!data) return null;
   let value;
   try { value = JSON.parse(data); if (typeof value === 'string') value = JSON.parse(value); }
   catch (error) { throw diagnosticError('Invalid event frame', 'event-json', 'decode', {}, error); }
+  if (ignore(value)) return null;
   if (!(value && typeof value.type === 'string' && value.data && typeof value.data === 'object' && !Array.isArray(value.data))) throw diagnosticError('Unknown event shape', 'event-shape', 'decode');
   return value;
 }
@@ -24,6 +28,16 @@ export async function watch(client, sessionID, signal, workspace) {
   const startedAt = Date.now();
   let lastEvent = null;
   const observation = () => ({ elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent });
+  const foreign = event => {
+    if (/^(server|location)\.(shutdown|disposed)$/.test(event?.type)) return false;
+    const ids = [event?.data?.sessionID, event?.data?.session?.id, event?.data?.form?.sessionID,
+      event?.data?.permission?.sessionID].filter(value => /^ses_[a-zA-Z0-9]+$/.test(value));
+    if (ids.length) return !ids.includes(sessionID);
+    const directory = event?.location?.directory;
+    if (typeof directory !== 'string' || typeof workspace !== 'string' || !isAbsolute(directory) || !isAbsolute(workspace)) return false;
+    try { return relative(realpathSync(workspace), realpathSync(directory)) !== ''; }
+    catch { return false; }
+  };
   const handshake = new AbortController();
   const timer = setTimeout(() => handshake.abort(), 20_000);
   let response;
@@ -53,7 +67,7 @@ export async function watch(client, sessionID, signal, workspace) {
         let boundary;
         while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
           const separator = buffer.slice(boundary).match(/^\r?\n\r?\n/)[0];
-          const event = decodeFrame(buffer.slice(0, boundary));
+          const event = decodeFrame(buffer.slice(0, boundary), foreign);
           buffer = buffer.slice(boundary + separator.length);
           if (!event) continue;
           if (/^(server|location)\.(shutdown|disposed)$/.test(event.type)) {
@@ -98,24 +112,66 @@ export async function watch(client, sessionID, signal, workspace) {
   };
 }
 
+export async function observationWake(client, sessionID, signal, workspace, pollOnly = false) {
+  const started = Date.now();
+  const recoverable = diagnostic => ['event-eof', 'event-read', 'event-open', 'event-handshake-timeout'].includes(diagnostic?.category);
+  let stream, disconnected, refreshed = false;
+  try { if (!pollOnly) stream = await watch(client, sessionID, signal, workspace); }
+  catch (error) {
+    if (signal.aborted || !recoverable(error.diagnostic)) throw error;
+    disconnected = error.diagnostic;
+  }
+  const fallback = () => {
+    if (!disconnected && !signal.aborted && recoverable(stream?.diagnostic)) disconnected = stream.diagnostic;
+    return pollOnly || disconnected;
+  };
+  return {
+    get fault() { return fallback() ? null : stream?.fault; },
+    get diagnostic() { return disconnected ?? (signal.aborted ? null : stream?.diagnostic); },
+    get observation() { return stream?.observation ?? { elapsedMs: Date.now() - started, lastEvent: null }; },
+    takeFailureHint() {
+      if (fallback() && !refreshed) { refreshed = true; return true; }
+      return stream?.takeFailureHint();
+    },
+    async next(ms) {
+      if (fallback()) await delay(ms, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
+      else await stream.next(ms);
+    },
+    async close() { await stream?.close(); },
+  };
+}
+
 async function messagesSince(client, sessionID, boundary, allowEmpty = false) {
-  let route = `/api/session/${sessionID}/message?limit=100&order=desc`;
+  const base = `/api/session/${sessionID}/message`;
+  let route = base + '?limit=100&order=desc', size = 0;
   const result = [], ids = new Set(), cursors = new Set();
-  // Bound reads stop at this assignment, never at an arbitrary short page.
-  for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
-    const page = await client.request(route);
-    need(Array.isArray(page?.data), 'Unknown message page');
+  const budget = AbortSignal.timeout(90_000);
+  const limit = reason => diagnosticError(reason, 'history-limit', 'history');
+  for (let pageIndex = 0; pageIndex < 200; pageIndex++) {
+    if (budget.aborted) throw limit('History read exceeded 90 seconds before the delivery boundary');
+    const page = await client.request(route, undefined, budget);
+    need(Array.isArray(page?.data) && page.data.length <= 100, 'Unknown message page');
     for (const message of page.data) {
       need(message && typeof message.id === 'string' && !ids.has(message.id), 'Ambiguous message pagination');
+      size += Buffer.byteLength(JSON.stringify(message));
+      if (size > 64 * 1024 * 1024) throw limit('History exceeds 64 MiB before the delivery boundary');
       ids.add(message.id); result.push(message);
-      if (boundary(message)) return result.reverse();
+      if (boundary(message)) {
+        if (pageIndex > 0) {
+          const head = await client.request(base + '?limit=1&order=desc', undefined, budget);
+          need(head?.data?.length === 1 && fingerprint(head.data[0]) === fingerprint(result[0]),
+            'History head changed during paginated read');
+        }
+        return result.reverse();
+      }
     }
     if (allowEmpty && result.length === 0 && page.data.length === 0) return [];
-    need(page.data.length > 0 && typeof page.cursor?.next === 'string' && !cursors.has(page.cursor.next), 'Assignment absent from message history');
+    need(page.data.length > 0 && typeof page.cursor?.next === 'string' && page.cursor.next.length > 0 &&
+      page.cursor.next.length <= 2048 && !cursors.has(page.cursor.next), 'Assignment absent from message history or invalid cursor');
     cursors.add(page.cursor.next);
-    route = `/api/session/${sessionID}/message?limit=100&cursor=${encodeURIComponent(page.cursor.next)}`;
+    route = base + '?limit=100&cursor=' + encodeURIComponent(page.cursor.next);
   }
-  throw new Error('Assignment history exceeds bounded read');
+  throw limit('Assignment history exceeds 200 pages before the delivery boundary');
 }
 
 export function assignmentMessages(client, binding) {
@@ -165,6 +221,13 @@ function nativeSystem(message) {
     Array.isArray(metadata.instructionSources) && metadata.instructionSources.length > 0 &&
     new Set(metadata.instructionSources).size === metadata.instructionSources.length &&
     metadata.instructionSources.every(source => ['core/codemode', 'core/skill-guidance'].includes(source));
+}
+
+function nativeSkill(message) {
+  return /^msg_[a-zA-Z0-9]+$/.test(message.id) && typeof message.skill === 'string' && message.skill.length > 0 &&
+    typeof message.name === 'string' && message.name.length > 0 && typeof message.text === 'string' &&
+    Number.isSafeInteger(message.time?.created) && message.time.created >= 0 &&
+    Object.keys(message).every(key => ['id', 'type', 'skill', 'name', 'text', 'time', 'metadata'].includes(key));
 }
 
 function nativeBackgroundShell(message, launches) {
@@ -217,32 +280,38 @@ function readOnlyToolError(tool) {
     try { if (['http:', 'https:'].includes(new URL(input.url).protocol)) return 'http-rate-limit'; }
     catch { /* Unknown URLs do not establish a read-only request. */ }
   }
+  if (error.type === 'tool.execution' && ['read', 'glob', 'grep'].includes(tool.name) &&
+    (typeof input?.path === 'string' || typeof input?.pattern === 'string')) return 'read-operation-failed';
   return null;
+}
+
+function validateCompaction(message) {
+  need(Object.keys(message).every(key => ['id', 'type', 'time', 'metadata', 'status', 'reason', 'model', 'summary', 'cost', 'tokens', 'error'].includes(key)) &&
+    typeof message.id === 'string' && message.id.startsWith('msg_'), 'Unknown compaction record');
+  need(['running', 'completed', 'failed'].includes(message.status), 'Unknown compaction status');
+  need(['auto', 'manual'].includes(message.reason) && Number.isFinite(message.time?.created) && message.time.created >= 0 &&
+    Object.keys(message.time).length === 1, 'Invalid compaction metadata');
+  if (message.status === 'completed') need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID &&
+    typeof message.summary === 'string', 'Compaction model/summary changed');
 }
 
 export function inspectMessages(binding, messages, { adopting = false } = {}) {
   need(messages[0]?.id === binding.messageID, 'Uncorrelated assignment');
   const tail = messages.slice(1);
   need(!tail.some(message => message.type === 'user'), 'Another user prompt followed the bound assignment');
-  const unsupported = tail.find(message => !['assistant', 'idle', 'synthetic', 'compaction', 'system'].includes(message.type));
+  const unsupported = tail.find(message => !['assistant', 'idle', 'synthetic', 'compaction', 'system', 'skill'].includes(message.type));
   const knownType = ['system', 'skill', 'shell', 'agent-switched', 'model-switched', 'location-switched'].includes(unsupported?.type) ? unsupported.type : 'unrecognized';
-  need(!unsupported, 'Unsupported execution history type: ' + knownType + '; cannot transfer ownership');
-  need(tail.filter(message => message.type === 'system').every(nativeSystem), 'Unknown native system record; cannot transfer ownership');
+  need(!unsupported, 'Unsupported execution history type: ' + knownType + ' (' + shellEvidenceID(unsupported?.id) + '); cannot transfer ownership');
+  for (const message of tail) {
+    if (message.type === 'system') need(nativeSystem(message), 'Unknown native system record (' + shellEvidenceID(message.id) + '); cannot transfer ownership');
+    if (message.type === 'skill') need(nativeSkill(message), 'Unknown native skill record (' + shellEvidenceID(message.id) + '); cannot transfer ownership');
+  }
   const inputs = tail.filter(message => message.type === 'synthetic');
   if (!inputs.every(message => typeof message.text === 'string' && Number.isFinite(message.time?.created) && message.time.created >= 0)) {
     throw diagnosticError('Invalid synthetic input metadata; no ownership transfer', 'history-correlation', 'history',
       { historyType: 'synthetic', errorCode: 'InvalidSyntheticInput' });
   }
-  const compactions = tail.filter(message => message.type === 'compaction');
-  for (const message of compactions) {
-    need(Object.keys(message).every(key => ['id', 'type', 'time', 'metadata', 'status', 'reason', 'model', 'summary', 'cost', 'tokens', 'error'].includes(key)) &&
-      typeof message.id === 'string' && message.id.startsWith('msg_'), 'Unknown compaction record');
-    need(['running', 'completed', 'failed'].includes(message.status), 'Unknown compaction status');
-    need(['auto', 'manual'].includes(message.reason) && Number.isFinite(message.time?.created) && message.time.created >= 0 &&
-      Object.keys(message.time).length === 1, 'Invalid compaction metadata');
-    if (message.status === 'completed') need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID &&
-      typeof message.summary === 'string', 'Compaction model/summary changed');
-  }
+  for (const message of tail) if (message.type === 'compaction') validateCompaction(message);
   const assistants = tail.filter(message => message.type === 'assistant');
   for (const message of assistants) {
     need(message.model?.id === MODEL.id && message.model?.providerID === MODEL.providerID && Array.isArray(message.content), 'Executor model/history changed');
@@ -267,13 +336,24 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
         { historyType: 'synthetic', errorCode: 'UncorrelatedSyntheticInput' });
     }
   }
-  const failed = tail.find(message => message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
+  const final = assistants.at(-1), idle = tail.at(-1);
+  const retries = new Map();
+  if (idle?.type === 'idle' && idle.outcome === 'succeeded' && final?.finish === 'stop' &&
+    Number.isFinite(final.time?.created) && Number.isFinite(final.time?.completed)) {
+    for (const message of assistants.slice(0, -1)) {
+      const retry = message.retry, status = retry?.error?.status;
+      if (Number.isSafeInteger(retry?.attempt) && retry.attempt > 0 && Number.isFinite(retry.at) &&
+        Number.isFinite(message.time?.created) && message.time.created <= retry.at && retry.at <= final.time.created &&
+        [429, 502, 503, 504].includes(status) && !message.content.some(part => part.type === 'tool') &&
+        (!message.error || message.error.type === retry.error.type && message.error.status === status))
+        retries.set(message, { messageID: message.id, attempt: retry.attempt, status });
+    }
+  }
+  const failed = tail.find(message => !retries.has(message) && (message.error || message.retry || message.type === 'idle' && message.outcome === 'failed' ||
     message.type === 'compaction' && message.status === 'failed' ||
-    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish));
+    message.type === 'assistant' && ['error', 'length', 'content-filter', 'unknown'].includes(message.finish)));
   const interrupted = tail.find(message => message.type === 'idle' && message.outcome === 'interrupted');
   const tools = assistants.flatMap(message => message.content.filter(part => part.type === 'tool').map(part => ({ ...part, messageID: message.id })));
-  const final = assistants.at(-1);
-  const idle = tail.at(-1);
   const evidence = (reason, messageID, tool) => ({ reason,
     ...(/^msg_[a-zA-Z0-9]{1,160}$/.test(messageID) ? { messageID } : {}),
     ...(tool && /^[a-zA-Z0-9_-]{1,160}$/.test(tool.id) ? { toolID: tool.id } : {}),
@@ -311,7 +391,7 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: repair ? 'recovered-edit' : 'blocking',
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
-  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors,
+  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors, retries,
     invocationProofs: binding.invocationProofs,
     ...(binding.postgresRecovery ? { recoveryBinding: binding } : {}) };
   // Keep history failure separate from current executor activity; preserve tools for questions.
@@ -328,18 +408,24 @@ export function interactive(kind, request, binding, history) {
   need(request.sessionID === binding.sessionID && typeof request.id === 'string', 'Wrong interactive session/request');
   const source = kind === 'question' ? request.metadata?.tool : request.source;
   need(source && (kind === 'question' || source.type === 'tool') && history.tools?.some(tool => tool.messageID === source.messageID && tool.id === source.id), 'Interactive request not correlated to this assignment tool');
+  let manualReason;
   if (kind === 'question') {
-    need(request.metadata?.kind === 'question' && /^frm_[a-zA-Z0-9]+$/.test(request.id) && Array.isArray(request.fields) && request.fields.length > 0, 'Unknown question form');
+    need(/^frm_[a-zA-Z0-9]+$/.test(request.id) && Array.isArray(request.fields) && request.fields.length > 0, 'Unknown question form');
+    if (request.metadata?.kind !== 'question') manualReason = 'Native form requires an answer in OpenCode';
     const keys = new Set();
     for (const field of request.fields) {
-      need(field && typeof field.key === 'string' && !keys.has(field.key) && ['string', 'multiselect'].includes(field.type) && !field.when && !field.hidden, 'Unsupported question field');
+      need(field && typeof field.key === 'string' && !keys.has(field.key), 'Invalid or duplicate question field');
+      if (field.when?.length || field.hidden || field.type === 'external' || field.format ||
+        !['string', 'multiselect', 'number', 'integer', 'boolean'].includes(field.type))
+        manualReason ??= field.hidden || field.when?.length ? 'Conditional or hidden fields require an answer in OpenCode' :
+          'Unsupported field semantics require an answer in OpenCode';
       keys.add(field.key);
       need(field.options === undefined || Array.isArray(field.options) && field.options.every(option => typeof option.value === 'string' && typeof option.label === 'string'), 'Invalid question options');
     }
   } else {
     need(/^per[a-zA-Z0-9_]+$/.test(request.id) && typeof request.action === 'string' && Array.isArray(request.resources) && request.resources.every(resource => typeof resource === 'string'), 'Unknown permission request');
   }
-  return { kind, request, fingerprint: fingerprint(request) };
+  return { kind, request, fingerprint: fingerprint(request), ...(manualReason ? { manualReason } : {}) };
 }
 
 export function validateAnswer(request, payload) {
@@ -348,6 +434,12 @@ export function validateAnswer(request, payload) {
   for (const field of request.fields) {
     const value = payload.answer[field.key];
     if (value === undefined) { need(field.required === false, 'Missing answer field'); continue; }
+    if (field.type === 'boolean') { need(typeof value === 'boolean', 'Invalid boolean answer'); continue; }
+    if (['number', 'integer'].includes(field.type)) {
+      need(Number.isFinite(value) && (field.type !== 'integer' || Number.isSafeInteger(value)) &&
+        value >= (field.minimum ?? -Infinity) && value <= (field.maximum ?? Infinity), 'Invalid numeric answer');
+      continue;
+    }
     const values = field.type === 'multiselect' ? value : [value];
     need(Array.isArray(values) && values.every(item => typeof item === 'string') && new Set(values).size === values.length, 'Invalid single/multiple answer');
     if (field.type === 'string') need(typeof value === 'string' && value.length >= (field.minLength ?? 0) && value.length <= (field.maxLength ?? Infinity) && (!field.pattern || new RegExp(field.pattern).test(value)), 'Invalid string answer');
@@ -360,11 +452,14 @@ export function completion(history, session, shells, invocationCheck) {
   need(!history.kind, 'Failed/interrupted exchange cannot complete');
   const { final, idle, tools } = history;
   need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
-  need(history.tail.filter(message => message.type === 'assistant').every(message => Number.isFinite(message.time?.completed)), 'Unfinished assistant step');
+  need(history.tail.filter(message => message.type === 'assistant').every(message => history.retries?.has(message) ||
+    Number.isFinite(message.time?.completed)), 'Unfinished assistant step');
   need(idle?.type === 'idle' && idle.outcome === 'succeeded' && idle.time?.created >= final.time.completed && session.time.idle >= idle.time.created, 'No correlated terminal idle');
   const finalIndex = history.tail.indexOf(final);
+  const notices = new Set([...history.backgroundShells?.values() ?? []].map(launch => launch?.notice).filter(Boolean));
   for (const [index, message] of history.tail.entries()) {
-    if (['synthetic', 'system'].includes(message.type)) need(index < finalIndex &&
+    if (notices.has(message)) need(message.time.created <= idle.time.created, 'Shell completion notice is newer than terminal idle');
+    else if (['synthetic', 'system', 'skill'].includes(message.type)) need(index < finalIndex &&
       message.time.created <= final.time.completed, 'No completed final after ' + message.type + ' input');
     if (message.type === 'compaction') {
       need(message.status === 'completed', 'Compaction has not completed');
@@ -374,20 +469,37 @@ export function completion(history, session, shells, invocationCheck) {
   const recovered = history.recoveredToolErrors ?? [];
   need(recovered.every(value => tools.some(tool => tool.id === value.recoveredBy &&
     tool.time?.completed <= final.time.completed)), 'No completed final after recovered edit');
-  need(tools.every(tool => (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
+  need(tools.every(tool => {
+    const launch = history.backgroundShells?.get(tool.state?.metadata?.shellID);
+    if (launch?.notice && launch.toolID === tool.id && launch.messageID === tool.messageID)
+      return launch.ran <= final.time.completed && launch.notice.time.created <= idle.time.created;
+    return (tool.state?.status === 'completed' || tool.state?.status === 'error' &&
     (readOnlyToolError(tool) || recovered.some(value => value.id === tool.id && value.messageID === tool.messageID))) &&
-    Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed), 'Outstanding/unknown tool operation');
+      Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed;
+  }), 'Outstanding/unknown tool operation');
   const postgres = endedShells(history, shells, false, invocationCheck);
+  const shellOutcomes = tools.filter(tool => /^(bash|shell|exec|terminal|powershell)$/.test(tool.name)).map(tool => {
+    const metadata = tool.state.metadata ?? {}, registered = shells.data.find(shell => shell.id && shell.id === metadata.shellID);
+    const notice = history.backgroundShells?.get(metadata.shellID)?.notice?.metadata;
+    const exit = notice?.exit ?? registered?.exit ?? metadata.exit, signal = notice?.signal ?? registered?.signal ?? metadata.signal;
+    const timeout = notice?.timeout === true || registered?.status === 'timeout' || metadata.timeout === true;
+    return { callID: shellEvidenceID(tool.id), outcome: timeout ? 'timeout' : signal || registered?.status === 'killed' ? 'signalled' :
+      Number.isSafeInteger(exit) ? exit === 0 ? 'succeeded' : 'nonzero-exit' : 'completed',
+      ...(Number.isSafeInteger(exit) ? { exit } : {}), ...(timeout ? { timeout } : {}),
+      ...(typeof signal === 'string' && /^[a-zA-Z0-9_-]{1,24}$/.test(signal) ? { signal } : {}) };
+  });
   const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   need(output.trim(), 'Empty final response');
   return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
     ...(tool.state.metadata?.timeout === true ? { timeout: true } : {}) })),
     ...(postgres.length ? { postgresRecovery: postgres } : {}),
+    ...(shellOutcomes.length ? { shellOutcomes } : {}),
     ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
+    ...(history.retries?.size ? { recoveredRetries: [...history.retries.values()] } : {}),
     ...(recovered.length ? { recoveredToolErrors: recovered } : {}), endedAt: idle.time.created } };
 }
 
-const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
+const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bsaps\b|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
 
 function detachedReason(command, maskInvocationCalls, postgresRecovery) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
@@ -397,8 +509,15 @@ function detachedReason(command, maskInvocationCalls, postgresRecovery) {
     command.replace(/^[ \t]*"--- pg_ctl start log ---"[ \t]*\r?$/gm, '') : command).replace(
     /^([ \t]*rg[ \t]+-n[ \t]+)'[\w .:-]*(\|[\w:.-]+(?:\|[\w:.-]+)*)?'(?=[ \t])/i,
     (pattern, prefix, alternatives) => detachedLauncher.test(alternatives ?? '') ? pattern : prefix + 'quoted');
-  const launcher = launcherSource.match(detachedLauncher);
+  let verified;
+  const verifiedSource = () => verified ??= maskInvocationCalls(command);
+  const rawLauncher = launcherSource.match(detachedLauncher);
+  const launcher = rawLauncher && /(?:\bWrite-(?:Output|Host)\b|#)/i.test(command) && verifiedSource() !== command ?
+    verifiedSource().match(detachedLauncher) : rawLauncher;
   if (launcher) return 'possible detached launcher ' + launcher[0].toLowerCase();
+  const nested = /\b(?:bash|sh|zsh|cmd)(?:\.exe)?[ \t]+-(?:c|lc)\b|\bcmd(?:\.exe)?[ \t]+\/c\b|\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*?[ \t]-(?:c|command)\b/i.exec(command);
+  if (nested && /(^|[^&])&([^&]|$)/.test(command.slice(nested.index + nested[0].length).replace(/\b\d+>&\d+\b/g, 'redirect')))
+    return 'unclassified ampersand in nested shell';
 
   // A physical line cannot start a Bash background operator unless the line continues a command.
   const separateLines = !/[\\^`]\r?\n/.test(command);
@@ -408,7 +527,7 @@ function detachedReason(command, maskInvocationCalls, postgresRecovery) {
     .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
   const loneAmpersand = /(^|[^&])&([^&]|$)/;
   if (loneAmpersand.test(normalize(command)) &&
-    (!/[=|]\s*&/.test(command) || loneAmpersand.test(normalize(maskInvocationCalls(command)))))
+    loneAmpersand.test(normalize(verifiedSource())))
     return 'unclassified or background ampersand';
 }
 
@@ -422,8 +541,15 @@ if ($errors.Count) { exit }
 $offsets = @($ast.FindAll({ param($node)
   $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq 'Ampersand'
 }, $true) | ForEach-Object { $_.Extent.StartOffset } | Sort-Object -Unique)
-if (!$offsets.Count) { exit }
 if ($call.syntaxOnly) { ConvertTo-Json -Compress -InputObject $offsets; exit }
+$dataExtents = @($tokens | Where-Object Kind -eq 'Comment' | ForEach-Object Extent)
+$dataExtents += @($ast.FindAll({ param($node)
+  $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -in 'Write-Output','Write-Host'
+}, $true) | ForEach-Object { $_.CommandElements | Select-Object -Skip 1 | Where-Object {
+  $_ -is [System.Management.Automation.Language.StringConstantExpressionAst]
+} | ForEach-Object Extent })
+$dataRanges = @($dataExtents | Sort-Object StartOffset -Unique | ForEach-Object { @{ start=$_.StartOffset; end=$_.EndOffset } })
+if (!$offsets.Count -and !$dataRanges.Count) { exit }
 $start = [DateTimeOffset]::FromUnixTimeMilliseconds($call.ran).LocalDateTime
 $end = [DateTimeOffset]::FromUnixTimeMilliseconds($call.completed).LocalDateTime
 $exe = Join-Path $PSHOME 'powershell.exe'
@@ -449,7 +575,7 @@ $matchesByProcess = @($events | ForEach-Object {
 if ($matchesByProcess.Count -eq 2 -and $matchesByProcess[0].Id -eq 403 -and $matchesByProcess[1].Id -eq 400 -and
   $matchesByProcess[0].pid -gt 0 -and $matchesByProcess[0].pid -eq $matchesByProcess[1].pid -and
   $matchesByProcess[0].host -eq $matchesByProcess[1].host) {
-  ConvertTo-Json -Compress -InputObject @{ offsets=$offsets; events=@($matchesByProcess[1],$matchesByProcess[0]) }
+  ConvertTo-Json -Compress -InputObject @{ offsets=$offsets; dataRanges=$dataRanges; events=@($matchesByProcess[1],$matchesByProcess[0]) }
 }`;
 
 function invocationProbe(input) {
@@ -476,9 +602,12 @@ function maskVerifiedInvocationCalls(command, tool, saved, check) {
   const original = tool.state.input.command;
   const identity = { id: tool.id, messageID: tool.messageID, ran, completed,
     hash: createHash('sha256').update(original).digest('hex') };
-  const valid = proof => Array.isArray(proof?.offsets) && proof.offsets.length > 0 &&
+  const valid = proof => Array.isArray(proof?.offsets) && (proof.offsets.length > 0 || proof.dataRanges?.length > 0) &&
     proof.offsets.every((offset, index) => Number.isSafeInteger(offset) && command[offset] === '&' &&
       (index === 0 || offset > proof.offsets[index - 1])) &&
+    (proof.dataRanges === undefined || Array.isArray(proof.dataRanges) && proof.dataRanges.every((range, index) =>
+      Number.isSafeInteger(range?.start) && Number.isSafeInteger(range.end) && range.start >= 0 && range.start < range.end &&
+      range.end <= command.length && (!index || proof.dataRanges[index - 1].end <= range.start))) &&
     Array.isArray(proof.events) && proof.events.length === 2 && proof.events.every((event, index) =>
       event?.id === (index === 0 ? 400 : 403) && Number.isSafeInteger(event.at) && event.at >= ran && event.at <= completed &&
       Number.isSafeInteger(event.record) && event.record > 0 && Number.isSafeInteger(event.pid) && event.pid > 0 &&
@@ -494,8 +623,13 @@ function maskVerifiedInvocationCalls(command, tool, saved, check) {
   const matching = saved?.find(proof => proof && Object.keys(identity).every(key => proof[key] === identity[key]) && valid(proof));
   const proof = matching ?? probe() ?? (check?.archive ? probe(check.archive) : undefined);
   if (!proof) return command;
-  check?.verified?.push({ ...identity, offsets: proof.offsets, events: proof.events });
-  return maskInvocationOffsets(command, proof.offsets);
+  check?.verified?.push({ ...identity, offsets: proof.offsets, events: proof.events,
+    ...(proof.dataRanges ? { dataRanges: proof.dataRanges } : {}) });
+  const masked = maskInvocationOffsets(command, proof.offsets).split('');
+  for (const range of proof.dataRanges ?? []) for (let i = range.start; i < range.end; i++) {
+    if (!/[\r\n]/.test(masked[i])) masked[i] = ' ';
+  }
+  return masked.join('');
 }
 
 const shellEvidenceID = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id) ? id : 'unknown';
@@ -549,6 +683,7 @@ function endedShells(history, shells, closing = false, invocationCheck) {
     const shellID = tool.state.metadata?.shellID;
     const call = ' (call ' + shellEvidenceID(tool.id) + ')';
     const listed = typeof shellID === 'string' ? shells.data.filter(shell => shell.id === shellID) : [];
+    need(listed.length <= 1, 'Ambiguous project shell registry entry' + call);
     const launch = history.backgroundShells?.get(shellID);
     const notice = launch && launch.toolID === tool.id && launch.messageID === tool.messageID ? launch.notice : undefined;
     if (notice) need(listed.length <= 1 && listed.every(shell => shell.status === 'exited' &&
@@ -565,6 +700,8 @@ function endedShells(history, shells, closing = false, invocationCheck) {
       need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
         shellID === undefined && !tool.state.metadata?.background && input.background !== true, 'Unknown shell/background completion status' + call);
       const recovered = postgres.get(tool.id);
+      if (tool.state.metadata?.timeout === true || tool.state.metadata?.signal !== undefined)
+        need(recovered || notice || listed.some(shell => shell.command === input.command), 'Shell termination is not confirmed' + call);
       const command = recovered?.command ?? input.command;
       let reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),
         postgres.size > 0);
@@ -582,18 +719,53 @@ function endedShells(history, shells, closing = false, invocationCheck) {
   return timeline;
 }
 
-export function closureBoundary(binding, messages, session, shells, invocationCheck) {
+export function sessionAvailable(session) {
+  return !!session.time && typeof session.time === 'object' && !Array.isArray(session.time) && session.time.archived === undefined &&
+    (session.archived === undefined || session.archived === false);
+}
+
+export function deliveredExchange(messages) {
+  const late = messages.findIndex((item, index) => item.type === 'model-switched' ||
+    item.type === 'compaction' && item.reason === 'manual' && messages[index - 1]?.type === 'idle');
+  return late < 0 ? messages : messages.slice(0, late);
+}
+
+export function deliveredBoundary(binding, messages, session, review = false) {
   const modelRef = model => model?.providerID === MODEL.providerID && model?.id === MODEL.id &&
     (model.variant === undefined || typeof model.variant === 'string' && model.variant.length <= 80);
   const terminal = item => item?.type === 'idle' && ['succeeded', 'failed', 'interrupted'].includes(item.outcome) &&
     Number.isSafeInteger(item.time?.created) && item.time.created >= binding.submittedAt;
-  need(session.time?.archived === undefined && (session.archived === undefined || session.archived === false) &&
-    modelRef(session.model), 'Archived session or unsupported model; no closure');
-  const late = messages.findIndex((item, index) => item.type === 'model-switched' ||
-    item.type === 'compaction' && messages[index - 1]?.type === 'idle');
-  const exchange = late < 0 ? messages : messages.slice(0, late);
+  need(modelRef(session.model), 'Unsupported model for delivered history');
+  const exchange = deliveredExchange(messages);
   const ended = exchange.at(-1);
   need(exchange.length > 1 && terminal(ended), 'No correlated terminal idle for the delivered assignment');
+  let idle = ended, lastTime = ended.time.created, compacting = false, selected;
+  const executorVariant = exchange.findLast(item => item.type === 'assistant')?.model?.variant;
+  for (const item of messages.slice(exchange.length)) {
+    const time = item.time?.created;
+    need(Number.isSafeInteger(time) && time >= lastTime, 'Unordered history after assignment idle');
+    lastTime = time;
+    if (!compacting && item.type === 'model-switched' && modelRef(item.previous) && modelRef(item.model) &&
+      (selected ? (item.previous.variant ?? null) === (selected.variant ?? null) :
+        executorVariant === undefined || item.previous.variant === executorVariant)) selected = item.model;
+    else if (!compacting && item.type === 'compaction' && item.reason === 'manual' && item.status === 'completed' && modelRef(item.model)) {
+      if (review) {
+        validateCompaction(item);
+        need(!item.error && !item.retry, 'Compaction after assignment idle failed or retried');
+      }
+      compacting = true;
+    } else if (compacting && terminal(item)) { idle = item; compacting = false; }
+    else throw new Error('Unrelated or unfinished history after assignment idle; no closure');
+  }
+  need(!compacting && (!selected || (selected.variant ?? null) === (session.model.variant ?? null)) &&
+    session.time?.idle === idle.time.created && session.outcome === idle.outcome &&
+    (session.time.busy === undefined || Number.isSafeInteger(session.time.busy) && session.time.busy <= idle.time.created),
+  'Live idle state disagrees with delivered history');
+  return { exchange, boundary: { lastMessageID: messages.at(-1).id, idleAt: idle.time.created, variant: session.model.variant ?? null } };
+}
+
+export function closureBoundary(binding, messages, session, shells, invocationCheck, delivered = deliveredBoundary(binding, messages, session)) {
+  const { exchange, boundary } = delivered, ended = exchange.at(-1);
   const history = inspectMessages(invocationCheck?.lostCalls ? { ...binding, legacyPostgresClients: true } : binding, exchange, { adopting: true });
   need(exchange.slice(1, -1).every(item => item.type === 'assistant' ?
     Number.isSafeInteger(item.time?.completed) && item.time.completed <= ended.time.created :
@@ -602,21 +774,6 @@ export function closureBoundary(binding, messages, session, shells, invocationCh
     history.tools.every(tool => ['completed', 'error'].includes(tool.state?.status) &&
       Number.isSafeInteger(tool.time?.completed) && tool.time.completed <= ended.time.created), 'Unfinished operation in delivered assignment');
   if (invocationCheck?.lostCalls) completion(history, session, shells, invocationCheck);
-  else endedShells(history, shells, true);
-  let idle = ended, lastTime = ended.time.created, compacting = false, selected;
-  for (const item of late < 0 ? [] : messages.slice(late)) {
-    const time = item.time?.created;
-    need(Number.isSafeInteger(time) && time >= lastTime, 'Unordered history after assignment idle');
-    lastTime = time;
-    if (!compacting && item.type === 'model-switched' && modelRef(item.previous) && modelRef(item.model) &&
-      (!selected || (item.previous.variant ?? null) === (selected.variant ?? null))) selected = item.model;
-    else if (!compacting && item.type === 'compaction' && item.reason === 'manual' && item.status === 'completed' && modelRef(item.model)) compacting = true;
-    else if (compacting && terminal(item)) { idle = item; compacting = false; }
-    else throw new Error('Unrelated or unfinished history after assignment idle; no closure');
-  }
-  need(!compacting && (!selected || (selected.variant ?? null) === (session.model.variant ?? null)) &&
-    session.time.idle === idle.time.created && session.outcome === idle.outcome &&
-    (session.time.busy === undefined || Number.isSafeInteger(session.time.busy) && session.time.busy <= idle.time.created),
-  'Live idle state disagrees with delivered history');
-  return { lastMessageID: messages.at(-1).id, idleAt: idle.time.created, variant: session.model.variant ?? null };
+  else endedShells(history, shells, true, invocationCheck);
+  return boundary;
 }

@@ -59,9 +59,9 @@ test('bound wait and observer use a four-hour default while invalid deadlines le
   const durations = [], original = AbortSignal.timeout;
   t.mock.method(AbortSignal, 'timeout', milliseconds => { durations.push(milliseconds); return original(milliseconds); });
   assert.equal((await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true })).kind, 'observing');
-  assert.equal(durations.at(-1), 14_400_000);
+  assert.ok(durations.includes(14_400_000)); durations.length = 0;
   const armed = await f.arm({ timeoutMs: undefined }); assert.equal(armed.kind, 'observer-armed');
-  assert.equal(durations.at(-1), 14_400_000); assert.equal(f.sent.length, 0);
+  assert.ok(durations.includes(14_400_000)); assert.equal(f.sent.length, 0);
   f.finish(f.session); await f.end();
   assert.equal(f.sent[0].timeoutMs, 14_400_000);
   assert.equal((await f.o.consume(armed.id)).kind, 'completed-for-review');
@@ -158,15 +158,30 @@ test('permission events retain tool correlation and only notify; no approval or 
   assert.equal(f.permissions.length, 1); assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
 });
 
-test('a lost established stream wakes once, stays STOPPED and does not reconnect or retry', async t => {
+test('a lost established stream completes through HTTP and wakes once without reconnecting', async t => {
   const f = await setup(t), armed = await f.arm(), opens = f.streamOpens;
   for (const stream of f.streams) stream.end();
+  f.finish(f.session);
   await f.end();
   assert.equal(f.sent.length, 1); assert.equal(f.streamOpens, opens);
-  assert.equal(f.state().bindings[0].phase, 'STOPPED');
-  assert.equal((await f.o.consume(armed.id)).kind, 'stopped');
-  await assert.rejects(f.arm(), /explicit resume/);
+  assert.equal(f.state().bindings[0].phase, 'REVIEWING');
+  assert.equal((await f.o.consume(armed.id)).kind, 'completed-for-review');
   assert.equal(f.state().plans[0].correctionCount, 9);
+});
+
+test('consume releases a failed read reservation and returns the same result after recovery', async t => {
+  const f = await setup(t), armed = await f.arm();
+  f.finish(f.session); await f.end();
+  const before = f.state();
+  f.fault = 'history-truncated';
+  assert.equal((await f.o.consume(armed.id)).kind, 'retryable-read');
+  assert.equal(f.o.status(armed.id).consumed, false);
+  assert.deepEqual(f.state(), before);
+  f.fault = null;
+  assert.equal((await f.o.consume(armed.id)).kind, 'completed-for-review');
+  assert.equal((await f.o.consume(armed.id)).kind, 'already-consumed');
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
 });
 
 test('explicit resume observes the same stopped delivery; uncertain mutations remain forbidden', async t => {

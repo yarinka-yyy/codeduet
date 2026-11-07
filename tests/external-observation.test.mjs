@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -30,7 +30,7 @@ async function setup(t) {
     checkout: old.checkout, sessionID: old.sessionID, assignmentID: old.assignmentID, operation: 'resume-watch' }));
   const session = { id: sessionID, location: { directory: f.workspace }, model: { providerID: model.providerID, id: model.id, variant: 'high' }, time: {} };
   f.sessions.set(sessionID, session);
-  f.messages.set(sessionID, [{ id: messageID, type: 'user', text: 'Implement ' + basename(f.plan), time: { created: Date.now() } }]);
+  f.messages.set(sessionID, [{ id: messageID, type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan), time: { created: Date.now() } }]);
   f.active[sessionID] = { type: 'running' };
   const before = readFileSync(f.statePath), leaseBefore = readFileSync(lease), from = f.calls.length, sent = [];
   let running;
@@ -73,7 +73,7 @@ test('passive observer pins a four-hour default and completes early without chan
   const f = await setup(t), durations = [], original = AbortSignal.timeout;
   t.mock.method(AbortSignal, 'timeout', milliseconds => { durations.push(milliseconds); return original(milliseconds); });
   const armed = await f.o.arm(f.workspace, f.plan, { codexExe: process.execPath, sessionID, messageID });
-  assert.equal(armed.kind, 'observer-armed'); assert.equal(durations.at(-1), 14_400_000);
+  assert.equal(armed.kind, 'observer-armed'); assert.ok(durations.includes(14_400_000));
   assert.equal(f.sent.length, 0);
   f.finish(sessionID); await f.end(); assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].timeoutMs, 14_400_000);
@@ -96,9 +96,9 @@ test('newer or edited prompts never retarget a receipt, even at consume', async 
   const f = await setup(t), pin = await f.select();
   f.messages.get(sessionID)[0].text += ' changed';
   await assert.rejects(externalOutcome(f.client, f.stateRoot, pin), /prompt changed/);
-  f.messages.get(sessionID)[0].text = 'Implement ' + basename(f.plan);
+  f.messages.get(sessionID)[0].text = 'Canonical plan: ' + JSON.stringify(f.plan);
   const armed = await f.arm(); f.finish(sessionID); await f.end();
-  f.messages.get(sessionID).push({ id: 'msg_new', type: 'user', text: 'Implement ' + basename(f.plan) });
+  f.messages.get(sessionID).push({ id: 'msg_new', type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) });
   await assert.rejects(f.o.consume(armed.id), /prompt changed/);
 });
 
@@ -149,7 +149,7 @@ test('terminal text alone, outstanding shell, invalid status and uncorrelated re
 test('new untracked plan has unknown count, changed plan and interrupted exchange refuse completion', async t => {
   const f = await setup(t), plan = join(dirname(f.plan), '002-other.md');
   writeFileSync(plan, 'Read-only plan with no non-Git declaration.');
-  f.messages.get(sessionID)[0].text = 'Implement 002-other.md';
+  f.messages.get(sessionID)[0].text = 'Canonical plan: ' + JSON.stringify(plan);
   const pin = await selectExternal(f.client, f.stateRoot, f.workspace, plan, sessionID, messageID);
   assert.equal(pin.correctionCount, null);
   writeFileSync(plan, 'Changed'); await assert.rejects(externalOutcome(f.client, f.stateRoot, pin), /context\/plan changed/);
@@ -182,11 +182,11 @@ test('unknown passive checkout slot is retained and prevents a second observer',
 test('stream disconnect notifies once and never reconnects or sends a prompt', async t => {
   const f = await setup(t), armed = await f.arm(), opens = f.streamOpens;
   for (const stream of f.streams) stream.destroy();
+  f.finish(sessionID);
   await f.end(); assert.equal(f.sent.length, 1); assert.equal(f.streamOpens, opens);
   const consumed = await f.o.consume(armed.id);
-  assert.equal(consumed.kind, 'observer-error');
-  assert.equal(consumed.executorCheck.status, 'checked'); assert.equal(consumed.executorCheck.kind, 'observing');
-  assert.equal(consumed.executorCheck.executorActivity, 'running'); assert.equal(consumed.executorCheck.reviewAllowed, false);
+  assert.equal(consumed.kind, 'external-completed');
+  assert.equal(consumed.reviewAllowed, true);
   assert.equal(consumed.rearm, false);
   await assert.rejects(f.o.worker(armed.id), /EEXIST|slot changed/); assert.equal(f.sent.length, 1);
 });
@@ -215,7 +215,8 @@ test('saved observer error cannot become completion; failed fresh reads remain u
   assert.equal(result.rearm, false);
   f.active[sessionID] = { type: 'running' };
   const next = await f.arm();
-  for (const stream of f.streams) stream.destroy();
+  for (const stream of f.streams) stream.write('data: ' + JSON.stringify({ type: 'location.shutdown',
+    location: { directory: f.workspace }, data: {} }) + '\n\n');
   await f.end(); f.session.model.variant = 'changed';
   const failed = await f.o.consume(next.id);
   assert.equal(failed.kind, 'observer-error'); assert.equal(failed.executorCheck.status, 'unavailable');

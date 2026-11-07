@@ -57,9 +57,10 @@ node helper/observer.mjs observe <workspace> <plan.md> --session <exact-session-
 
 Run in the intended receiving Codex chat with its actual CODEX_THREAD_ID. Resolve
 an explicitly selected session title using the paged existing-session procedure.
-Inspect is read-only; it returns the latest user message ID only if its text names
-the selected plan file. Observe repeats validation and pins that message, prompt
-hash, physical context, plan hash, engine and model variant. It never retargets a
+Inspect is read-only. The latest user message must contain `Canonical plan: `
+followed by the JSON-quoted exact absolute plan path on its own line. Observe pins
+that message, prompt hash, physical context, plan identity, engine and model variant.
+Checkpoint notes and Markdown line endings do not alter the plan identity. It never retargets a
 newer prompt. No non-Git implementation baseline or new correction count is invented.
 
 The existing observer handles readiness, one event hint, consume and cancel.
@@ -210,8 +211,9 @@ event.location.directory resolves to a different physical directory is ignored.
 Selected or unresolved location shutdown/disposal stops observation with
 location-shutdown; server shutdown stops it with engine-shutdown. Diagnostics
 retain the exact known event type and eventScope (server/selected/unknown),
-without copying event payloads or filesystem paths. SSE EOF still stops the
-worker; no lifecycle event, compaction or disconnect proves task completion.
+without copying event payloads or filesystem paths. SSE EOF switches the worker
+to HTTP polling through the original deadline. Completion requires a fresh exact
+history and idle/shell check.
 
 ## Stop and remove
 

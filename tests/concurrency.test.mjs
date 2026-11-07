@@ -45,8 +45,72 @@ function bindArgs(workspace, plan, count) {
 }
 
 function submitArgs(workspace, plan, packet, assignment, kind = 'initial') {
-  return ['submit', workspace, plan, assignment, packet, '--kind', kind, '--non-git-baseline', baseline];
+  return ['submit', workspace, plan, assignment, packet, '--kind', kind, '--non-git-baseline', baseline, '--manual-observation'];
 }
+
+for (const kind of ['initial', 'correction']) {
+  test('a shell starting after preflight blocks ' + kind + ' before POST and reservation', async t => {
+    const f = await fixture(t);
+    const bound = await f.call(f.bindArgs(0));
+    assert.equal(bound.status, 0, JSON.stringify(bound.result));
+    const preflight = await f.call(['preflight', f.workspace, f.plan, '--non-git-baseline', baseline]);
+    assert.equal(preflight.result.status, 'pass', JSON.stringify(preflight.result));
+    const before = readFileSync(f.statePath), start = f.calls.length;
+    f.shells = [{ id: 'sh_late', status: 'running' }];
+    const outcome = await f.call(submitArgs(f.workspace, f.plan, f.packet, 'late-shell', kind));
+    assert.equal(outcome.status, 1, JSON.stringify(outcome.result));
+    assert.match(outcome.result.error, /shell.*running/i);
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+  });
+}
+
+for (const mode of ['wait', 'finish']) {
+  for (const changed of ['shell', 'history']) {
+    test(mode + ' rejects changed ' + changed + ' even when session time is unchanged', async t => {
+      const f = await fixture(t);
+      const bound = await f.call(f.bindArgs(0));
+      assert.equal(bound.status, 0, JSON.stringify(bound.result));
+      const { sessionID } = bound.result;
+      assert.equal((await f.call(submitArgs(f.workspace, f.plan, f.packet, 'confirm-review'))).status, 0);
+      f.finish(sessionID);
+      if (mode === 'finish') {
+        const waited = await f.call(wait(f.workspace, f.plan));
+        assert.equal(waited.result.phase, 'REVIEWING', JSON.stringify(waited.result));
+      }
+      let sawShell = false, injected = false;
+      f.onRequest = route => {
+        if (route.startsWith('/api/shell?')) sawShell = true;
+        if (route === '/api/session/' + sessionID && sawShell && !injected) {
+          injected = true;
+          if (changed === 'shell') f.shells = [{ id: 'sh_late', status: 'running' }];
+          else f.messages.get(sessionID).push({ id: 'msg_late', type: 'user', text: 'Outside assignment' });
+        }
+      };
+      const args = mode === 'wait' ? wait(f.workspace, f.plan) : ['finish', f.workspace, f.plan, '--non-git-baseline', baseline];
+      const outcome = await f.call(args);
+      assert.equal(injected, true);
+      assert.equal(outcome.status, 1, JSON.stringify(outcome.result));
+      assert.match(outcome.result.error, /history|shell/i);
+      assert.notEqual(f.state().bindings[0].phase, 'FINISHED');
+      assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
+    });
+  }
+}
+
+test('wait opens review when a disappearing foreign active ID is absent from the fresh list', async t => {
+  const f = await fixture(t);
+  const bound = await f.call(f.bindArgs(0));
+  assert.equal(bound.status, 0, JSON.stringify(bound.result));
+  assert.equal((await f.call(submitArgs(f.workspace, f.plan, f.packet, 'foreign-disappeared'))).status, 0);
+  f.finish(bound.result.sessionID);
+  f.active.ses_disappearing = { type: 'running' };
+  f.onRequest = route => {
+    if (route === '/api/session/ses_disappearing') delete f.active.ses_disappearing;
+  };
+  const { result } = await f.call(wait(f.workspace, f.plan));
+  assert.equal(result.kind, 'completed-for-review', JSON.stringify(result));
+});
 
 function addQuestion(f, sessionID, suffix) {
   const now = Date.now(), messageID = 'msg_tool_' + suffix, callID = 'call_' + suffix;

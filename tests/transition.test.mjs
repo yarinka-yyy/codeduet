@@ -96,6 +96,110 @@ test('competing transitions and concurrent submits have one winner', async t => 
   assert.equal(f.state().bindings.length, 1);
 });
 
+test('a shell starting after transition preflight keeps the reviewed owner', async t => {
+  const f = await artex(t);
+  const ready = await f.call(f.preflight, newChat);
+  assert.equal(ready.result.transition.status, 'ready', JSON.stringify(ready.result));
+  const before = readFileSync(f.statePath), start = f.calls.length;
+  f.shells = [{ id: 'sh_late', status: 'running' }];
+  const outcome = await f.call(f.transition, newChat);
+  assert.equal(outcome.status, 1, JSON.stringify(outcome.result));
+  assert.match(outcome.result.error, /shell.*running/i);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+});
+
+for (const variant of ['low', 'foreign']) {
+  test('review and transition agree on a late model change: ' + variant, async t => {
+    const f = await artex(t), session = f.sessions.get(f.sessionID);
+    const previous = session.model;
+    session.model = { ...previous, variant: 'low' };
+    f.messages.get(f.sessionID).push({ id: 'msg_lateModel', type: 'model-switched',
+      previous, model: variant === 'low' ? session.model : { ...session.model, providerID: 'other' },
+      time: { created: session.time.idle + 1 } });
+    const preview = (await f.call(['preflight', f.workspace, f.plan, ...baselineArgs], oldChat)).result;
+    const history = preview.checks.find(check => check.name === 'history');
+    assert.equal(history.status, variant === 'low' ? 'pass' : 'blocked', JSON.stringify(preview));
+    const accepted = ['transition', f.workspace, f.target, f.source.messageID, 'accepted', ...baselineArgs];
+    if (variant === 'foreign') {
+      assert.equal(preview.transition.status, 'blocked');
+      assert.equal((await f.call(accepted, newChat)).status, 1);
+      assert.equal(f.state().bindings[0].phase, 'REVIEWING');
+      return;
+    }
+    assert.equal(preview.transition.status, 'ready');
+    const waited = await f.call(['wait', f.workspace, f.plan, '--timeout-ms', '3000', ...baselineArgs]);
+    assert.equal(waited.result.kind, 'completed-for-review', JSON.stringify(waited.result));
+    const finished = await f.call(['finish', f.workspace, f.plan, ...baselineArgs]);
+    assert.equal(finished.result.kind, 'released', JSON.stringify(finished.result));
+    assert.equal((await f.call(accepted, newChat)).result.kind, 'transition-prepared');
+    const result = await f.call(f.submit, newChat);
+    assert.equal(result.status, 0, JSON.stringify(result.result));
+    assert.equal(session.model.variant, 'high');
+    assert.equal(f.posts(f.prompt), 2);
+  });
+}
+
+test('an archived result remains reviewable while dispatch and transition are blocked', async t => {
+  const f = await artex(t);
+  f.sessions.get(f.sessionID).time.archived = Date.now();
+  const start = f.calls.length;
+  const preview = (await f.call(['preflight', f.workspace, f.plan, ...baselineArgs])).result;
+  assert.equal(preview.checks.find(check => check.name === 'history').status, 'pass');
+  assert.equal(preview.checks.find(check => check.name === 'session-availability').status, 'blocked');
+  assert.match(preview.nextStep, /unarchive.*preflight/i);
+  const waited = await f.call(['wait', f.workspace, f.plan, '--timeout-ms', '3000', ...baselineArgs]);
+  assert.equal(waited.result.kind, 'completed-for-review', JSON.stringify(waited.result));
+  assert.equal((await f.call(f.transition, newChat)).status, 1);
+  assert.equal((await f.call(['next', f.workspace, f.plan, 'block', ...baselineArgs])).status, 1);
+  assert.equal(f.state().bindings[0].phase, 'REVIEWING');
+  const finished = await f.call(['finish', f.workspace, f.plan, ...baselineArgs]);
+  assert.equal(finished.result.kind, 'released', JSON.stringify(finished.result));
+  assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+  delete f.sessions.get(f.sessionID).time.archived;
+  assert.equal((await f.call(['next', f.workspace, f.plan, 'block', ...baselineArgs])).status, 0);
+  f.sessions.get(f.sessionID).time.archived = Date.now();
+  const submit = await f.call(['submit', f.workspace, f.plan, 'archived-block', f.packet, '--kind', 'block', ...baselineArgs]);
+  assert.equal(submit.status, 1);
+  assert.match(submit.result.error, /unarchive.*preflight/i);
+  assert.equal(f.posts(f.prompt), 1);
+});
+
+test('restoring High cannot dispatch against an exchange modified during model selection', async t => {
+  const f = await artex(t), session = f.sessions.get(f.sessionID);
+  const previous = session.model;
+  session.model = { ...previous, variant: 'low' };
+  const history = f.messages.get(f.sessionID);
+  const final = history.at(-2);
+  history.push({ id: 'msg_lateLow', type: 'model-switched', previous, model: session.model,
+    time: { created: session.time.idle + 1 } });
+  const accepted = ['transition', f.workspace, f.target, f.source.messageID, 'accepted', ...baselineArgs];
+  assert.equal((await f.call(accepted, newChat)).status, 0);
+  f.onRequest = route => {
+    if (route.endsWith('/model')) final.content[0].text = 'Replaced during model selection';
+  };
+  const result = await f.call(f.submit, newChat);
+  assert.equal(result.status, 1);
+  assert.match(result.result.error, /changed since review/i);
+  assert.equal(f.posts(f.prompt), 1);
+  assert.equal(f.state().bindings[0].phase, 'PREPARING');
+});
+
+for (const action of ['finish', 'transition']) {
+  test(action + ' refuses a replaced reviewed result with unchanged IDs and timestamps', async t => {
+    const f = await artex(t);
+    f.messages.get(f.sessionID).at(-2).content[0].text = 'Replaced after review';
+    const start = f.calls.length;
+    const preview = (await f.call(['preflight', f.workspace, f.plan, ...baselineArgs])).result;
+    assert.match(preview.checks.find(check => check.name === 'history').reason, /changed since review/i);
+    const outcome = action === 'finish' ? await f.call(['finish', f.workspace, f.plan, ...baselineArgs]) :
+      await f.call(['transition', f.workspace, f.target, f.source.messageID, 'accepted', ...baselineArgs], newChat);
+    assert.equal(outcome.status, 1);
+    assert.match(outcome.result.error, /changed since review/i);
+    assert.ok(f.calls.slice(start).every(call => call.method === 'GET'));
+  });
+}
+
 test('same-plan continuation requires a disposition and keeps the correction count until submit', async t => {
   const f = await artex(t);
   const args = ['transition', f.workspace, f.plan, f.source.messageID];

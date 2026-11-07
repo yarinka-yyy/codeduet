@@ -39,6 +39,11 @@ when preparing a packet.
 
 ## Prepare one connected assignment
 
+Before submit, choose how the result will return to this chat. Pass
+`--codex-exe <absolute Desktop-bundled Codex executable>` for observer delivery,
+or `--manual-observation` for the foreground wait/resume route. An invalid chat
+ID or unavailable queue capability blocks automatic submission before an OpenCode request.
+
 Confirm that the prior writer and known project-changing operations ended.
 Runtime STOPPED or uncertain delivery is a blocker, not a reason to start a
 fresh chat or another executor. On an explicit continuation request, first read
@@ -146,6 +151,10 @@ not increment it. Up to 20 corrections are counted in the current explicit
 selection, not from the task's earlier history.
 An uncertain POST reserves one possibly delivered cycle and leaves STOPPED;
 it is not automatically refunded/retried. Report that uncertainty in the plan.
+Run `reconcile <workspace> <plan>` from the owning chat to check an uncertain
+create, prompt, reply or model selection against OpenCode. It sends no task.
+If the exact session, delivery, answer or model change cannot be established,
+preserve STOPPED and the saved reservation.
 After correction 20, still review normally. Accept if every applicable gate
 passes; otherwise report the limit and remaining work, then stop. A new explicit
 selection starts the next cycle at zero; do not silently continue or send a 21st
@@ -167,6 +176,18 @@ The previous plan's history, status and correction count are preserved. No manua
 `finish` or counter reset is part of this route. Use `finish` for a standalone
 release after review when there is no next Code Duet assignment to prepare.
 
+After an OpenCode restart changes the engine registration, use
+`rebind-engine <workspace> <plan> <message-id> --session <session-id>` to
+verify the exact delivery and resume in the same phase with the same count.
+A running legacy delivery without a saved prompt checksum requires review of
+the original session before switching engines.
+
+Use `acceptance-status <workspace> <plan> <message-id> [--index <index.md>]`
+to verify the runtime receipt, the `<!-- code-duet-accepted msg_… -->` line
+and the plan index independently. For a moved accepted plan, pass
+`--moved-prior-plan <absolute-path>` to `transition` after verifying the
+receipt and plan identity.
+
 ## Handoff to or from the ordinary route
 
 Handoff is a deliberate advisor decision within user authority, never fallback
@@ -179,6 +200,15 @@ transfer a session, invoke another agent, or erase prior history.
 Use the ordinary route's own authority/constraints when it is later selected.
 
 ## Final checkpoint and report
+
+After accepting a delivery through `finish`, `next`, or an accepted `transition`,
+add `<!-- code-duet-accepted msg_... -->` to its Markdown review checkpoint.
+If interrupted between edits, run `acceptance-status <workspace> <plan> <message-id>
+--index <index.md>` to compare the exact runtime receipt, checkpoint marker, and
+index row. Complete the missing edit only after confirming the review and all
+remaining gates. For a FINISHED prior plan moved within the workspace, pass its
+new absolute path as `transition --moved-prior-plan`; the original acceptance
+receipt and unchanged plan identity are required.
 
 Record assigned/accepted blocks, executor claims versus verified results, changed
 files, baseline/protected-file outcome, route/model/session/options, correction

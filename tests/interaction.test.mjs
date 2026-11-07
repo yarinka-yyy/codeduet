@@ -5,7 +5,25 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { helper } from '../helper/binding.mjs';
 import { MODEL, validateDiagnostic } from '../helper/connection.mjs';
-import { assignmentMessages, decodeFrame, watch } from '../helper/interaction.mjs';
+import { assignmentMessages, decodeFrame, interactive, validateAnswer, watch } from '../helper/interaction.mjs';
+
+test('2.2.5 form key order is stable, typed answers validate and conditional fields take the manual route', () => {
+  const binding = { sessionID: 'ses_form' }, history = { tools: [{ id: 'call_question', messageID: 'msg_question' }] };
+  const metadata = { kind: 'question', tool: { id: 'call_question', messageID: 'msg_question' } };
+  const fields = [{ key: 'count', type: 'integer', minimum: 1, maximum: 3 }, { key: 'run', type: 'boolean' }];
+  const original = { id: 'frm_form', sessionID: binding.sessionID, metadata, fields };
+  const canonical = request => interactive('question', request, binding, history);
+  assert.equal(canonical(original).fingerprint, canonical({ fields, metadata, sessionID: binding.sessionID, id: 'frm_form' }).fingerprint);
+  validateAnswer(original, { answer: { count: 2, run: false } });
+  assert.throws(() => validateAnswer(original, { answer: { count: 2.5, run: false } }), /numeric/);
+  assert.throws(() => validateAnswer(original, { answer: { count: 2, run: 'false' } }), /boolean/);
+  for (const field of [{ ...fields[0], hidden: true }, { ...fields[0], when: [{ key: 'run', op: 'eq', value: true }] },
+    { key: 'count', type: 'external', url: 'https://example.com' }]) {
+    const modified = canonical({ ...original, fields: [field, fields[1]] });
+    assert.notEqual(modified.fingerprint, canonical(original).fingerprint);
+    assert.match(modified.manualReason, /OpenCode/);
+  }
+});
 
 test('discovery failure between invocations persists STOP without a transport or mutation', async t => {
   const f = await setup(t);
@@ -95,12 +113,17 @@ async function setup(t) {
         return { data: { id: body.id, sessionID: 'ses_test' } };
       }
       if (route.endsWith('/reply')) {
-        if (this.lostReply) throw new Error('Engine mutation uncertain; do not retry');
-        if (route.includes('/form/')) this.forms = [];
+        if (this.lostReply && this.lostReply !== 'accepted') throw new Error('Engine mutation uncertain; do not retry');
+        if (route.includes('/form/')) {
+          this.answeredForm = { ...this.forms[0], state: { status: 'answered', answer: body.answer } };
+          this.forms = [];
+        }
         else this.permissions = [];
+        if (this.lostReply) throw new Error('Engine mutation uncertain; do not retry');
         return;
       }
       if (route.endsWith('/form')) return { data: structuredClone(this.forms) };
+      if (route.endsWith('/form/frm_question')) return { data: structuredClone(this.answeredForm) };
       if (route.endsWith('/permission')) return { data: structuredClone(this.permissions) };
       if (route.includes('/message?')) return { data: structuredClone(this.messages).reverse(), cursor: {} };
       if (route.startsWith('/api/shell?')) return { data: structuredClone(this.shells) };
@@ -286,6 +309,22 @@ test('uncertain reply is written ahead and is never retried', async t => {
   assert.equal(f.posts().length, 3);
 });
 
+test('reconcile verifies the exact answered form after a lost acknowledgement', async t => {
+  const f = await setup(t);
+  f.client.question();
+  assert.equal((await f.wait()).kind, 'question');
+  f.client.lostReply = 'accepted';
+  assert.equal((await f.reply('question', 'frm_question', { answer: { q0: 'Beta' } })).phase, 'STOPPED');
+  const check = () => f.adapter.reconcile(f.workspace, f.plan, f.baseline);
+  f.client.answeredForm.state.answer.q0 = 'Alpha';
+  assert.equal((await check()).phase, 'STOPPED');
+  f.client.answeredForm.state.answer.q0 = 'Beta';
+  const result = await check();
+  assert.equal(result.kind, 'mutation-reconciled');
+  assert.equal(result.phase, 'EXECUTING');
+  assert.equal(f.posts().length, 3);
+});
+
 for (const failure of ['provider-limit', 'tool-error', 'interrupted', 'stream-gap', 'failure-event', 'advisor-interrupted']) {
   test(failure + ' stays failed even after late successful idle', async t => {
     const f = await setup(t);
@@ -319,18 +358,19 @@ test('foreign/old events and token deltas are hints only; current assignment sta
   f.client.event('session.execution.succeeded'); // Old event: engine remains active.
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(f.state().phase, 'EXECUTING');
+  assert.equal(f.client.calls.filter(call => call.route.includes('/message?')).length, 1);
   f.client.finish(); f.client.event('session.execution.succeeded');
   assert.equal((await waiting).kind, 'completed-for-review');
-  assert.equal(f.client.calls.filter(call => call.route.includes('/message?')).length, 2);
+  assert.equal(f.client.calls.filter(call => call.route.includes('/message?')).length, 3);
   assert.equal(f.posts().length, 2);
 });
 
 test('pagination stops at current prompt, supports short pages with next cursor and rejects ambiguity', async () => {
   const binding = { sessionID: 'ses_test', messageID: 'msg_user', assignmentID: 'block' };
   let calls = 0;
-  const client = { request: async () => ++calls === 1 ? { data: [{ id: 'msg_final' }], cursor: { next: 'opaque' } } :
+  const client = { request: async route => ++calls === 1 || route.includes('limit=1&') ? { data: [{ id: 'msg_final' }], cursor: { next: 'opaque' } } :
     { data: [{ id: 'msg_user', type: 'user', text: 'Assignment ID: block\nTask' }], cursor: {} } };
-  assert.deepEqual((await assignmentMessages(client, binding)).map(message => message.id), ['msg_user', 'msg_final']); assert.equal(calls, 2);
+  assert.deepEqual((await assignmentMessages(client, binding)).map(message => message.id), ['msg_user', 'msg_final']); assert.equal(calls, 3);
   await assert.rejects(assignmentMessages({ request: async () => ({ data: [{ id: 'msg_duplicate' }], cursor: { next: 'same' } }) }, binding), /Ambiguous|absent/);
   assert.equal(decodeFrame(': heartbeat\n'), null);
   assert.equal(decodeFrame('data: {"type":"session.execution.succeeded","data":{}}\r\n').type, 'session.execution.succeeded');

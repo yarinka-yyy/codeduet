@@ -35,6 +35,8 @@ node helper/cli.mjs finish <absolute-workspace> <absolute-plan.md> [--powershell
 node helper/cli.mjs transition <absolute-workspace> <target-plan.md> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]
 node helper/cli.mjs retire-legacy <absolute-workspace> <old-plan.md> <lease-token>
 node helper/cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>
+node helper/cli.mjs state-lock [<exact-token-to-recover>]
+node helper/cli.mjs reconcile <workspace> <plan> [--non-git-baseline <declaration>]
 node helper/cli.mjs wait <absolute-workspace> <absolute-plan.md> [--timeout-ms <ms>]
 node helper/cli.mjs resume-watch <absolute-workspace> <absolute-plan.md> <assignment-id> <message-id> --session <exact-session-id> [--timeout-ms <ms>] [--postgres-evidence <absolute-json-file>]
 node helper/cli.mjs reply <absolute-workspace> <absolute-plan.md> <question|permission> <request-id> <absolute-answer.json>
@@ -55,7 +57,7 @@ it does not infer execution authorization from the mere existence of a plan.
 
 The shared `connection.mjs` also serves the original transport probe. It reads
 the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
-only, rejects redirects, validates installed/API version 2.1.4, 2.2.0, 2.2.1, 2.2.2, 2.2.3 or 2.2.5 and the enabled
+only, rejects redirects, validates installed/API version 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 or 2.2.6 and the enabled
 `opencode-go/deepseek-v4.1-flash` model. Credentials stay inside HTTP closures;
 the exposed client, state, results and errors contain no auth/response-body data.
 New Code Duet sessions start at High. Before dispatch on a saved idle session,
@@ -63,21 +65,24 @@ the helper selects High with `POST /api/session/:session/model` if needed and
 verifies the readback before sending a prompt. Adoption and passive observation
 do not change the model. There is no fallback or global configuration change.
 
-Ordinary JSON requests use fetch with a twenty-second deadline. SSE alone uses
-a dedicated node:http connection and a web-readable body; it does not inherit
-fetch/Undici's body-idle timeout. The wait owns its handshake/total lifetime.
+Ordinary JSON requests and SSE use separate `node:http` connections with
+web-readable bodies. JSON reads have a twenty-second deadline and a 32 MiB body
+limit. A temporary read failure may retry within that deadline on the same
+engine registration. SSE uses the wait's handshake and total lifetime.
 No SSE redirects, automatic reconnects or extra dependency are introduced.
 
 Bootstrap retries are limited to registration plus parallel GET `/api/info` and
 `/api/model`: at most three attempts total, with 500/1000 ms delays and a
 30-second budget. The 20-second request timeout is clipped to that budget.
-Only explicit timeout/reset/refused transport codes and HTTP 502/503/504 retry;
-each attempt rereads registration. Access, malformed registration, 400/401/403/
+Incomplete registration JSON, explicit timeout/reset/refused transport codes
+and HTTP 502/503/504 retry. Each attempt rereads registration. Access, malformed registration, 400/401/403/
 429, schema/version/model/identity errors and unknown transport errors are
 single-attempt failures. A failed parallel GET aborts its sibling. These retries
-never replay create/prompt/reply POSTs and do not reconnect SSE.
+never replay create, model selection, prompt or reply POSTs. SSE disconnects use
+fresh GET snapshots until the original deadline. JSON/shape/lifecycle faults
+retain their specific diagnostics.
 
-Only the exact validated releases 2.1.4, 2.2.0, 2.2.1, 2.2.2, 2.2.3 and 2.2.5 are accepted; registration and
+Only the exact validated releases 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 and 2.2.6 are accepted; registration and
 GET info versions must agree. A mismatch is a single-attempt `engine-version`
 diagnostic with expectedVersions, observedVersion (numeric release or unknown)
 and versionSource (registration or server-info). Inspect and preflight expose
@@ -86,8 +91,8 @@ rather than suggesting a connection retry. Untrusted version text is not echoed.
 
 ## Identity and persistence
 
-`task-maintenance` is a local, state-lock-protected operation, invoked before
-preflight for a selected task. It records that task's use, archives eligible
+`task-maintenance` is a local, state-lock-protected operation. A failed maintenance
+run does not prevent read-only preflight. It records a selected task's use, archives eligible
 inactive task records after 30 days, restores an archived task's exact counter
 when selected again, and removes records after a further 30 days in the archive.
 Cleanup happens at the next invocation, not while Code Duet is not running.
@@ -113,11 +118,12 @@ after task-maintenance; never on an observer wake or automatic continuation.
 
 Writes use a same-directory temporary file and atomic rename. The global
 `state.lock` covers only synchronous store reload, validation and atomic update;
-it never covers HTTP or SSE. Acquisition gets at most 7 exclusive-open attempts
-under a 120 ms monotonic deadline, with nominal 1 ms waits between attempts, and only
-retries `EEXIST` while acquiring this short lock. A persistent or crash-left lock
-remains untouched and fails busy. Access and other filesystem errors are
-single-attempt failures.
+it never covers HTTP or SSE. The complete process identity and token are published
+using an exclusive hard link on the state volume. Acquisition retries only `EEXIST`,
+with up to 7 attempts in a 120 ms window. `state-lock` inspects the current owner.
+Use `state-lock <exact-token>` to archive a lock only after proving that its owner
+ended and checking that the lock and `state.json` are unchanged. Unknown or legacy
+owners remain locked. State access errors and process identity errors are distinct.
 This does not lock the OS or prevent user edits to the project.
 
 Long operations hold a separate per-checkout ownership lease. The lease prevents
@@ -131,6 +137,10 @@ same short state lock, without changing state.json. Schema1 leases without
 identity remain unknown and cannot be automatically retired. A real terminal
 Ctrl+C can release a lease; Windows process termination may bypass all finally
 handlers, so interruption through the host is not proof of graceful cleanup.
+Schema3 operation leases record physical workspace, plan and process identity.
+Each protected save pins the binding and plan counters on both sides of the
+atomic write. `ownership --action inspect` and `--action recover` use those pins.
+Recovering a lease preserves the saved delivery, receipts and any uncertain POST.
 Every post-network save reloads the store under `state.lock` and validates the
 saved chat/session/assignment/message/phase before applying only its own change,
 so another workspace's binding and counter are retained. Schema-1 bindings and
@@ -561,12 +571,26 @@ chat; consume must refuse the changed pins before any action.
 the current identified prompt with no later user prompt; the fixed model;
 a completed final assistant response and successful terminal idle after it;
 ended execution in this session; no outstanding tools/forms/permissions;
-and known shell/background operations ended. Completion is confirmed with a
-second execution/interactive snapshot before saving REVIEWING.
+and known shell/background operations ended. Before saving REVIEWING or
+releasing an assignment, the helper checks execution, interactive requests,
+history and the shell registry again. A changed snapshot blocks transfer.
+Before reporting REVIEWING the helper saves a delivery-bound history hash.
+Finish, preflight and transition compare it with the current exchange. Existing
+deliveries without a hash still use live verification. A verified model switch
+or completed manual compaction after terminal idle is checked separately from
+the reviewed exchange. A later prompt or changed exchange blocks transfer.
 
-Foreground checks are required in the assignment packet. The helper reads
-the selected workspace's shell registry, rejects running/unknown operations,
-and requires shell completion metadata or an explicitly tracked, ended shell.
+An archived session can retain a reviewable result and be finished locally.
+Unarchive it in OpenCode and rerun preflight before preparing another assignment
+or dispatching to that session. A supported late variant change does not affect
+the earlier review. Submit selects and confirms High before sending.
+
+Foreground checks are required in the assignment packet. The helper reads the
+selected workspace and, when different, its Git checkout shell registry. It
+rejects running/unknown operations and requires shell completion metadata or an
+explicitly tracked, ended shell. Submit repeats the quiet-shell check under the
+checkout lease before sending. The lease coordinates Code Duet callers; a
+manual OpenCode action may still race the final API read.
 Detached launch syntax, unknown background results and
 unrecognized execution history stop conservatively. This is not a general
 shell interpreter or OS process supervisor: hidden descendants and arbitrary

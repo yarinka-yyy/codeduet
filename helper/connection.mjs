@@ -3,17 +3,16 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
-import { text } from 'node:stream/consumers';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 export const EXECUTOR_MODEL = Object.freeze({ ...MODEL, variant: 'high' });
-export const ENGINE_VERSIONS = Object.freeze(['2.1.4', '2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.5']);
+export const ENGINE_VERSIONS = Object.freeze(['2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6']);
 const releaseVersion = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value);
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
   'event-open', 'event-handshake-timeout', 'event-http', 'event-content-type', 'event-eof', 'event-read',
   'event-json', 'event-shape', 'event-buffer-limit', 'engine-shutdown', 'location-shutdown', 'interrupted', 'deadline',
-  'state-locked', 'state-access', 'state-io', 'engine-version', 'history-correlation']);
-const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'history', 'state-directory', 'state-lock', 'state-write']);
+  'state-locked', 'state-access', 'state-io', 'process-identity', 'engine-version', 'history-correlation', 'history-limit', 'response-limit']);
+const stages = new Set(['connection', 'request', 'handshake', 'stream', 'decode', 'wait', 'snapshot', 'history', 'state-directory', 'state-lock', 'state-write', 'process-probe']);
 const names = new Set(['Error', 'TypeError', 'SyntaxError', 'AbortError', 'TimeoutError']);
 const codes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ABORT_ERR',
   'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
@@ -27,6 +26,7 @@ const operations = new Map([
   ['POST /api/session/:session/model', 'session.switchModel'],
   ['GET /api/session/:session/message', 'session.message.list'],
   ['GET /api/session/:session/form', 'session.form.list'],
+  ['GET /api/session/:session/form/:request', 'session.form.get'],
   ['GET /api/session/:session/permission', 'session.permission.list'],
   ['GET /api/shell', 'shell.list'], ['POST /api/session/:session/prompt', 'session.prompt'],
   ['POST /api/session/:session/form/:request/reply', 'session.form.reply'],
@@ -141,7 +141,7 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
   const retryable = error => {
     const diagnostic = error?.diagnostic;
     return diagnostic && ([502, 503, 504].includes(diagnostic.httpStatus) ||
-      diagnostic.category === 'request-timeout' ||
+      diagnostic.category === 'request-timeout' || diagnostic.category === 'request-json' && diagnostic.stage === 'connection' ||
       diagnostic.category === 'request-read' &&
         ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
           'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(diagnostic.errorCode));
@@ -153,13 +153,17 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
     try {
       let registration;
       try { registration = JSON.parse(readFileSync(registrationPath, 'utf8')); }
-      catch { throw new Error('Missing or invalid engine registration'); }
+      catch (error) {
+        if (error instanceof SyntaxError && /Unexpected end|Unterminated string/.test(error.message))
+          throw diagnosticError('Engine registration appears incomplete', 'request-json', 'connection');
+        throw new Error('Missing or invalid engine registration');
+      }
       requireValue(registration && typeof registration.id === 'string' && registration.id.length > 0 &&
         typeof registration.password === 'string' && registration.password.length > 0, 'Invalid engine registration fields');
       if (!ENGINE_VERSIONS.includes(registration.version)) throw versionMismatch(registration.version, ENGINE_VERSIONS, 'registration');
       const base = localEndpoint(registration.url);
       const auth = 'Basic ' + Buffer.from('opencode:' + registration.password).toString('base64');
-      async function request(route, body, parentSignal, timeoutMs = 20_000) {
+      async function requestOnce(route, body, parentSignal, timeoutMs = 20_000) {
         requireValue(typeof route === 'string' && route.startsWith('/api/') && !route.startsWith('//'), 'Invalid API route');
         const details = requestDetails(route, body), requestStarted = now();
         const controller = new AbortController();
@@ -191,7 +195,15 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
             await response.body?.cancel().catch(() => {});
             return undefined;
           }
-          const raw = response.body ? await text(response.body) : '';
+          const chunks = [];
+          let size = 0;
+          if (response.body) for await (const chunk of response.body) {
+            size += chunk.byteLength;
+            if (size > 32 * 1024 * 1024)
+              throw diagnosticError('Engine response exceeds 32 MiB', 'response-limit', 'request', details);
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks, size).toString('utf8');
           try { return JSON.parse(raw); }
           catch (error) {
             throw diagnosticError(body === undefined ? 'Invalid engine JSON' : 'Mutation response invalid; do not retry',
@@ -208,11 +220,30 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
           parentSignal?.removeEventListener('abort', abortFromParent);
         }
       }
+      async function request(route, body, parentSignal, timeoutMs = 20_000) {
+        if (body !== undefined) return requestOnce(route, body, parentSignal, timeoutMs);
+        const deadline = now() + timeoutMs;
+        for (let attempt = 0; ; attempt++) {
+          try { return await requestOnce(route, undefined, parentSignal, Math.max(1, deadline - now())); }
+          catch (error) {
+            const diagnostic = error.diagnostic;
+            const pause = (attempt + 1) * 250;
+            if (attempt >= 2 || parentSignal?.aborted || now() + pause >= deadline ||
+              !(retryable(error) || diagnostic?.httpStatus === 429 || diagnostic?.category === 'request-json')) throw error;
+            await sleep(pause);
+            if (parentSignal?.aborted || now() >= deadline) throw error;
+            let current;
+            try { current = JSON.parse(readFileSync(registrationPath, 'utf8')); } catch { throw error; }
+            if (current?.id !== registration.id || current?.url !== registration.url || current?.version !== registration.version ||
+              current?.password !== registration.password) throw error;
+          }
+        }
+      }
       const attemptController = new AbortController();
       const requestTimeout = Math.max(1, Math.min(20_000, 30_000 - (now() - startedAt)));
       const bootstrapRequests = [
-        request('/api/info', undefined, attemptController.signal, requestTimeout),
-        request('/api/model', undefined, attemptController.signal, requestTimeout),
+        requestOnce('/api/info', undefined, attemptController.signal, requestTimeout),
+        requestOnce('/api/model', undefined, attemptController.signal, requestTimeout),
       ];
       let info, models;
       try { [info, models] = await Promise.all(bootstrapRequests); }

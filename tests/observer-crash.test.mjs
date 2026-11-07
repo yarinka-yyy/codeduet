@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fixture, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
 import { observer } from '../helper/observer.mjs';
-import { processOwner } from '../helper/process-owner.mjs';
+import { probeProcess, processOwner } from '../helper/process-owner.mjs';
 
 const chatID = '00000000-0000-4000-8000-000000000025';
 const moduleURL = new URL('../helper/observer.mjs', import.meta.url).href;
@@ -18,7 +18,7 @@ test('killed real worker is explicitly retired by exact process evidence; rearm 
   const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
   f.sessions.set(sessionID, { id: sessionID, location: { directory: f.workspace },
     model: { id: model.id, providerID: model.providerID }, time: {} });
-  f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Implement ' + basename(f.plan) }]);
+  f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) }]);
   f.active[sessionID] = { type: 'running' };
   const registrationPath = join(f.home, '.local/state/opencode/service.json');
   let child;
@@ -69,7 +69,7 @@ test('cancel and consume are serialized; a cancelled receipt never grants a late
   const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
   f.sessions.set(sessionID, { id: sessionID, location: { directory: f.workspace },
     model: { id: model.id, providerID: model.providerID }, time: {} });
-  f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Implement ' + basename(f.plan) }]);
+  f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) }]);
   f.active[sessionID] = { type: 'running' };
   const connectEngine = () => connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   let worker, releaseRead, readStarted;
@@ -111,4 +111,28 @@ test('unknown worker evidence never unlocks a slot', async t => {
     assert.equal(existsSync(join(dir, 'exited.json')), false);
     assert.equal(f.calls.length, 0); assert.equal(existsSync(f.statePath), false);
   }));
+});
+
+for (const spawned of [false, true]) test('dead observer startup is fenced before worker registration: ' + spawned, async t => {
+  const f = await fixture(t), stateRoot = dirname(f.statePath), id = '00000000-0000-4000-8000-000000000027';
+  const folder = join(stateRoot, 'observers', createHash('sha256').update(chatID).digest('hex')), dir = join(folder, id);
+  mkdirSync(dir, { recursive: true });
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+  const ended = once(child, 'close');
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await ended; });
+  const launcher = { ...processOwner(), pid: child.pid, start: probeProcess(child.pid).start };
+  assert.ok(launcher.start);
+  const receipt = JSON.stringify({ schema: 1, id, codexChat: chatID, checkout: f.workspace });
+  writeFileSync(join(dir, 'receipt.json'), receipt);
+  writeFileSync(join(folder, 'active'), JSON.stringify({ id, launcher, receiptHash: createHash('sha256').update(receipt).digest('hex') }));
+  if (spawned) writeFileSync(join(dir, 'spawn-intent.json'), '{}');
+  const o = observer({ stateRoot, chatID });
+  assert.equal(o.status().startup.status, 'live');
+  child.kill('SIGKILL'); await ended;
+  assert.equal(o.status().startup.status, 'dead');
+  assert.equal(o.status().startup.spawnReserved, spawned);
+  assert.equal((await o.cancel(id)).exited, true);
+  assert.equal(o.status().state, 'absent');
+  await assert.rejects(o.worker(id), /slot changed/);
+  assert.equal(f.calls.length, 0);
 });

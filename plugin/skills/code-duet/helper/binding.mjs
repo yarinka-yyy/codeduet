@@ -1,11 +1,13 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
-import { assignmentMessages, recentSessionMessages, closureBoundary, completion, inspectMessages, interactive, validateAnswer, watch } from './interaction.mjs';
+import { assignmentMessages, recentSessionMessages, closureBoundary, deliveredBoundary, deliveredExchange, sessionAvailable, completion, inspectMessages, interactive, validateAnswer, observationWake, fingerprint } from './interaction.mjs';
 import { validatePostgresRecovery } from './postgres-recovery.mjs';
 import { localWindowsBootTime, processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
@@ -23,11 +25,55 @@ const observationFingerprint = (binding, counter) => createHash('sha256').update
 const fingerprintPattern = /^[a-f0-9]{64}$/;
 const leaseTokenPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const historyFingerprint = messages => createHash('sha256').update(JSON.stringify(messages)).digest('hex');
+const unavailableForDispatch = 'Archived or unavailable session; unarchive it in OpenCode and rerun preflight before dispatch';
+const shellRoute = directory => '/api/shell?location[directory]=' + encodeURIComponent(directory);
+function shellListKnown(result) {
+  return Array.isArray(result?.data) && result.data.every(shell =>
+    ['running', 'exited', 'timeout', 'killed'].includes(shell?.status) &&
+    (shell.status === 'running' || Number.isFinite(shell.time?.completed)));
+}
+
+async function projectShells(client, { workspace, checkout }) {
+  const local = await client.request(shellRoute(workspace));
+  if (!checkout || checkout === workspace) return local;
+  const root = await client.request(shellRoute(checkout));
+  if (!shellListKnown(local) || !shellListKnown(root)) return { data: null };
+  const shells = [...local.data];
+  const byID = new Map(shells.filter(shell => text(shell.id)).map(shell => [shell.id, shell]));
+  for (const shell of root.data) {
+    const existing = byID.get(shell.id);
+    if (existing && !isDeepStrictEqual(existing, shell)) return { data: null };
+    if (!existing) shells.push(shell);
+  }
+  return { data: shells };
+}
+
+async function requireQuietShells(client, binding) {
+  const shells = await projectShells(client, binding);
+  need(shellListKnown(shells), 'Unknown project shell status; no dispatch');
+  need(shells.data.every(shell => shell.status !== 'running'), 'Project shell still running; no dispatch');
+}
+
+async function confirmHistoryAndShells(client, binding, messages, shells) {
+  const [latest, latestShells] = await Promise.all([assignmentMessages(client, binding), projectShells(client, binding)]);
+  need(isDeepStrictEqual(latest, messages), 'History changed during completion verification');
+  need(isDeepStrictEqual(latestShells, shells), 'Project shells changed during completion verification');
+}
 function bindFingerprint(state, binding) {
   if (!binding) return createHash('sha256').update('unbound').digest('hex');
   const { stopReason, diagnostic, ...pins } = binding;
   const counter = state.plans.find(plan => plan.planPath === binding.planPath)?.correctionCount;
   return createHash('sha256').update(JSON.stringify([pins, counter])).digest('hex');
+}
+
+function leasedBinding(state, owner) {
+  return state.bindings.find(binding => binding.codexChat === owner.codexChat) ??
+    state.bindings.find(binding => binding.codexChat === owner.bindingChat);
+}
+
+function leaseFingerprint(state, owner, binding = leasedBinding(state, owner)) {
+  return historyFingerprint([binding ?? null, ...[owner.planPath, binding?.planPath].map(path =>
+    state.plans.find(plan => plan.planPath === path) ?? null)]);
 }
 
 function physicalContext(workspace, planPath) {
@@ -72,7 +118,7 @@ export function validateState(state) {
     need(['workspace', 'checkout', 'planPath'].every(key => text(binding[key]) && isAbsolute(binding[key])), 'Invalid binding paths');
     need(['workspaceID', 'checkoutID', 'engineID'].every(key => text(binding[key])) && phases.includes(binding.phase), 'Invalid binding identity/phase');
     need(binding.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(binding.sessionID), 'Invalid saved session ID');
-    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment', 'diagnostic', 'adoption'].includes(key)), 'Unexpected binding fields');
+    need(Object.keys(binding).every(key => ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID', 'phase', 'uncertain', 'intent', 'assignmentID', 'messageID', 'submittedAt', 'pending', 'stopReason', 'nextAssignment', 'diagnostic', 'adoption'].includes(key)), 'Unexpected binding fields');
     if (binding.adoption !== undefined) {
       const value = binding.adoption;
       need(value && Object.keys(value).length === 3 &&
@@ -81,7 +127,17 @@ export function validateState(state) {
     }
     if (binding.diagnostic !== undefined) { need(binding.phase === 'STOPPED', 'Diagnostic requires STOPPED'); validateDiagnostic(binding.diagnostic); }
     if (binding.nextAssignment !== undefined) need(['block', 'correction'].includes(binding.nextAssignment) && ['PREPARING', 'STOPPED'].includes(binding.phase), 'Invalid next assignment');
-    if (binding.uncertain !== undefined) need(['create', 'submit', 'reply'].includes(binding.uncertain) && binding.phase === 'STOPPED', 'Invalid pending mutation');
+    if (binding.uncertain !== undefined) need(['create', 'submit', 'reply', 'model'].includes(binding.uncertain) && binding.phase === 'STOPPED', 'Invalid pending mutation');
+    if (binding.intent !== undefined) {
+      const intent = binding.intent;
+      need(intent && (binding.uncertain === 'create' && Object.keys(intent).length === 1 && leaseTokenPattern.test(intent.nonce) ||
+        binding.uncertain === 'submit' && Object.keys(intent).length === 1 && fingerprintPattern.test(intent.promptHash) ||
+        binding.uncertain === 'reply' && (Object.keys(intent).length === 2 || Object.keys(intent).length === 3 && fingerprintPattern.test(intent.answerHash)) &&
+          typeof intent.reject === 'boolean' && typeof intent.acknowledged === 'boolean' && binding.pending ||
+        binding.uncertain === 'model' && Object.keys(intent).length === 4 && (intent.head === null || text(intent.head)) &&
+          (intent.variant === null || text(intent.variant) && intent.variant.length <= 80) &&
+          (intent.idleAt === null || Number.isSafeInteger(intent.idleAt)) && Number.isSafeInteger(intent.at)), 'Invalid mutation evidence');
+    }
     if (binding.stopReason !== undefined) need(text(binding.stopReason) && binding.phase === 'STOPPED', 'Invalid stop reason');
     if (binding.pending !== undefined) need(['WAITING_FOR_ANSWER', 'STOPPED'].includes(binding.phase) && ['question', 'permission'].includes(binding.pending.kind) && /^(frm_|per)[a-zA-Z0-9_]+$/.test(binding.pending.id) && /^[a-f0-9]{64}$/.test(binding.pending.fingerprint) && Object.keys(binding.pending).length === 3, 'Invalid pending request');
     if (binding.phase === 'WAITING_FOR_ANSWER') need(binding.pending, 'Missing pending request');
@@ -132,17 +188,21 @@ function readOwnerships(root) {
     const fields = ['schema', 'token', 'codexChat', 'workspace', 'checkout', 'sessionID', 'assignmentID', 'operation'];
     const modern = owner?.schema === 2 && validProcessOwner(owner.process) && fingerprintPattern.test(owner.fingerprint);
     const observation = modern && ['wait', 'resume-watch'].includes(owner.operation) && /^msg_[a-zA-Z0-9]+$/.test(owner.messageID);
-    const bind = modern && owner.operation === 'bind' && isAbsolute(owner.planPath) &&
+    const operations = ['bind', 'adopt', 'submit', 'reply', 'next', 'finish', 'close', 'transition', 'reconcile', 'rebind-engine'];
+    const operation = (modern && owner.operation === 'bind' || owner?.schema === 3 &&
+      validProcessOwner(owner.process) && owner.process.start && fingerprintPattern.test(owner.fingerprint) &&
+      text(owner.bindingChat) && operations.includes(owner.operation)) && isAbsolute(owner.planPath) &&
       text(owner.workspaceID) && text(owner.checkoutID) &&
       (owner.messageID === null || /^msg_[a-zA-Z0-9]+$/.test(owner.messageID)) &&
       (owner.nextFingerprint === undefined || fingerprintPattern.test(owner.nextFingerprint));
-    const extra = observation ? ['process', 'messageID', 'fingerprint'] : bind ?
-      ['process', 'messageID', 'fingerprint', 'nextFingerprint', 'planPath', 'workspaceID', 'checkoutID'] : [];
-    if (!owner || !(owner.schema === 1 || observation || bind) || owner.token !== token || !text(owner.codexChat) ||
+    const extra = observation ? ['process', 'messageID', 'fingerprint'] : operation ?
+      ['process', 'messageID', 'fingerprint', 'nextFingerprint', 'planPath', 'workspaceID', 'checkoutID',
+        ...(owner.schema === 3 ? ['bindingChat'] : [])] : [];
+    if (!owner || !(owner.schema === 1 || observation || operation) || owner.token !== token || !text(owner.codexChat) ||
       !isAbsolute(owner.workspace) || !isAbsolute(owner.checkout) ||
       !(owner.sessionID === null || /^ses_[a-zA-Z0-9]+$/.test(owner.sessionID)) ||
       !(owner.assignmentID === null || text(owner.assignmentID)) ||
-      !['bind', 'adopt', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish'].includes(owner.operation) ||
+      ![...operations, 'wait', 'resume-watch'].includes(owner.operation) ||
       Object.keys(owner).some(key => ![...fields, ...extra].includes(key))) invalid = true;
     else owners.push({ ...owner, path: join(root, name) });
   }
@@ -167,8 +227,112 @@ const postgresPath = (root, messageID) => join(root, 'postgres-recoveries', mess
 const deliveryFingerprint = binding => createHash('sha256').update(JSON.stringify(
   ['workspaceID', 'checkoutID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt'].map(key => binding[key]),
 )).digest('hex');
+const reviewPath = (root, messageID) => join(root, 'review-boundaries', messageID + '.json');
+const acceptedPath = (root, messageID) => join(root, 'accepted-deliveries', messageID + '.json');
+const promptPath = (root, messageID) => join(root, 'prompt-deliveries', messageID + '.json');
+
+function recordPrompt(root, binding) {
+  const path = promptPath(root, binding.messageID);
+  const receipt = { owner: deliveryFingerprint(binding), hash: binding.intent.promptHash };
+  if (existsSync(path)) {
+    need(isDeepStrictEqual(JSON.parse(readFileSync(path, 'utf8')), receipt), 'Conflicting prompt checksum receipt');
+    return;
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJSON(path, receipt);
+}
+export function planIdentity(path) {
+  const lines = readFileSync(path, 'utf8').replace(/\r\n/g, '\n').split('\n');
+  let checkpoint = false;
+  const content = [];
+  for (const line of lines) {
+    if (line.startsWith('## ')) checkpoint = /^## (?:Review checkpoint(?: \(advisor-owned\))?|Контрольная точка[^\n]*)\s*$/i.test(line);
+    if (checkpoint || !line.trim() || /^<!-- code-duet-accepted msg_[a-zA-Z0-9]+ -->$/.test(line.trim()) ||
+      /^(?:Status:|\*\*Status:\*\*)\s+(?:TODO|ACTIVE|DONE|BLOCKED|STALE)\.?\s*$/i.test(line)) continue;
+    content.push(line.trimEnd().replace(/^(\s*[-*+] )\[[ xX]\](?= )/, '$1[ ]'));
+  }
+  return createHash('sha256').update(content.join('\n')).digest('hex');
+}
+
+function loadAcceptance(root, messageID) {
+  try { return JSON.parse(readFileSync(acceptedPath(root, messageID), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+function readAcceptance(root, binding, value = loadAcceptance(root, binding.messageID)) {
+  if (value === null) return null;
+  need(value?.schema === 1 && value.owner === deliveryFingerprint(binding) && value.planPath === binding.planPath &&
+    fingerprintPattern.test(value.planHash) && Number.isSafeInteger(value.correctionCount) && value.correctionCount >= 0,
+  'Invalid or foreign acceptance receipt');
+  return value;
+}
+
+function recordAcceptance(root, state, binding, planPath = binding.planPath) {
+  const delivery = Object.fromEntries(['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID',
+    'sessionID', 'assignmentID', 'messageID', 'submittedAt', 'planPath'].map(key => [key, binding[key]]));
+  const value = { schema: 1, owner: deliveryFingerprint(binding), planPath: binding.planPath, planHash: planIdentity(planPath),
+    correctionCount: state.plans.find(plan => plan.planPath === binding.planPath).correctionCount, delivery };
+  const prior = readAcceptance(root, binding);
+  if (prior) return need(prior.planHash === value.planHash, 'Accepted plan identity changed');
+  const path = acceptedPath(root, binding.messageID);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJSON(path, value);
+}
+
+export function acceptanceStatus(workspace, planPath, messageID, { indexPath, stateRoot = defaultStateRoot(), chatID = process.env.CODEX_THREAD_ID } = {}) {
+  const ctx = observationContext(workspace, planPath), state = readState(join(stateRoot, 'state.json'));
+  need(/^msg_[a-zA-Z0-9]+$/.test(messageID) && text(chatID), 'Use the exact delivery and its owning Codex chat');
+  const current = state.bindings.find(binding => binding.messageID === messageID && binding.codexChat === chatID);
+  const transition = readTransition(stateRoot, messageID);
+  const saved = loadAcceptance(stateRoot, messageID), delivered = saved?.delivery;
+  const historical = delivered?.codexChat === chatID && delivered.messageID === messageID ? delivered : null;
+  const binding = transition?.source.codexChat === chatID ? transition.source : current ?? historical;
+  need(binding && ['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key => binding[key] === ctx[key]),
+    'No exact acceptance in this chat and workspace');
+  const receipt = readAcceptance(stateRoot, binding, saved);
+  need(receipt && (ctx.planPath === binding.planPath || !existsSync(binding.planPath)) &&
+    planIdentity(ctx.planPath) === receipt.planHash, 'Plan does not match this acceptance receipt');
+  const checkpointRecorded = readFileSync(ctx.planPath, 'utf8').split(/\r?\n/)
+    .some(line => line.trim() === '<!-- code-duet-accepted ' + messageID + ' -->');
+  let indexStatus;
+  if (indexPath !== undefined) {
+    need(isAbsolute(indexPath), 'Use an absolute plan index path');
+    const index = realpathSync(indexPath);
+    need(inside(ctx.workspace, index), 'Plan index is outside the workspace');
+    const statuses = [];
+    for (const line of readFileSync(index, 'utf8').split(/\r?\n/)) {
+      const match = /^\s*\|\s*\[[^\]]+\]\(([^)]+)\)\s*\|.*\|\s*(TODO|ACTIVE|DONE|BLOCKED|STALE)\s*\|\s*$/.exec(line);
+      if (match && resolve(dirname(index), decodeURI(match[1])) === ctx.planPath) statuses.push(match[2]);
+    }
+    indexStatus = statuses.length === 1 ? statuses[0] : statuses.length ? 'ambiguous' : 'missing';
+  }
+  const advanced = !current && historical && state.bindings.some(next => next.codexChat === chatID &&
+    next.workspaceID === binding.workspaceID && next.planPath === binding.planPath && next.sessionID === binding.sessionID &&
+    next.submittedAt >= binding.submittedAt && next.messageID && next.messageID !== messageID);
+  return { kind: 'acceptance-status', sessionID: binding.sessionID, assignmentID: binding.assignmentID, messageID,
+    correctionCount: receipt.correctionCount, checkpointRecorded, indexStatus, currentPhase: current?.phase ?? null,
+    runtimeRecorded: !!(current?.phase === 'FINISHED' || current?.nextAssignment === 'block' || transition?.disposition === 'accepted' || advanced),
+    taskSent: false, stateChange: 'unchanged' };
+}
+function reviewReceipt(root, binding, exchange) {
+  const canonical = JSON.stringify(exchange, (_key, value) => value && typeof value === 'object' && !Array.isArray(value) ?
+    Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
+  const receipt = { owner: deliveryFingerprint(binding), history: createHash('sha256').update(canonical).digest('hex') };
+  let saved;
+  try { saved = readFileSync(reviewPath(root, binding.messageID), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return receipt; throw error; }
+  need(isDeepStrictEqual(JSON.parse(saved), receipt),
+    'Delivered history changed since review; inspect the original result before continuing');
+  return receipt;
+}
+function saveReviewReceipt(root, binding, receipt) {
+  const path = reviewPath(root, binding.messageID);
+  if (existsSync(path)) return;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJSON(path, receipt);
+}
 function withPostgresRecovery(root, binding) {
-  if (!/^msg_[a-zA-Z0-9]+$/.test(binding.messageID ?? '') || binding.phase === 'STOPPED') return binding;
+  if (!/^msg_[a-zA-Z0-9]+$/.test(binding.messageID ?? '')) return binding;
   const path = postgresPath(root, binding.messageID);
   if (!existsSync(path)) return binding;
   const receipt = JSON.parse(readFileSync(path, 'utf8'));
@@ -257,25 +421,44 @@ async function matchingSession(client, binding) {
   return session;
 }
 
+async function checkoutActivity(client, checkout, response, selectedID) {
+  let active = response?.data;
+  resample: for (const allowResample of [true, false]) {
+    need(active && typeof active === 'object' && !Array.isArray(active), 'Unknown engine execution status');
+    let overlapping = false;
+    for (const [id, status] of Object.entries(active)) {
+      need(/^ses_[a-zA-Z0-9]+$/.test(id) && status?.type === 'running' && Object.keys(status).length === 1,
+        'Unknown active execution status');
+      if (id === selectedID) continue;
+      need(checkout, 'Active session directory cannot be compared without a checkout');
+      let other;
+      try { other = await client.request('/api/session/' + id); }
+      catch (error) {
+        if (!allowResample || error?.diagnostic?.httpStatus !== 404) throw error;
+        active = (await client.request('/api/session/active'))?.data;
+        continue resample;
+      }
+      need(other?.data?.id === id && text(other.data.location?.directory), 'Unknown active session identity');
+      overlapping ||= overlaps(checkout, realpathSync(other.data.location.directory));
+    }
+    return { selected: selectedID ? active[selectedID] : undefined, overlapping };
+  }
+}
+
 export async function observationSnapshot(client, binding) {
   const [session, active, forms, permissions] = await Promise.all([
     matchingSession(client, binding), client.request('/api/session/active'),
     client.request(`/api/session/${binding.sessionID}/form`), client.request(`/api/session/${binding.sessionID}/permission`),
   ]);
-  need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data) && Array.isArray(forms?.data) && Array.isArray(permissions?.data), 'Unknown execution/interactive status');
-  const activity = active.data[binding.sessionID];
-  need(activity === undefined || activity?.type === 'running' && Object.keys(activity).length === 1,
-    'Unknown active execution status');
-  for (const id of Object.keys(active.data)) {
-    if (id === binding.sessionID) continue;
-    need(/^ses_[a-zA-Z0-9]+$/.test(id), 'Unknown active session identity');
-    const other = await client.request('/api/session/' + id);
-    need(text(other?.data?.location?.directory) && !overlaps(binding.checkout, realpathSync(other.data.location.directory)), 'Another executor in this checkout; no ownership transfer');
-  }
-  return { session, active: active.data[binding.sessionID], forms: forms.data, permissions: permissions.data };
+  need(Array.isArray(forms?.data) && Array.isArray(permissions?.data), 'Unknown execution/interactive status');
+  const activity = await checkoutActivity(client, binding.checkout, active, binding.sessionID);
+  need(!activity.overlapping, 'Another executor in this checkout; no ownership transfer');
+  return { session, active: activity.selected, forms: forms.data, permissions: permissions.data };
 }
 
 async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess = false, verifyPriorPlan = false, invocationCheck) {
+  const verified = [];
+  invocationCheck = { verified, ...invocationCheck };
   const quiet = current => !current.active && !current.forms.length && !current.permissions.length;
   const current = await observationSnapshot(client, binding);
   if (invocationCheck?.lostCalls) {
@@ -284,38 +467,42 @@ async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess
     need(!current.permissions.length, 'Prior session has pending permissions; no replacement');
   }
   need(quiet(current), 'Session is active or awaiting a reply; no closure or dispatch');
+  need(sessionAvailable(current.session), unavailableForDispatch);
   need(!requireSuccess || current.session.outcome === 'succeeded', 'Acceptance requires confirmed successful execution');
-  const shellRoute = '/api/shell?location[directory]=' + encodeURIComponent(binding.workspace);
   const messages = await assignmentMessages(client, binding);
   if (invocationCheck?.historyFingerprint) need(historyFingerprint(messages) === invocationCheck.historyFingerprint,
     'Prior delivery history differs from the legacy bind recovery receipt');
   if (verifyPriorPlan) need(messages[0].text.startsWith('Assignment ID: ' + binding.assignmentID + '\nCanonical plan: ' +
     JSON.stringify(binding.planPath) + '\n'), 'Prior plan was not confirmed in the current OpenCode history');
-  const shells = await client.request(shellRoute);
-  const boundary = closureBoundary(withShellEvidence(stateRoot, binding), messages, current.session, shells, invocationCheck);
-  if (invocationCheck?.lostCalls) {
-    const [latest, latestShells] = await Promise.all([assignmentMessages(client, binding), client.request(shellRoute)]);
-    need(JSON.stringify(latest) === JSON.stringify(messages) && JSON.stringify(latestShells) === JSON.stringify(shells),
-      'History or project shells changed during replacement verification');
-  }
-  const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
-  need(Array.isArray(head?.data) && head.data.length === 1 && head.data[0].id === boundary.lastMessageID,
-    'History changed during closure verification');
+  const shells = await projectShells(client, binding);
+  const withEvidence = withShellEvidence(stateRoot, binding);
+  const review = requireSuccess && !invocationCheck?.lostCalls;
+  const delivered = deliveredBoundary(binding, messages, current.session, review);
+  if (review) {
+    completion(inspectMessages(withEvidence, delivered.exchange), current.session, shells, invocationCheck);
+  } else closureBoundary(withEvidence, messages, current.session, shells, invocationCheck, delivered);
+  const receipt = reviewReceipt(stateRoot, binding, delivered.exchange);
   const confirmed = await observationSnapshot(client, binding);
-  need(quiet(confirmed) && confirmed.session.outcome === current.session.outcome &&
+  need(quiet(confirmed) && sessionAvailable(confirmed.session) && confirmed.session.outcome === current.session.outcome &&
     JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
     JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model), 'Session changed during closure verification');
-  return boundary;
+  await confirmHistoryAndShells(client, binding, messages, shells);
+  return { boundary: delivered.boundary, receipt, verified };
 }
 
-function checkTransitionSource(binding, ctx) {
+function checkTransitionSource(binding, ctx, stateRoot, movedPlanPath) {
   need(!binding.uncertain, 'Prior assignment mutation is uncertain; keep its owner');
   need(!binding.pending && binding.phase !== 'WAITING_FOR_ANSWER', 'Prior assignment is awaiting a reply; keep its owner');
   need(['EXECUTING', 'REVIEWING', 'STOPPED', 'FINISHED'].includes(binding.phase) && binding.sessionID &&
     binding.assignmentID && !binding.nextAssignment, 'No confirmed delivered assignment to transition');
-  const source = observationContext(ctx.workspace, binding.planPath);
+  const source = observationContext(ctx.workspace, movedPlanPath ?? binding.planPath);
+  if (movedPlanPath !== undefined) {
+    const acceptance = readAcceptance(stateRoot, binding);
+    need(binding.phase === 'FINISHED' && !existsSync(binding.planPath) && acceptance &&
+      planIdentity(source.planPath) === acceptance.planHash, 'Moved plan does not match the exact FINISHED acceptance receipt');
+  }
   need(['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key => source[key] === ctx[key] && source[key] === binding[key]) &&
-    source.planPath === binding.planPath, 'Prior assignment workspace/plan identity changed');
+    (movedPlanPath !== undefined || source.planPath === binding.planPath), 'Prior assignment workspace/plan identity changed');
 }
 
 // Explicit paged discovery, independent of binding and without a store/lock.
@@ -527,8 +714,23 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       'Saved helper state is invalid or unavailable; do not replace it automatically', false, diagnostic);
   }
   if (existsSync(join(stateRoot, 'state.lock'))) {
-    add('state-transaction', 'blocked', 'A helper state transaction is present; wait and rerun, without removing the lock');
+    add('state-transaction', 'blocked', 'A helper state transaction is present; run state-lock to inspect its owner');
   } else if (state) add('state-transaction', 'pass', 'No short helper state transaction is present');
+  let taskArchive;
+  try {
+    const { ledger } = readTaskLedger(stateRoot);
+    const entry = ledger.entries.find(item => item.planPath === ctx?.planPath);
+    if (entry?.archivedAt != null || entry?.pendingRestore) {
+      add('task-maintenance', 'blocked', 'This task has an archive or pending restore; run task-maintenance before dispatch');
+    }
+    if (entry?.bindings.length) taskArchive = { archivedAt: entry.archivedAt, correctionCount: entry.plan.correctionCount,
+      deliveries: entry.bindings.map(binding => ({ sessionID: binding.sessionID, assignmentID: binding.assignmentID ?? null,
+        messageID: binding.messageID ?? null, phase: binding.phase })),
+      recovery: 'Select the exact old session in OpenCode for read-only review. If it is unavailable, use the accepted checkpoint and the authorized new-session route.' };
+  } catch (error) {
+    add('task-maintenance', 'unknown', 'Lifecycle journal unavailable; current state and OpenCode checks are independent',
+      true, diagnosticOf(error));
+  }
 
   const validCount = correctionCount === undefined ||
     Number.isInteger(correctionCount) && correctionCount >= 0 && correctionCount <= 20;
@@ -662,7 +864,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     const validSelectedID = typeof selectedSessionID === 'string' && /^ses_[a-zA-Z0-9]+$/.test(selectedSessionID);
     const probes = await Promise.all([
       capture(client.request('/api/session/active')),
-      workspacePath ? capture(client.request('/api/shell?location[directory]=' + encodeURIComponent(workspacePath))) :
+      workspacePath ? capture(projectShells(client, { workspace: workspacePath, checkout: ctx?.checkout })) :
         Promise.resolve({ error: new Error('Workspace unavailable') }),
       validSelectedID ? capture(client.request('/api/session/' + selectedSessionID)) : Promise.resolve(null),
       validSelectedID ? capture(client.request('/api/session/' + selectedSessionID + '/form')) : Promise.resolve(null),
@@ -687,8 +889,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
           (!candidateBinding?.adoption || (model.variant ?? null) === candidateBinding.adoption.variant)) {
           add('session-options', 'pass', 'Candidate model options are supported and match any saved adoption boundary');
         } else add('session-options', 'blocked', 'Candidate model options are unsupported or changed from the saved boundary');
-        if (liveSession.time && typeof liveSession.time === 'object' && liveSession.time.archived === undefined &&
-          (liveSession.archived === undefined || liveSession.archived === false)) {
+        if (sessionAvailable(liveSession)) {
           add('session-availability', 'pass', 'Candidate session is not archived');
         } else add('session-availability', 'blocked', 'Candidate session is archived or its availability is unknown');
         if (liveSession.location?.directory && workspacePath) {
@@ -717,7 +918,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       if (historyResult.error) add('history', errorStatus(historyResult.error), 'Candidate history could not be verified: ' + errorReason(historyResult.error),
         false, diagnosticOf(historyResult.error));
       else if (!liveSession) add('history', 'unknown', 'Candidate history depends on the exact session');
-      else if (shellsResult.error || !Array.isArray(shellsResult.value?.data)) {
+      else if (shellsResult.error || !shellListKnown(shellsResult.value)) {
         add('history', 'unknown', 'Candidate history completion depends on known project shell status', false,
           diagnosticOf(shellsResult.error));
       } else {
@@ -730,18 +931,22 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
               (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
                 readClosure(stateRoot, candidateBinding));
             const boundHistory = withShellEvidence(stateRoot, candidateBinding);
-            if (closed) need(sameBoundary(closed.boundary, closureBoundary(boundHistory, messages, liveSession, shells)),
-              'History changed since closure; no dispatch');
-            else {
+            const completed = ['FINISHED', 'REVIEWING'].includes(candidateBinding.phase) ||
+              candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment;
+            if (closed || completed) {
+              const review = !closed || closed.disposition === 'accepted';
+              const delivered = deliveredBoundary(candidateBinding, messages, liveSession, review);
+              if (review) completion(inspectMessages(boundHistory, delivered.exchange), liveSession, shells);
+              else closureBoundary(boundHistory, messages, liveSession, shells, undefined, delivered);
+              reviewReceipt(stateRoot, candidateBinding, delivered.exchange);
+              if (closed) need(sameBoundary(closed.boundary, delivered.boundary), 'History changed since closure; no dispatch');
+            } else {
               const history = inspectMessages(boundHistory, messages);
               need(!history.kind, 'Saved assignment history failed or was interrupted');
-              if (['FINISHED', 'REVIEWING'].includes(candidateBinding.phase) ||
-                candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment) completion(history, liveSession, shells);
-              if (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment && candidateBinding.adoption) {
-                need(candidateBinding.adoption.lastMessageID === (messages.at(-1)?.id ?? null) &&
-                  candidateBinding.adoption.idleAt === (liveSession.time?.idle ?? null) &&
-                  candidateBinding.adoption.variant === (liveSession.model?.variant ?? null), 'Saved history boundary changed');
-              }
+            }
+            if (!closed && candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment && candidateBinding.adoption) {
+              need(sameBoundary(candidateBinding.adoption, { lastMessageID: messages.at(-1)?.id ?? null,
+                idleAt: liveSession.time?.idle ?? null, variant: liveSession.model?.variant ?? null }), 'Saved history boundary changed');
             }
           } else if (candidateBinding?.adoption) {
             if (messages.length) {
@@ -774,35 +979,21 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
 
     if (activeResult.error) add('execution', errorStatus(activeResult.error), 'Execution status lookup failed: ' + errorReason(activeResult.error),
       false, diagnosticOf(activeResult.error));
-    else if (!activeResult.value?.data || typeof activeResult.value.data !== 'object' || Array.isArray(activeResult.value.data)) {
-      add('execution', 'unknown', 'Engine execution status shape is unknown');
-    } else {
-      const active = activeResult.value.data;
-      let activeUnknown = false, activeBlocker = false, otherCheckoutBlocker = false, activeDiagnostic;
-      for (const [id, status] of Object.entries(active)) {
-        if (!/^ses_[a-zA-Z0-9]+$/.test(id) || status?.type !== 'running') { activeUnknown = true; continue; }
-        if (id === selectedSessionID) activeBlocker = true;
-        else if (ctx) {
-          const otherResult = await capture(client.request('/api/session/' + id));
-          if (otherResult.error || !text(otherResult.value?.data?.location?.directory)) {
-            activeUnknown = true; activeDiagnostic ??= diagnosticOf(otherResult.error); continue;
-          }
-          try { if (overlaps(ctx.checkout, realpathSync(otherResult.value.data.location.directory))) otherCheckoutBlocker = true; }
-          catch { activeUnknown = true; }
-        }
+    else {
+      try {
+        const activity = await checkoutActivity(client, ctx?.checkout, activeResult.value, selectedSessionID);
+        add('execution', activity.selected || activity.overlapping ? 'blocked' : 'pass',
+          activity.selected ? 'Selected session is running' : activity.overlapping ?
+            'Another active OpenCode session is in this checkout' : 'No active OpenCode session in this checkout');
+      } catch (error) {
+        add('execution', 'unknown', 'One or more active session identities/statuses are unknown',
+          false, diagnosticOf(error));
       }
-      add('execution', activeBlocker || otherCheckoutBlocker ? 'blocked' : activeUnknown ? 'unknown' : 'pass',
-        activeBlocker ? 'Selected session is running' : otherCheckoutBlocker ?
-          'Another active OpenCode session is in this checkout' : activeUnknown ?
-            'One or more active session identities/statuses are unknown' : 'No active OpenCode session in this checkout',
-        false, activeDiagnostic);
     }
 
     if (shellsResult.error) add('background', errorStatus(shellsResult.error), 'Project shell lookup failed: ' + errorReason(shellsResult.error),
       false, diagnosticOf(shellsResult.error));
-    else if (!Array.isArray(shellsResult.value?.data) || !shellsResult.value.data.every(shell =>
-      ['running', 'exited', 'timeout', 'killed'].includes(shell.status) &&
-      (shell.status === 'running' || Number.isFinite(shell.time?.completed)))) {
+    else if (!shellListKnown(shellsResult.value)) {
       add('background', 'unknown', 'Project shell status is invalid or unknown');
     } else {
       const running = shellsResult.value.data.filter(shell => shell.status === 'running').length;
@@ -825,13 +1016,14 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
         assignmentID: prior.assignmentID ?? null, messageID: prior.messageID ?? null,
         correctionCount: state.plans.find(item => item.planPath === prior.planPath).correctionCount };
       try {
-        checkTransitionSource(prior, ctx);
+        checkTransitionSource(prior, ctx, stateRoot);
         need(checks.some(item => item.name === 'ownership' && item.status === 'pass'), 'Checkout lease is active or unknown');
         need(!readClosure(stateRoot, prior), 'Prior closure is staged; resolve it before a transition');
         const engineChanged = prior.engineID !== client.engineID;
-        await checkedClosureBoundary(client, stateRoot, { ...prior, adoption: undefined }, false, engineChanged);
+        const mayAccept = ['REVIEWING', 'FINISHED'].includes(prior.phase);
+        await checkedClosureBoundary(client, stateRoot, { ...prior, adoption: undefined }, mayAccept, engineChanged);
         transition = { ...evidence, status: 'ready', command: 'transition', args: [workspacePath, planRealPath, prior.messageID],
-          engineChanged, options: nonGitArgs, dispositions: [...(['REVIEWING', 'FINISHED'].includes(prior.phase) ? ['accepted'] : []),
+          engineChanged, options: nonGitArgs, dispositions: [...(mayAccept ? ['accepted'] : []),
             'blocked', 'without-acceptance'] };
       } catch (error) {
         transition = { ...evidence, status: 'blocked', reason: errorReason(error) };
@@ -844,6 +1036,11 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     connectionDiagnostic.observedVersion + ' (' + connectionDiagnostic.versionSource +
     '). Use a validated matching engine/helper or revalidate API compatibility before rerunning preflight; no task was sent.';
   else if (!connected) nextStep = 'Restore the OpenCode connection and rerun preflight; this call sent no task.';
+  else if (savedBinding?.uncertain && savedBinding.engineID === client.engineID && savedBinding.planPath === planRealPath &&
+    (savedBinding.intent || savedBinding.uncertain === 'create' && savedBinding.sessionID)) {
+    nextStep = 'Run reconcile to verify the exact prior mutation from OpenCode history and saved evidence; it sends no task.';
+    nextCommand = { command: 'reconcile', args: [workspacePath, planRealPath, ...nonGitArgs] };
+  }
   else if (blockers.length && permanentRequest) {
     const diagnostic = permanentRequest.diagnostic;
     const operation = [diagnostic.method, diagnostic.operation].filter(Boolean).join(' ');
@@ -852,8 +1049,14 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       ' with HTTP ' + diagnostic.httpStatus + (diagnostic.errorCode ? ' (' + diagnostic.errorCode + ')' : '') +
       '. Do not retry the unchanged request. Check and correct this API request/cursor before rerunning preflight; no task was sent.';
   }
+  else if (checks.some(check => check.name === 'task-maintenance' && check.status === 'blocked')) {
+    nextStep = 'Restore the archived correction counter with task-maintenance, then rerun preflight. Archive delivery IDs are for explicit review.';
+    nextCommand = { command: 'task-maintenance', args: [workspacePath, planRealPath] };
+  }
   else if (transition?.status === 'ready') nextStep =
     'Resolve the prior review or record the owner’s explicit decision to leave it without acceptance. For authorized next work run transition with that disposition, then rerun preflight.';
+  else if (checks.some(item => item.name === 'session-availability' && item.status === 'blocked')) nextStep =
+    'If the session is archived, unarchive it in OpenCode and rerun preflight to check dispatch readiness.';
   else if (transition?.status === 'blocked') nextStep = transition.reason;
   else if (blockers.length) nextStep = 'Resolve the listed blockers and rerun preflight; this call sent no task.';
   else if (status === 'unknown') nextStep = !connected ? 'Restore the OpenCode connection and rerun preflight.' :
@@ -895,7 +1098,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     recipient: { selected: !!selectedSessionID, sessionID: selectedSessionID ?? null,
       source: explicitSession ? 'explicit' : savedBinding ? 'saved-pair' : 'none' },
     checks, blockers: [...new Set(blockers)], unknowns: [...new Set(unknowns)], legacyCandidates,
-    ...(transition ? { transition } : {}),
+    ...(transition ? { transition } : {}), ...(taskArchive ? { taskArchive } : {}),
     nextStep, nextCommand, taskSent: false, snapshotOnly: true, stateChange: 'unchanged',
     storeWriteAccess: 'unknown until an authorized write command; request normal host approval if the store is outside writable roots',
   };
@@ -910,36 +1113,95 @@ function stateFailure(error, stage) {
     conflict ? 'state-locked' : denied ? 'state-access' : 'state-io', stage, {}, error);
 }
 
+const defaultStateRoot = () => resolve(homedir(), '.local/state/code-duet');
+const reservedSessionTitle = binding => 'Code Duet: ' + basename(binding.workspace).slice(0, 100) + ' [' + binding.intent.nonce + ']';
+
+export function stateLockStatus({ stateRoot = defaultStateRoot(), probeOwner, recoverToken } = {}) {
+  const lockPath = join(stateRoot, 'state.lock'), statePath = join(stateRoot, 'state.json');
+  const unchanged = { taskSent: false, stateChange: 'unchanged' };
+  let raw, owner;
+  try { raw = readFileSync(lockPath, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { kind: 'state-lock-status', ownerStatus: 'absent', ...unchanged };
+    throw stateFailure(error, 'state-lock');
+  }
+  try { owner = JSON.parse(raw); } catch { /* Legacy lock, without process evidence. */ }
+  const modern = owner?.schema === 1 && leaseTokenPattern.test(owner.token) &&
+    validProcessOwner(owner.process) && owner.process.start;
+  const proof = ownerLiveness(modern ? owner.process : undefined, probeOwner);
+  const result = { kind: 'state-lock-status', token: modern ? owner.token : null,
+    processID: modern ? owner.process.pid : null, ownerStatus: proof.status, reason: proof.reason,
+    recoveryAllowed: proof.status === 'dead', ...unchanged };
+  if (recoverToken === undefined) return result;
+  if (!modern || recoverToken !== owner.token || proof.status !== 'dead') return { ...result, kind: 'rejected' };
+  const stateBytes = () => {
+    try { return readFileSync(statePath); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  };
+  try {
+    const state = stateBytes();
+    if (state !== null) validateState(JSON.parse(state.toString('utf8')));
+    const archive = join(stateRoot, 'state-lock-history');
+    mkdirSync(archive, { recursive: true, mode: 0o700 });
+    need(readFileSync(lockPath, 'utf8') === raw && isDeepStrictEqual(stateBytes(), state),
+      'State or lock changed during recovery');
+    // The exclusive receipt elects a single recoverer for this immutable token.
+    writeFileSync(join(archive, owner.token + '.json'), JSON.stringify({ owner, proof,
+      stateFingerprint: state === null ? null : createHash('sha256').update(state).digest('hex') }), { flag: 'wx', mode: 0o600 });
+    need(readFileSync(lockPath, 'utf8') === raw && isDeepStrictEqual(stateBytes(), state),
+      'State or lock changed during recovery');
+    renameSync(lockPath, join(archive, owner.token + '.lock'));
+  } catch (error) { if (error.code) throw stateFailure(error, 'state-lock'); throw error; }
+  return { ...result, kind: 'state-lock-released', leaseArchived: true };
+}
+
 export function withStateLock(stateRoot, operation) {
-  const statePath = join(stateRoot, 'state.json');
+    const statePath = join(stateRoot, 'state.json');
     try { mkdirSync(stateRoot, { recursive: true, mode: 0o700 }); }
     catch (error) { throw stateFailure(error, 'state-directory'); }
     const lockPath = join(stateRoot, 'state.lock');
-    let lock, result, primary, releaseError, lastLockError;
+    let acquired = false, result, primary, releaseError, lastLockError, record;
     const token = randomUUID();
-    const lockDeadline = performance.now() + 120;
-    for (let attempt = 0; attempt < 7; attempt++) {
-      if (attempt > 0 && performance.now() >= lockDeadline) break;
-      try { lock = openSync(lockPath, 'wx', 0o600); break; }
-      catch (error) {
-        lastLockError = error;
-        if (error?.code !== 'EEXIST' || attempt >= 6 || performance.now() >= lockDeadline) throw stateFailure(error, 'state-lock');
-        // Wait briefly for a synchronous state transaction; never remove a foreign/crashed lock.
-        Atomics.wait(stateLockWait, 0, 0, Math.max(1, Math.min(1, lockDeadline - performance.now())));
-      }
-    }
-    if (lock === undefined) throw stateFailure(lastLockError, 'state-lock');
+    const candidate = join(stateRoot, 'state-lock-' + token + '.tmp');
+    let handle;
     try {
-      writeFileSync(lock, token);
+      // Check write access before querying the OS, then publish a complete record atomically.
+      handle = openSync(candidate, 'wx', 0o600);
+      const owner = processOwner();
+      if (!owner.start) throw diagnosticError('Cannot verify the helper process creation time; no state lock was acquired',
+        'process-identity', 'process-probe');
+      record = JSON.stringify({ schema: 1, token, process: owner });
+      writeFileSync(handle, record);
+      closeSync(handle);
+      handle = undefined;
+      const lockDeadline = performance.now() + 120;
+      for (let attempt = 0; attempt < 7; attempt++) {
+        if (attempt > 0 && performance.now() >= lockDeadline) break;
+        try { linkSync(candidate, lockPath); acquired = true; break; }
+        catch (error) {
+          lastLockError = error;
+          if (error.code !== 'EEXIST' || attempt >= 6) break;
+          Atomics.wait(stateLockWait, 0, 0, Math.max(0, Math.min(2 ** attempt, lockDeadline - performance.now())));
+        }
+      }
+      if (!acquired) throw stateFailure(lastLockError, 'state-lock');
+    } catch (error) { primary = error.diagnostic ? error : stateFailure(error, 'state-lock'); }
+    finally {
+      try { if (handle !== undefined) closeSync(handle); }
+      catch (error) { releaseError = error; }
+      try { if (existsSync(candidate)) unlinkSync(candidate); }
+      catch (error) { releaseError ??= error; }
+    }
+    if (!acquired) throw primary ?? stateFailure(releaseError, 'state-lock');
+    try {
+      if (releaseError) throw stateFailure(releaseError, 'state-lock');
       result = operation(readState(statePath));
       need(!result || typeof result.then !== 'function', 'State lock cannot cover asynchronous work');
     } catch (error) { primary = error; }
     let owned = false;
-    try { owned = readFileSync(lockPath, 'utf8') === token; }
+    try { owned = readFileSync(lockPath, 'utf8') === record; }
     catch (error) { releaseError = error; }
-    try { closeSync(lock); }
-    catch (error) { releaseError ??= error; }
-    if (owned && !releaseError) {
+    if (owned) {
       try { unlinkSync(lockPath); }
       catch (error) { releaseError = error; }
     } else if (!owned && !releaseError) releaseError = Object.assign(new Error('State lock ownership changed'), { code: 'EEXIST' });
@@ -951,45 +1213,48 @@ export function withStateLock(stateRoot, operation) {
     return result;
 }
 
-// Lifecycle cleanup runs only when explicitly invoked before a task; state.lock
-// also serializes its journal with every existing helper writer.
-export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir(), '.local/state/code-duet'), now = Date.now() } = {}) {
+function readTaskLedger(stateRoot) {
+  const path = join(stateRoot, 'task-lifecycle.json');
+  let raw = null;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch (error) { if (error.code !== 'ENOENT') throw stateFailure(error, 'state-lock'); }
+  const ledger = raw === null ? { schema: 1, entries: [] } : JSON.parse(raw);
+  need(ledger?.schema === 1 && Array.isArray(ledger.entries) && Object.keys(ledger).length === 2,
+    'Invalid task lifecycle journal');
+  const seen = new Set();
+  for (const entry of ledger.entries) {
+    need(entry && isAbsolute(entry.workspace) && isAbsolute(entry.planPath) && !seen.has(entry.planPath) &&
+      Number.isSafeInteger(entry.lastUsed) && entry.lastUsed >= 0 &&
+      (entry.archivedAt === null || Number.isSafeInteger(entry.archivedAt) && entry.archivedAt >= 0) &&
+      entry.plan?.workspace === entry.workspace && entry.plan?.planPath === entry.planPath &&
+      Number.isSafeInteger(entry.plan.correctionCount) && entry.plan.correctionCount >= 0 &&
+      Array.isArray(entry.bindings) && (entry.pendingRestore === undefined || typeof entry.pendingRestore === 'boolean') &&
+      (entry.fingerprint === undefined || /^[a-f0-9]{64}$/.test(entry.fingerprint)) &&
+      (entry.busy === undefined || typeof entry.busy === 'boolean') &&
+      (!entry.pendingRestore || entry.archivedAt === null), 'Invalid task lifecycle entry');
+    validateState({ schema: 1, bindings: entry.bindings, plans: [entry.plan] });
+    seen.add(entry.planPath);
+  }
+  return { path, raw, ledger, seen };
+}
+
+// Compare the validated journal again under the state lock before moving records.
+export function maintainTasks(workspace, planPath, { stateRoot = defaultStateRoot(), now = Date.now() } = {}) {
   need(Number.isSafeInteger(now) && now >= 0, 'Invalid maintenance time');
-  const ctx = observationContext(workspace, planPath);
-  const ledgerPath = join(stateRoot, 'task-lifecycle.json'), statePath = join(stateRoot, 'state.json');
+  const ctx = observationContext(workspace, planPath), statePath = join(stateRoot, 'state.json');
   const period = 30 * 24 * 60 * 60 * 1000;
+  const { path: ledgerPath, raw, ledger, seen } = readTaskLedger(stateRoot);
   return withStateLock(stateRoot, state => {
-    let ledger = { schema: 1, entries: [] };
-    if (existsSync(ledgerPath)) {
-      ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
-      need(ledger?.schema === 1 && Array.isArray(ledger.entries) && Object.keys(ledger).length === 2,
-        'Invalid task lifecycle journal');
-    }
-    const seen = new Set();
-    for (const entry of ledger.entries) {
-      need(entry && isAbsolute(entry.workspace) && isAbsolute(entry.planPath) && !seen.has(entry.planPath) &&
-        Number.isSafeInteger(entry.lastUsed) && entry.lastUsed >= 0 &&
-        (entry.archivedAt === null || Number.isSafeInteger(entry.archivedAt) && entry.archivedAt >= 0) &&
-        entry.plan?.workspace === entry.workspace && entry.plan?.planPath === entry.planPath &&
-        Number.isSafeInteger(entry.plan.correctionCount) && entry.plan.correctionCount >= 0 &&
-        Array.isArray(entry.bindings) && (entry.pendingRestore === undefined || typeof entry.pendingRestore === 'boolean') &&
-        (entry.fingerprint === undefined || /^[a-f0-9]{64}$/.test(entry.fingerprint)) &&
-        (entry.busy === undefined || typeof entry.busy === 'boolean') &&
-        (!entry.pendingRestore || entry.archivedAt === null), 'Invalid task lifecycle entry');
-      validateState({ schema: 1, bindings: [], plans: [entry.plan] });
-      seen.add(entry.planPath);
-    }
+    const currentRaw = existsSync(ledgerPath) ? readFileSync(ledgerPath, 'utf8') : null;
+    need(currentRaw === raw, 'Lifecycle journal changed; rerun maintenance');
     const owners = readOwnerships(join(stateRoot, 'ownership'));
     need(!owners.invalid, 'Cannot maintain tasks while ownership is invalid');
-    const observerRoot = join(stateRoot, 'observers');
-    const externalObserver = existsSync(observerRoot) && readdirSync(observerRoot).some(name => name.startsWith('external-'));
     const inUse = plan => {
-      if (externalObserver) return true;
+      if (observerPresent(stateRoot, plan.workspace)) return true;
       const bindings = state.bindings.filter(item => item.planPath === plan.planPath);
       if (bindings.some(item => item.phase !== 'FINISHED' || item.uncertain || item.nextAssignment)) return true;
       if (owners.owners.some(owner => overlaps(plan.workspace, owner.checkout))) return true;
-      return bindings.some(binding => existsSync(join(stateRoot, 'observers',
-        createHash('sha256').update(binding.codexChat).digest('hex'), 'active')));
+      return false;
     };
     for (const plan of state.plans) if (!seen.has(plan.planPath)) {
       ledger.entries.push({ workspace: plan.workspace, planPath: plan.planPath, plan: structuredClone(plan),
@@ -1064,10 +1329,24 @@ export function maintainTasks(workspace, planPath, { stateRoot = resolve(homedir
   });
 }
 
-function observerPresent(stateRoot) {
+function observerPresent(stateRoot, checkout) {
   const observers = join(stateRoot, 'observers');
-  return existsSync(observers) && readdirSync(observers, { withFileTypes: true }).some(entry =>
-    entry.name.startsWith('external-') || entry.isDirectory() && existsSync(join(observers, entry.name, 'active')));
+  return existsSync(observers) && readdirSync(observers, { withFileTypes: true }).some(entry => {
+    const external = entry.name.startsWith('external-');
+    const slot = join(observers, entry.name, ...(external ? [] : ['active']));
+    if (!external && (!entry.isDirectory() || !existsSync(slot))) return false;
+    try {
+      const pointer = JSON.parse(readFileSync(slot, 'utf8'));
+      if (!leaseTokenPattern.test(pointer.id)) return true;
+      const directory = external ? createHash('sha256').update(pointer.codexChat).digest('hex') : entry.name;
+      const receipt = readFileSync(join(observers, directory, pointer.id, 'receipt.json'), 'utf8');
+      const value = JSON.parse(receipt);
+      if (value.id !== pointer.id || createHash('sha256').update(value.codexChat).digest('hex') !== directory ||
+        (pointer.receiptHash && pointer.receiptHash !== createHash('sha256').update(receipt).digest('hex')) ||
+        !isAbsolute(value.checkout) || identity(value.checkout) !== value.checkoutID) return true;
+      return overlaps(checkout, realpathSync(value.checkout));
+    } catch { return true; }
+  });
 }
 
 // Called only for a new explicit selection, never for an observer wake-up.
@@ -1084,7 +1363,7 @@ export function startCycle(workspace, planPath, { stateRoot = resolve(homedir(),
     }
     const owners = readOwnerships(join(stateRoot, 'ownership'));
     need(!owners.invalid && !owners.owners.some(owner => overlaps(ctx.checkout, owner.checkout)), 'A task owner is active or unknown; no counter reset');
-    need(!observerPresent(stateRoot), 'An observer is active or uncertain; no counter reset');
+    need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no counter reset');
     for (const binding of state.bindings.filter(item => item.planPath === ctx.planPath)) {
       need(binding.workspace === ctx.workspace && ['PREPARING', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.uncertain && !binding.pending,
         'Assignment is active or uncertain; no counter reset');
@@ -1118,13 +1397,13 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   const ownershipRoot = join(stateRoot, 'ownership');
   const ownershipHistory = join(stateRoot, 'ownership-history');
   const stopRoot = join(stateRoot, 'observation-stop');
-  let observingProcess;
+  const activeLease = new AsyncLocalStorage();
   function ownerships() {
     const result = readOwnerships(ownershipRoot);
     if (result.invalid) throw ownershipError();
     return result.owners;
   }
-  function claimOwnership(state, ctx, binding, operation, bindProcess) {
+  function claimOwnership(state, ctx, binding, operation) {
     for (const owner of ownerships()) if (overlaps(ctx.checkout, owner.checkout)) throw ownershipError();
     try { mkdirSync(ownershipRoot, { recursive: true, mode: 0o700 }); }
     catch (error) { throw stateFailure(error, 'state-directory'); }
@@ -1132,32 +1411,32 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     const value = { schema: 1, token, codexChat: chatID, workspace: ctx.workspace, checkout: ctx.checkout,
       sessionID: binding?.sessionID ?? null, assignmentID: binding?.assignmentID ?? null, operation };
     if (['wait', 'resume-watch'].includes(operation)) Object.assign(value,
-      { schema: 2, process: observingProcess, messageID: binding.messageID,
+      { schema: 2, process: processOwner(), messageID: binding.messageID,
         fingerprint: observationFingerprint(binding, planCounter(state, binding).correctionCount) });
-    if (operation === 'bind') Object.assign(value, { schema: 2, process: bindProcess, planPath: ctx.planPath,
-      workspaceID: ctx.workspaceID, checkoutID: ctx.checkoutID, messageID: binding?.messageID ?? null,
-      fingerprint: bindFingerprint(state, binding) });
-    let handle;
-    try {
-      handle = openSync(path, 'wx', 0o600);
-      writeFileSync(handle, JSON.stringify(value));
-      closeSync(handle);
-      handle = undefined;
-    } catch (error) {
-      if (handle !== undefined) { try { closeSync(handle); } catch {} }
-      throw stateFailure(error, 'state-lock');
+    else {
+      Object.assign(value, { schema: 3, process: processOwner(), planPath: ctx.planPath,
+        workspaceID: ctx.workspaceID, checkoutID: ctx.checkoutID, messageID: binding?.messageID ?? null,
+        bindingChat: binding?.codexChat ?? chatID });
+      value.fingerprint = leaseFingerprint(readState(statePath), value);
     }
+    try { saveJSON(path, value, stateRoot); }
+    catch (error) { throw stateFailure(error, 'state-lock'); }
     return { path, token };
   }
-  function pinBindSave(lease, state, binding) {
-    const { path, ...owner } = ownerships().find(item => item.token === lease.token) ?? {};
-    const saved = readState(statePath);
-    const fingerprint = bindFingerprint(saved, saved.bindings.find(item => item.codexChat === chatID));
-    need(path === lease.path && owner.operation === 'bind' && owner.schema === 2 && owner.codexChat === chatID &&
-      [owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Bind ownership or saved binding changed');
-    // Record both sides before the state save, so a crash at either side leaves a verifiable pin.
-    try { saveJSON(path, { ...owner, fingerprint, nextFingerprint: bindFingerprint(state, binding) }, stateRoot); }
-    catch (error) { throw stateFailure(error, 'state-write'); }
+  function saveOwnedState(state) {
+    const lease = activeLease.getStore();
+    if (lease) {
+      const { path, ...owner } = ownerships().find(item => item.token === lease.token) ?? {};
+      need(path === lease.path && owner.codexChat === chatID, 'Operation ownership changed');
+      if (owner.schema === 3) {
+        const fingerprint = leaseFingerprint(readState(statePath), owner);
+        need([owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Saved binding changed during operation');
+        // Record both sides before the state save, so either side of a crash has a valid pin.
+        try { saveJSON(path, { ...owner, fingerprint, nextFingerprint: leaseFingerprint(state, owner) }, stateRoot); }
+        catch (error) { throw stateFailure(error, 'state-write'); }
+      }
+    }
+    saveState(statePath, state);
   }
   function archiveOwner(owner, audit) {
     try {
@@ -1194,7 +1473,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
   }
   async function withOwnership(lease, operation) {
     let result, primary;
-    try { result = await operation(); }
+    try { result = await activeLease.run(lease, operation); }
     catch (error) { primary = error; }
     try { releaseOwnership(lease); }
     catch (error) {
@@ -1224,15 +1503,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     for (const binding of state.bindings) {
       if (overlaps(ctx.checkout, binding.checkout) || ctx.checkoutID === binding.checkoutID) need(['PREPARING', 'FINISHED'].includes(binding.phase) && !binding.uncertain, 'Prior helper assignment not reviewed/stopped; no new writer');
     }
-    const active = await client.request('/api/session/active');
-    need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data), 'Unknown engine execution status');
-    for (const [sessionID, status] of Object.entries(active.data)) {
-      need(/^ses_[a-zA-Z0-9]+$/.test(sessionID) && status && typeof status.type === 'string', 'Invalid active session status');
-      const response = await client.request('/api/session/' + sessionID);
-      need(response?.data?.id === sessionID && text(response.data.location?.directory), 'Unknown active session identity');
-      const directory = realpathSync(response.data.location.directory);
-      need(!overlaps(ctx.checkout, directory), 'Active executor in this physical checkout');
-    }
+    const activity = await checkoutActivity(client, ctx.checkout, await client.request('/api/session/active'));
+    need(!activity.overlapping, 'Active executor in this physical checkout');
   }
   async function noForms(binding) {
     const forms = await client.request(`/api/session/${binding.sessionID}/form`);
@@ -1248,7 +1520,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     binding.phase = 'STOPPED';
     binding.stopReason = reason;
     if (diagnostic) binding.diagnostic = validateDiagnostic(diagnostic);
-    saveState(statePath, state);
+    saveOwnedState(state);
     return { ...summary(state, binding, kind), error: reason, executorStopped: false, retried: false, stateChange: 'saved' };
   }
   const bindingFields = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath',
@@ -1257,6 +1529,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     return !!current && bindingFields.every(key => current[key] === expected[key]) &&
       planCounter(state, current).correctionCount === expected.correctionCount &&
       JSON.stringify(current.pending ?? null) === JSON.stringify(expected.pending ?? null) &&
+      isDeepStrictEqual(current.intent, expected.intent) &&
       JSON.stringify(current.adoption ?? null) === JSON.stringify(expected.adoption ?? null);
   }
   function checkoutAvailable(state, ctx, own) {
@@ -1298,7 +1571,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       need(unchanged(binding, expected, state), 'Saved assignment/count changed during observation; no stale state write');
       const result = operation(state, binding);
       beforeSave?.();
-      saveState(statePath, state);
+      saveOwnedState(state);
       return { expected: { ...structuredClone(binding), correctionCount: state.plans.find(plan => plan.planPath === binding.planPath).correctionCount },
         result: { ...result, stateChange: 'saved' } };
     });
@@ -1332,7 +1605,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     return { kind: 'rejected', workspace: expected.workspace, planPath: expected.planPath,
       sessionID: expected.sessionID, phase: expected.phase, model: MODEL,
       correctionCount: expected.correctionCount, error: error.message,
+      ...(expected.messageID ? { messageID: expected.messageID, assignmentID: expected.assignmentID } : {}),
+      ...(error.diagnostic ? { diagnostic: validateDiagnostic(error.diagnostic) } : {}),
       stateChange: 'unchanged', retried: false };
+  }
+  function temporaryReviewRead(error) {
+    const diagnostic = error?.diagnostic;
+    return diagnostic?.method === 'GET' && (['request-timeout', 'request-read', 'request-json'].includes(diagnostic.category) ||
+      diagnostic.httpStatus === 429 || diagnostic.httpStatus >= 500);
   }
   function unconfirmedOutcome(expected, error, reason) {
     return { kind: 'stopped', workspace: expected.workspace, planPath: expected.planPath,
@@ -1360,27 +1640,32 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     const current = await snapshot(binding);
     need(!current.active && !current.forms.length && !current.permissions.length && current.session.outcome === 'succeeded' &&
       current.session.time?.idle >= binding.submittedAt, 'Executor has not ended this assignment');
-    const history = inspectMessages(withShellEvidence(stateRoot, binding), await assignmentMessages(client, binding));
+    const messages = await assignmentMessages(client, binding);
+    const { exchange, boundary } = deliveredBoundary(binding, messages, current.session, true);
+    const history = inspectMessages(withShellEvidence(stateRoot, binding), exchange);
     need(!history.kind, 'Failed/interrupted assignment cannot be released');
-    const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace));
+    const shells = await projectShells(client, binding);
     completion(history, current.session, shells, invocationCheck);
+    const receipt = reviewReceipt(stateRoot, binding, exchange);
     const confirmed = await snapshot(binding);
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+      confirmed.session.outcome === current.session.outcome &&
+      sessionAvailable(confirmed.session) === sessionAvailable(current.session) &&
+      JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model) &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
-    return { lastMessageID: history.idle.id, idleAt: current.session.time.idle };
+    await confirmHistoryAndShells(client, binding, messages, shells);
+    return { boundary, receipt, available: sessionAvailable(current.session) };
   }
   async function idleExisting(state, binding) {
     await idleWorkspace(state, binding);
     const current = await snapshot(binding), session = current.session;
     need(!current.active && !current.forms.length && !current.permissions.length, 'Existing session busy or interactive');
-    need(session.time && typeof session.time === 'object' && session.time.archived === undefined &&
-      (session.archived === undefined || session.archived === false), 'Archived/unknown existing session');
+    need(sessionAvailable(session), 'Archived/unknown existing session');
     need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
       (session.model.variant === undefined || text(session.model.variant) && session.model.variant.length <= 80), 'Unsupported existing model options');
     const messages = await recentSessionMessages(client, binding.sessionID);
-    const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace));
-    need(Array.isArray(shells?.data) && shells.data.every(shell => ['exited', 'timeout', 'killed'].includes(shell.status) &&
-      Number.isFinite(shell.time?.completed)), 'Project shell still running or unknown');
+    const shells = await projectShells(client, binding);
+    need(shellListKnown(shells) && shells.data.every(shell => shell.status !== 'running'), 'Project shell still running or unknown');
     if (messages.length) {
       need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
       const previous = messages[0].id === binding.messageID ? withShellEvidence(stateRoot, binding) :
@@ -1400,8 +1685,160 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     await idleWorkspace(state, binding);
     return { variant: session.model.variant ?? null, lastMessageID, idleAt: session.time.idle ?? null };
   }
+  function settleMutation(state, binding, reconciled, sessionID) {
+    const mutation = binding.uncertain, rejected = binding.intent?.reject;
+    if (mutation === 'submit' && binding.intent?.promptHash) recordPrompt(stateRoot, binding);
+    delete binding.uncertain; delete binding.intent; delete binding.stopReason; delete binding.diagnostic;
+    if (mutation === 'create') {
+      binding.sessionID = sessionID;
+      binding.phase = 'PREPARING';
+    } else {
+      delete binding.nextAssignment; delete binding.pending;
+      binding.phase = rejected ? 'STOPPED' : 'EXECUTING';
+      if (rejected) binding.stopReason = 'Permission rejected; coordination stopped, executor termination unconfirmed';
+    }
+    const kind = reconciled ? 'mutation-reconciled' : rejected ? 'permission-rejected' : 'replied';
+    return { ...summary(state, binding, kind), ...(reconciled ? { mutation, taskSent: false } : {}) };
+  }
+  async function verifyModelChange(binding, requireRecord) {
+    const route = '/api/session/' + binding.sessionID;
+    const current = await snapshot({ ...binding, adoption: binding.adoption ? { ...binding.adoption, variant: EXECUTOR_MODEL.variant } : undefined });
+    need(sessionAvailable(current.session), unavailableForDispatch);
+    const { head: priorID, variant, idleAt, at } = binding.intent;
+    need(current.session.model.variant === EXECUTOR_MODEL.variant && !current.active && !current.forms.length &&
+      !current.permissions.length && (current.session.time?.idle ?? null) === idleAt,
+    'Session activity or model changed during High selection');
+    const page = await client.request(route + '/message?limit=2&order=desc');
+    need(Array.isArray(page?.data) && page.data.length <= 2, 'Unknown model selection history');
+    const [head, prior] = page.data;
+    const exact = (prior?.id ?? null) === priorID && head?.type === 'model-switched' && /^msg_[a-zA-Z0-9]+$/.test(head.id) &&
+      head.model?.providerID === MODEL.providerID && head.model?.id === MODEL.id && head.model.variant === EXECUTOR_MODEL.variant &&
+      head.previous?.providerID === MODEL.providerID && head.previous?.id === MODEL.id &&
+      (head.previous.variant ?? null) === variant && Number.isSafeInteger(head.time?.created) && head.time.created >= at;
+    need(exact || !requireRecord && (head?.id ?? null) === priorID, 'No unique matching High selection at the reserved history boundary');
+    return { session: current.session, lastMessageID: head?.id ?? null };
+  }
   return {
     statePath,
+    async reconcile(workspace, planPath, nonGitBaseline) {
+      const ctx = context(workspace, planPath, nonGitBaseline);
+      const start = locked(state => {
+        const binding = state.bindings.find(item => item.codexChat === chatID);
+        need(binding?.phase === 'STOPPED' && binding.uncertain, 'No uncertain mutation in this chat');
+        need(['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath'].every(key => binding[key] === ctx[key]) &&
+          binding.engineID === client.engineID, 'Mutation belongs to a different workspace, plan or engine');
+        checkoutAvailable(state, ctx, binding);
+        return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
+          lease: claimOwnership(state, ctx, binding, 'reconcile') };
+      });
+      const { expected } = start;
+      return withOwnership(start.lease, async () => {
+        try {
+          let sessionID = expected.sessionID;
+          if (expected.uncertain === 'create') {
+            need(sessionID || expected.intent, 'No exact create reservation evidence in this legacy binding');
+            if (!sessionID) {
+              const ids = new Set(), cursors = new Set(), matches = [];
+              let cursor;
+              do {
+                need(cursors.size < 20 && !cursors.has(cursor), 'Incomplete creation lookup; reservation remains uncertain');
+                cursors.add(cursor);
+                const page = await listSessions(client, ctx.workspace, cursor);
+                for (const item of page.sessions) {
+                  need(!ids.has(item.id), 'Session list changed during creation lookup');
+                  ids.add(item.id);
+                  if (item.title === reservedSessionTitle(expected)) matches.push(item.id);
+                }
+                cursor = page.nextCursor ?? undefined;
+              } while (cursor);
+              need(matches.length === 1, 'No unique session matches the create reservation');
+              [sessionID] = matches;
+            }
+            const candidate = { ...expected, sessionID };
+            const current = await snapshot(candidate);
+            need(!expected.intent || current.session.title === reservedSessionTitle(expected), 'Session title differs from the create reservation');
+            const head = await client.request(`/api/session/${sessionID}/message?limit=1&order=desc`);
+            need(sessionAvailable(current.session) && !current.active && !current.forms.length && !current.permissions.length &&
+              current.session.model.variant === EXECUTOR_MODEL.variant && current.session.outcome === undefined &&
+              Array.isArray(head?.data) && head.data.length === 0, 'Reserved session is not empty, available and idle at High');
+            await requireQuietShells(client, ctx);
+          } else if (expected.uncertain === 'submit') {
+            need(expected.intent?.promptHash, 'No exact prompt hash in this legacy reservation');
+            await sessionMatches(expected);
+            const messages = await assignmentMessages(client, expected);
+            need(createHash('sha256').update(messages[0].text).digest('hex') === expected.intent.promptHash &&
+              messages.slice(1).every(message => message.type !== 'user'), 'Reserved prompt or delivery boundary changed');
+          } else if (expected.uncertain === 'model') {
+            const { lastMessageID } = await verifyModelChange(expected, true);
+            await requireQuietShells(client, ctx);
+            return commit(expected, (state, binding) => {
+              if (binding.adoption) Object.assign(binding.adoption, { variant: EXECUTOR_MODEL.variant, lastMessageID });
+              delete binding.uncertain; delete binding.intent; delete binding.stopReason; delete binding.diagnostic;
+              binding.phase = 'PREPARING';
+              return { ...summary(state, binding, 'mutation-reconciled'), mutation: 'model', taskSent: false };
+            }).result;
+          } else {
+            const current = await snapshot(expected), pending = expected.pending;
+            need(pending, 'No exact pending request is saved');
+            need(![...current.forms, ...current.permissions].some(item => item.id === pending.id), 'Acknowledged request still appears pending');
+            if (!expected.intent?.acknowledged) {
+              need(pending.kind === 'question' && expected.intent?.answerHash, 'Request disappeared without an exact reply acknowledgement');
+              const response = await client.request(`/api/session/${expected.sessionID}/form/${pending.id}`);
+              const { state, ...question } = response?.data ?? {};
+              need(question.id === pending.id && question.sessionID === expected.sessionID && fingerprint(question) === pending.fingerprint &&
+                state?.status === 'answered' && state.answer && fingerprint({ answer: state.answer }) === expected.intent.answerHash,
+              'Saved answer is not confirmed for the exact request');
+            }
+          }
+          return commit(expected, (state, binding) => {
+            need(!state.bindings.some(item => item !== binding && item.sessionID === sessionID), 'Reserved session already belongs to another chat');
+            return settleMutation(state, binding, true, sessionID);
+          }).result;
+        } catch (error) { return { ...rejectedOutcome(expected, error), mutation: expected.uncertain, taskSent: false }; }
+      });
+    },
+    async rebindEngine(workspace, planPath, messageID, sessionID, nonGitBaseline) {
+      const ctx = context(workspace, planPath, nonGitBaseline);
+      const start = locked(state => {
+        const binding = state.bindings.find(item => item.codexChat === chatID);
+        need(binding?.messageID === messageID && binding.sessionID === sessionID && !binding.uncertain &&
+          ['EXECUTING', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.pending && !binding.nextAssignment &&
+          !readTransition(stateRoot, messageID) && !readClosure(stateRoot, binding), 'No exact delivered assignment to rebind');
+        savedContext({ ...binding, engineID: client.engineID }, ctx);
+        checkoutAvailable(state, ctx, binding);
+        need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no engine rebind');
+        return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
+          lease: claimOwnership(state, ctx, binding, 'rebind-engine') };
+      });
+      const { expected } = start;
+      return withOwnership(start.lease, async () => {
+        const current = await snapshot(expected), messages = await assignmentMessages(client, expected);
+        need(messages[0].text.startsWith('Assignment ID: ' + expected.assignmentID + '\nCanonical plan: ' +
+          JSON.stringify(expected.planPath) + '\n'), 'Delivery does not confirm the exact original plan');
+        const path = promptPath(stateRoot, expected.messageID);
+        if (existsSync(path)) {
+          const prompt = JSON.parse(readFileSync(path, 'utf8'));
+          need(prompt?.owner === deliveryFingerprint(expected) && createHash('sha256').update(messages[0].text).digest('hex') === prompt.hash,
+            'Assignment prompt checksum changed');
+        } else need(expected.phase !== 'EXECUTING', 'Exact prompt checksum unavailable for this running legacy delivery');
+        if (expected.phase === 'EXECUTING') {
+          need(sessionAvailable(current.session) && !current.forms.length && !current.permissions.length,
+            'Session is unavailable or has pending interaction');
+          need(!inspectMessages(withShellEvidence(stateRoot, expected), messages).kind, 'Delivery has failed or is interrupted');
+          const head = await client.request(`/api/session/${sessionID}/message?limit=1&order=desc`);
+          need(isDeepStrictEqual(head?.data?.[0], messages.at(-1)), 'Delivery head changed while rebinding');
+        } else {
+          await reviewedResult(expected);
+        }
+        return commit(expected, (state, binding) => {
+          need(!state.bindings.some(item => item !== binding && item.engineID === client.engineID && item.sessionID === sessionID),
+            'Session already belongs to another chat');
+          need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no engine rebind');
+          binding.engineID = client.engineID;
+          return { ...summary(state, binding, 'engine-rebound'), previousEngineID: expected.engineID, taskSent: false };
+        }).result;
+      });
+    },
     async retireLegacy(workspace, planPath, token) {
       need(client, 'OpenCode connection is required to check project activity');
       need(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(token), 'Invalid legacy lease token');
@@ -1470,17 +1907,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         ['inspect', 'stop', 'recover', 'recover-legacy-bind'].includes(action), 'Invalid ownership action or token');
       const ctx = context(workspace, planPath, nonGitBaseline);
       const selectedOwner = ownerships().find(value => value.token === token);
-      if (selectedOwner?.operation === 'bind') {
+      if (selectedOwner?.operation === 'bind' || selectedOwner?.schema === 3) {
         const legacy = selectedOwner.schema === 1;
         function selectBind(state) {
           const owners = ownerships();
           const owner = owners.find(item => item.token === token);
-          need(owner?.operation === 'bind' && owner.schema === selectedOwner.schema && owner.codexChat === chatID &&
-            owner.workspace === ctx.workspace && owner.checkout === ctx.checkout, 'Bind lease is missing or belongs to another chat or checkout');
+          need(owner?.operation === selectedOwner.operation && owner.schema === selectedOwner.schema && owner.codexChat === chatID &&
+            owner.workspace === ctx.workspace && owner.checkout === ctx.checkout, 'Operation lease is missing or belongs to another chat or checkout');
           need(owners.filter(item => overlaps(ctx.checkout, item.checkout)).length === 1,
             'Another operation owns this checkout');
-          const binding = state.bindings.find(item => item.codexChat === chatID);
-          const fingerprint = bindFingerprint(state, binding);
+          const binding = leasedBinding(state, owner);
+          const fingerprint = owner.schema === 3 ? leaseFingerprint(state, owner, binding) : bindFingerprint(state, binding);
           const counter = binding ? planCounter(state, binding).correctionCount : null;
           if (legacy) {
             need(binding?.uncertain !== 'create', 'Session creation is already uncertain; preserve its binding and do not retry');
@@ -1492,7 +1929,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               birth: file.birthtimeMs, written: file.mtimeMs };
           }
           need(['workspaceID', 'checkoutID', 'planPath'].every(key => owner[key] === ctx[key]) &&
-            [owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Bind lease pins or saved binding changed');
+            [owner.fingerprint, owner.nextFingerprint].includes(fingerprint), 'Operation lease pins or saved binding changed');
           return { owner, binding, fingerprint, counter };
         }
         const selected = selectBind(readState(statePath)), { owner, binding, counter } = selected;
@@ -1507,7 +1944,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             ['preflight', workspace, planPath, '--session', '<new-session-id>'],
           ].map(args => nonGitBaseline ? [...args, '--non-git-baseline', nonGitBaseline] : args),
         } : undefined;
-        const result = { kind: 'ownership-status', token, operation: 'bind', ownerStatus: proof.status, reason: proof.reason,
+        const result = { kind: 'ownership-status', token, operation: owner.operation, ownerStatus: proof.status, reason: proof.reason,
           processID: owner.process?.pid ?? null, recoveryAllowed: !legacy && proof.status === 'dead',
           sessionID: binding?.sessionID ?? null, messageID: binding?.messageID ?? null, phase: binding?.phase ?? null,
           correctionCount: counter, uncertain: binding?.uncertain ?? null, taskSent: false, stateChange: 'unchanged',
@@ -1530,7 +1967,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             need(!existsSync(receipt), 'A replacement receipt exists; create may have been reserved');
             need(!readClosure(stateRoot, binding) && !readTransition(stateRoot, binding.messageID),
               'Another closure or transition already exists');
-            need(!observerPresent(stateRoot), 'An observer is active or uncertain; no legacy bind recovery');
+            need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no legacy bind recovery');
             checkoutAvailable(state, ctx, current.binding);
           };
           checkLocal(readState(statePath));
@@ -1566,7 +2003,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           need(JSON.stringify(selectBind(state)) === JSON.stringify(selected), 'Bind ownership or saved binding changed; no recovery');
           archiveOwner(owner, { schema: 1, owner, proof, counter, messageID: binding?.messageID ?? null });
         });
-        return { ...result, kind: 'bind-ownership-released', leaseArchived: true };
+        return { ...result, kind: owner.operation === 'bind' ? 'bind-ownership-released' : 'operation-ownership-released', leaseArchived: true };
       }
       need(action !== 'recover-legacy-bind', 'Only an exact legacy bind lease can use recover-legacy-bind');
       function selection(state) {
@@ -1622,14 +2059,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       return withOwnership(begun.lease, async () => {
         try {
           const verified = [];
-          const boundary = await reviewedResult(begun.expected, { verified });
+          const { boundary, receipt, available } = await reviewedResult(begun.expected, { verified });
+          if (!available) return rejectedOutcome(begun.expected, new Error(unavailableForDispatch));
           return commit(begun.expected, (state, binding) => {
+            saveReviewReceipt(stateRoot, binding, receipt);
             saveInvocationProofs(stateRoot, binding, verified);
+            if (kind === 'block') recordAcceptance(stateRoot, state, binding);
             if (binding.adoption) Object.assign(binding.adoption, boundary);
             binding.nextAssignment = kind; binding.phase = 'PREPARING';
             return summary(state, binding, 'prepared');
           }).result;
-        } catch (error) { return stoppedOutcome(begun.expected, error); }
+        } catch (error) { return temporaryReviewRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
       });
     },
     async finish(workspace, planPath, nonGitBaseline, archive) {
@@ -1640,16 +2080,18 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       return withOwnership(begun.lease, async () => {
         try {
           const verified = [];
-          await reviewedResult(begun.expected, { verified, archive });
+          const { receipt } = await reviewedResult(begun.expected, { verified, archive });
           return commit(begun.expected, (state, binding) => {
+            saveReviewReceipt(stateRoot, binding, receipt);
             saveInvocationProofs(stateRoot, binding, verified);
+            recordAcceptance(stateRoot, state, binding);
             binding.phase = 'FINISHED';
             return summary(state, binding, 'released');
           }).result;
-        } catch (error) { return archive ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
+        } catch (error) { return archive || temporaryReviewRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
       });
     },
-    async transition(workspace, planPath, messageID, disposition, { kind, nonGitBaseline, connectionError } = {}) {
+    async transition(workspace, planPath, messageID, disposition, { kind, nonGitBaseline, connectionError, movedPlanPath } = {}) {
       need(/^msg_[a-zA-Z0-9]+$/.test(messageID) && ['accepted', 'blocked', 'without-acceptance'].includes(disposition),
         'Transition requires the exact prior message ID and an explicit review disposition');
       const ctx = context(workspace, planPath, nonGitBaseline);
@@ -1673,7 +2115,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
         if (connectionError) throw connectionError;
         need(client && binding, 'No exact saved prior delivery or OpenCode connection');
-        checkTransitionSource(binding, ctx);
+        checkTransitionSource(binding, ctx, stateRoot, movedPlanPath);
         need(!readClosure(stateRoot, binding), 'Prior closure is staged; resolve it before a transition');
         need(disposition !== 'accepted' || ['REVIEWING', 'FINISHED'].includes(binding.phase),
           'Acceptance requires an assignment ready for review');
@@ -1686,11 +2128,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           'Use initial for a new plan, or block/correction for the same plan');
         planCounter(state, ctx);
         return { source: structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount,
-          assignmentKind, lease: claimOwnership(state, ctx, binding, 'finish') };
+          assignmentKind, lease: claimOwnership(state, ctx, binding, 'transition') };
       });
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
-        const boundary = await checkedClosureBoundary(client, stateRoot, { ...start.source, adoption: undefined },
+        const { boundary, receipt: reviewed, verified } = await checkedClosureBoundary(client, stateRoot, { ...start.source, adoption: undefined },
           disposition === 'accepted', start.source.engineID !== client.engineID);
         let saving = false;
         try {
@@ -1706,6 +2148,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               chatID, planPath: ctx.planPath, engineID: client.engineID, kind: start.assignmentKind, disposition };
             const path = transitionPath(stateRoot, messageID);
             mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+            if (disposition === 'accepted') {
+              saveReviewReceipt(stateRoot, binding, reviewed);
+              recordAcceptance(stateRoot, state, binding, movedPlanPath);
+            }
+            saveInvocationProofs(stateRoot, binding, verified);
             // Keep the source before moving ownership. A staged retry must verify the live boundary again.
             saveJSON(path, receipt);
             Object.assign(binding, { codexChat: chatID, planPath: ctx.planPath, engineID: client.engineID, phase: 'PREPARING' });
@@ -1713,7 +2160,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (binding.adoption) Object.assign(binding.adoption, boundary);
             if (receipt.kind !== 'initial') binding.nextAssignment = receipt.kind;
             saving = true;
-            saveState(statePath, state);
+            saveOwnedState(state);
             return result(receipt);
           });
         } catch (error) {
@@ -1749,12 +2196,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         need(!readTransition(stateRoot, binding.messageID), 'Transition was staged; repeat the exact transition command');
         checkoutAvailable(state, ctx, binding);
         return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
-          lease: claimOwnership(state, ctx, binding, 'next') };
+          lease: claimOwnership(state, ctx, binding, 'close') };
       });
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
         const expected = start.expected;
-        const boundary = await checkedClosureBoundary(client, stateRoot, { ...expected, adoption: undefined });
+        const { boundary, verified } = await checkedClosureBoundary(client, stateRoot, { ...expected, adoption: undefined });
         let saving = false;
         try {
           const saved = commit(expected, (state, binding) => {
@@ -1767,6 +2214,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             const path = closurePath(stateRoot, binding.messageID);
             mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
             // Write the receipt first. A still-STOPPED binding must reverify before completing a staged closure.
+            saveInvocationProofs(stateRoot, binding, verified);
             saveJSON(path, receipt);
             delete binding.stopReason; delete binding.diagnostic;
             if (binding.adoption) Object.assign(binding.adoption, boundary);
@@ -1781,7 +2229,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
       });
     },
-    async connectionLost(error) {
+    async connectionLost(error, { preserveReview = false } = {}) {
       return locked(state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
         if (!binding) return null;
@@ -1790,7 +2238,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           executorStopped: false, retried: false, stateChange: 'unchanged', ...(binding.diagnostic ? { diagnostic: binding.diagnostic } : {}) };
         const diagnostic = error?.diagnostic ? validateDiagnostic(error.diagnostic) : diagnose(error, 'unknown', 'connection');
         const retried = !!error?.bootstrap?.retried;
-        if (['PREPARING', 'FINISHED'].includes(binding.phase)) return { ...summary(state, binding, 'connection-unavailable'),
+        if (['PREPARING', 'FINISHED'].includes(binding.phase) || preserveReview && binding.phase === 'REVIEWING')
+          return { ...summary(state, binding, 'connection-unavailable'),
           error: error?.message ?? 'Engine connection unavailable', diagnostic, retried, bootstrap: error?.bootstrap,
           stateChange: 'unchanged' };
         const result = stop(state, binding, 'connection-uncertain',
@@ -1801,7 +2250,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     async wait(workspace, planPath, { nonGitBaseline, timeoutMs = WAIT_TIMEOUT_MS, signal = new AbortController().signal, resume, postgresRecovery, onReady, once = false } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= WAIT_TIMEOUT_MS, 'Wait timeout must be 1..' + WAIT_TIMEOUT_MS + ' ms');
       const resuming = resume !== undefined;
-      observingProcess = processOwner(); // Capture outside the short state transaction.
       if (resuming) need(resume && Object.keys(resume).length === 3 &&
         ['sessionID', 'assignmentID', 'messageID'].every(key => typeof resume[key] === 'string') &&
         /^ses_[a-zA-Z0-9]+$/.test(resume.sessionID) && /^[a-zA-Z0-9._-]{1,120}$/.test(resume.assignmentID) &&
@@ -1850,15 +2298,15 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             messageID: expected.messageID, diagnostic, executorStopped: false } :
           stoppedOutcome(expected, Object.assign(new Error(reason), { diagnostic }), kind);
         try {
-          stream = await watch(client, expected.sessionID, combined, expected.workspace);
-          let history, messages;
+          stream = await observationWake(client, expected.sessionID, combined, expected.workspace, once);
+          let history, messages, exchange;
           while (true) {
             locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected, state),
               'Saved assignment/count changed during wait; no stale state write'));
             if (signal.aborted) return stopWait('interrupted', 'Advisor wait interrupted; executor termination unconfirmed',
               diagnose(null, 'interrupted', 'wait', stream.observation));
             if (deadline.aborted) return stopWait('connection-uncertain', 'Wait deadline reached; executor termination unconfirmed',
-              diagnose(null, 'deadline', 'wait', stream.observation));
+              stream.diagnostic ?? diagnose(null, 'deadline', 'wait', stream.observation));
             if (stream.fault) return stopWait(stream.fault, 'Event stream failed/interrupted; no reconnect or ownership transfer', stream.diagnostic);
             const current = await snapshot(expected);
             if (postgresRecovery) need(!current.active && !current.forms.length && !current.permissions.length &&
@@ -1873,7 +2321,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) {
               messages = await assignmentMessages(client, expected);
               const boundHistory = withShellEvidence(stateRoot, expected);
-              history = inspectMessages(postgresRecovery ? { ...boundHistory, postgresRecovery } : boundHistory, messages);
+              exchange = !current.active && !current.forms.length && !current.permissions.length &&
+                current.session.outcome === 'succeeded' && current.session.time?.idle >= expected.submittedAt ?
+                deliveredExchange(messages) : messages;
+              history = inspectMessages(postgresRecovery ? { ...boundHistory, postgresRecovery, postgresTimeline: undefined } : boundHistory, exchange);
             }
             if (stream.fault || combined.aborted) continue;
             locked(state => need(unchanged(state.bindings.find(binding => binding.codexChat === chatID), expected, state),
@@ -1901,26 +2352,29 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 binding.phase = 'WAITING_FOR_ANSWER';
                 binding.pending = { kind: result.kind, id: result.request.id, fingerprint: result.fingerprint };
               }, result.kind);
-              return { ...saved, ...progress, request: result.request, fingerprint: result.fingerprint };
+              return { ...saved, ...progress, request: result.request, fingerprint: result.fingerprint,
+                ...(result.manualReason ? { manualReason: result.manualReason, replyAllowed: false } : {}) };
             }
             if (expected.pending && expected.phase !== 'STOPPED') record((state, binding) => {
               delete binding.pending; binding.phase = 'EXECUTING';
             }, 'observing');
             if (!current.active && current.session.time?.idle >= expected.submittedAt) {
               need(current.session.outcome === 'succeeded', 'Unknown terminal outcome');
-              const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(expected.workspace));
-              const result = completion(history, current.session, shells);
+              deliveredBoundary(expected, messages, current.session, true);
+              const review = reviewReceipt(stateRoot, expected, exchange);
+              const shells = await projectShells(client, expected);
+              const verified = [], result = completion(history, current.session, shells, { verified });
               const confirmed = await snapshot(expected);
               need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+                confirmed.session.outcome === current.session.outcome &&
+                sessionAvailable(confirmed.session) === sessionAvailable(current.session) &&
+                JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model) &&
                 JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during completion confirmation');
-              if (postgresRecovery) {
-                const [latest, latestShells] = await Promise.all([assignmentMessages(client, expected),
-                  client.request('/api/shell?location[directory]=' + encodeURIComponent(expected.workspace))]);
-                need(JSON.stringify(latest) === JSON.stringify(messages) && JSON.stringify(latestShells) === JSON.stringify(shells),
-                  'History or project shells changed during PostgreSQL recovery');
-              }
+              await confirmHistoryAndShells(client, expected, messages, shells);
               if (stream.fault || combined.aborted) continue;
               return { ...record((state, binding) => {
+                saveReviewReceipt(stateRoot, binding, review);
+                saveInvocationProofs(stateRoot, binding, verified);
                 delete binding.pending; binding.phase = 'REVIEWING';
                 if (postgresRecovery) {
                   const path = postgresPath(stateRoot, binding.messageID);
@@ -1950,6 +2404,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             await stream.next(Math.min(5_000, timeoutMs));
           }
         } catch (error) {
+          if (once && !combined.aborted && temporaryReviewRead(error))
+            return { ...rejectedOutcome(expected, error), kind: 'retryable-read' };
           const category = signal.aborted ? 'interrupted' : deadline.aborted ? 'deadline' : null;
           const diagnostic = diagnose(category ? null : error, category ?? 'unknown', category ? 'wait' : 'snapshot',
             stream?.observation ?? { elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent: null });
@@ -1987,7 +2443,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           }).result;
           history = inspectMessages(expected, await assignmentMessages(client, expected));
           verified = interactive(kind, request, expected, history);
-          need(expected.pending.fingerprint === verified.fingerprint, 'Pending request changed; no reply');
+          need([verified.fingerprint, historyFingerprint(request)].includes(expected.pending.fingerprint), 'Pending request changed; no reply');
           const latest = await client.request('/api/session/' + expected.sessionID + (kind === 'question' ? '/form' : '/permission'));
           need(Array.isArray(latest?.data), 'Unknown pending status before reply');
           const stillPending = latest.data.find(item => item.id === requestID);
@@ -1995,8 +2451,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             delete binding.pending; binding.phase = 'EXECUTING';
             return summary(state, binding, 'stale-request');
           }).result;
-          need(interactive(kind, stillPending, expected, history).fingerprint === verified.fingerprint,
+          const fresh = interactive(kind, stillPending, expected, history);
+          need(fresh.fingerprint === verified.fingerprint,
             'Request changed before reply; no mutation');
+          if (fresh.manualReason) return rejectedOutcome(expected, new Error(fresh.manualReason));
           request = stillPending;
         } catch (error) { return stoppedOutcome(expected, error); }
         if (kind === 'question') {
@@ -2007,6 +2465,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           reserved = commit(expected, (state, binding) => {
             binding.phase = 'STOPPED'; binding.uncertain = 'reply';
+            binding.pending.fingerprint = verified.fingerprint;
+            binding.intent = { reject: kind === 'permission' && payload.decision === 'reject', acknowledged: false,
+              ...(kind === 'question' ? { answerHash: fingerprint(payload) } : {}) };
             return summary(state, binding, 'reply-pending');
           }, () => { reservationAttempted = true; });
         } catch (error) {
@@ -2019,14 +2480,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             (kind === 'question' ? 'form' : 'permission') + '/' + requestID + '/reply', payload);
         } catch (error) { return stoppedOutcome(reserved.expected, error); }
         try {
-          if (kind === 'permission' && payload.decision === 'reject') return commit(reserved.expected, (state, binding) => {
-            delete binding.uncertain; delete binding.pending;
-            binding.phase = 'STOPPED'; binding.stopReason = 'Permission rejected; coordination stopped, executor termination unconfirmed';
-            return summary(state, binding, 'permission-rejected');
-          }).result;
+          reserved = commit(reserved.expected, (_state, binding) => { binding.intent.acknowledged = true; });
           return commit(reserved.expected, (state, binding) => {
-            delete binding.uncertain; delete binding.pending; binding.phase = 'EXECUTING';
-            return summary(state, binding, 'replied');
+            return settleMutation(state, binding, false);
           }).result;
         } catch (error) {
           error.stateOutcome = unconfirmedOutcome(reserved.expected, error,
@@ -2090,7 +2546,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               planCounter(state, start.ctx, importedCount);
               state.bindings.push(binding);
               saving = true;
-              saveState(statePath, state);
+              saveOwnedState(state);
               return summary(state, binding, 'adopted');
             });
           } catch (error) {
@@ -2119,8 +2575,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       'Use exact prior session, delivery, PowerShell call IDs and legacy bind token');
       need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20,
         'Invalid imported correction count');
-      const bindProcess = processOwner();
-      need(validProcessOwner(bindProcess) && bindProcess.start, 'Cannot verify the bind owner process identity; no lease was created');
       const start = locked(state => {
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         planCounter(state, ctx, importedCount);
@@ -2130,11 +2584,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const verifiedHistory = replacement.recoveredBind && legacyBindProof(replacement.recoveredBind, state, existing);
           savedContext(verifiedHistory ? { ...existing, engineID: client.engineID } : existing, ctx);
           need(!readClosure(stateRoot, existing) && !readTransition(stateRoot, existing.messageID), 'Another closure or transition already exists');
-          need(!observerPresent(stateRoot), 'An observer is active or uncertain; no replacement');
+          need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no replacement');
           checkoutAvailable(state, ctx, existing);
           return { ctx, state: structuredClone(state), source: structuredClone(existing), verifiedHistory,
             correctionCount: planCounter(state, existing).correctionCount,
-            lease: claimOwnership(state, ctx, existing, 'bind', bindProcess) };
+            lease: claimOwnership(state, ctx, existing, 'bind') };
         }
         if (existing) {
           if (existing.planPath !== ctx.planPath) {
@@ -2143,16 +2597,16 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             checkoutAvailable(state, ctx, existing);
             return { ctx, state: structuredClone(state), expected: { ...structuredClone(existing),
               correctionCount: state.plans.find(plan => plan.planPath === existing.planPath).correctionCount },
-              lease: claimOwnership(state, ctx, existing, 'bind', bindProcess), planSwitch: true };
+              lease: claimOwnership(state, ctx, existing, 'bind'), planSwitch: true };
           }
           savedContext(existing, ctx);
           checkoutAvailable(state, ctx, existing);
           return { ctx, state: structuredClone(state), expected: { ...structuredClone(existing),
             correctionCount: planCounter(state, ctx).correctionCount },
-            lease: claimOwnership(state, ctx, existing, 'bind', bindProcess), planSwitch: false };
+            lease: claimOwnership(state, ctx, existing, 'bind'), planSwitch: false };
         }
         checkoutAvailable(state, ctx);
-        return { ctx, state: structuredClone(state), lease: claimOwnership(state, ctx, null, 'bind', bindProcess), planSwitch: false };
+        return { ctx, state: structuredClone(state), lease: claimOwnership(state, ctx, null, 'bind'), planSwitch: false };
       });
       return withOwnership(start.lease, async () => {
         if (start.expected && !start.planSwitch) {
@@ -2169,13 +2623,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
         if (start.planSwitch) {
           try {
-            const boundary = await reviewedResult(start.expected);
+            const { boundary, receipt, available } = await reviewedResult(start.expected);
+            if (!available) return rejectedOutcome(start.expected, new Error(unavailableForDispatch));
             return commit(start.expected, (state, binding) => {
+              saveReviewReceipt(stateRoot, binding, receipt);
               if (binding.adoption) Object.assign(binding.adoption, boundary);
               planCounter(state, ctx, importedCount);
               binding.planPath = ctx.planPath; binding.phase = 'PREPARING';
               for (const key of ['assignmentID', 'messageID', 'submittedAt', 'nextAssignment']) delete binding[key];
-              pinBindSave(start.lease, state, binding);
               return summary(state, binding, 'reused-plan');
             }).result;
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
@@ -2183,7 +2638,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         let archive;
         if (start.source) {
           const gaps = [], lostCalls = new Set(replacement.lostCalls);
-          const boundary = await checkedClosureBoundary(client, stateRoot, start.source, true, !!start.verifiedHistory,
+          const { boundary } = await checkedClosureBoundary(client, stateRoot, start.source, true, !!start.verifiedHistory,
             { gaps, lostCalls, historyFingerprint: start.verifiedHistory });
           need(gaps.length === lostCalls.size && new Set(gaps.map(call => call.id)).size === lostCalls.size,
             'The listed PowerShell calls do not match the lost evidence; no replacement');
@@ -2198,12 +2653,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (archive) {
               need(unchanged(current, { ...start.source, correctionCount: start.correctionCount }, state),
                 'Finished delivery changed during replacement');
-              need(!observerPresent(stateRoot), 'An observer is active or uncertain; no replacement');
+              need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no replacement');
             } else need(!current, 'Binding appeared during create preparation');
             checkoutAvailable(state, ctx, current);
             const plan = planCounter(state, ctx, importedCount);
             const binding = { codexChat: chatID, ...ctx, engineID: client.engineID,
-              sessionID: null, phase: 'STOPPED', uncertain: 'create' };
+              sessionID: null, phase: 'STOPPED', uncertain: 'create', intent: { nonce: randomUUID() } };
             if (archive) {
               const path = join(stateRoot, 'finished-session-replacements', start.source.messageID + '.json');
               mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -2212,10 +2667,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               else saveJSON(path, archive);
               state.bindings[state.bindings.indexOf(current)] = binding;
             } else state.bindings.push(binding);
-            pinBindSave(start.lease, state, binding);
             reservationExpected = { ...structuredClone(binding), correctionCount: plan.correctionCount };
             reservationAttempted = true;
-            saveState(statePath, state);
+            saveOwnedState(state);
             return { expected: reservationExpected, result: summary(state, binding, 'create-pending') };
           });
         } catch (error) {
@@ -2227,7 +2681,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         let response;
         try {
           response = await client.request('/api/session', {
-            title: 'Code Duet: ' + basename(ctx.workspace), location: { directory: ctx.workspace }, model: EXECUTOR_MODEL,
+            title: reservedSessionTitle(expected), location: { directory: ctx.workspace }, model: EXECUTOR_MODEL,
           });
           need(/^ses_[a-zA-Z0-9]+$/.test(response?.data?.id), 'Creation uncertain; no retry');
           if (archive) need(!start.state.bindings.some(binding => binding.sessionID === response.data.id),
@@ -2240,7 +2694,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           expected = commit(expected, (state, binding) => {
             binding.sessionID = response.data.id;
-            pinBindSave(start.lease, state, binding);
             return summary(state, binding, 'create-pending');
           }).expected;
         } catch (error) {
@@ -2264,8 +2717,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
         try {
           return commit(expected, (state, binding) => {
-            delete binding.uncertain; binding.phase = 'PREPARING';
-            pinBindSave(start.lease, state, binding);
+            delete binding.uncertain; delete binding.intent; binding.phase = 'PREPARING';
             return archive ? { ...summary(state, binding, 'finished-session-replaced'), taskSent: false,
               previous: { phase: 'FINISHED', sessionID: start.source.sessionID, messageID: start.source.messageID,
                 correctionCount: start.correctionCount, reason: archive.reason } } : summary(state, binding, 'created');
@@ -2277,7 +2729,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
       });
     },
-    async submit(workspace, planPath, assignmentID, packetPath, nonGitBaseline, kind = 'initial') {
+    async submit(workspace, planPath, assignmentID, packetPath, nonGitBaseline, kind = 'initial', { requirePacketIdentity = false } = {}) {
       need(['initial', 'block', 'correction'].includes(kind), 'Invalid assignment kind');
       need(text(assignmentID) && /^[a-zA-Z0-9._-]{1,120}$/.test(assignmentID), 'Invalid assignment ID');
       need(isAbsolute(packetPath), 'Use absolute packet path');
@@ -2285,6 +2737,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       need(statSync(packet).isFile() && inside(ctx.workspace, packet), 'Packet outside physical workspace');
       const task = readFileSync(packet, 'utf8');
       need(text(task), 'Empty assignment packet');
+      const header = task.replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0];
+      const prefix = 'Code Duet packet: ';
+      if (header.startsWith(prefix)) {
+        let identity;
+        try { identity = JSON.parse(header.slice(prefix.length)); } catch { throw new Error('Invalid packet identity header'); }
+        need(identity && Object.keys(identity).length === 3 && identity.planPath === ctx.planPath &&
+          identity.assignmentID === assignmentID && identity.kind === kind, 'Assignment packet belongs to a different plan, assignment or kind');
+      } else need(!requirePacketIdentity, 'Desktop submission requires the exact Code Duet packet identity header');
       const start = locked(state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
         need(binding, 'No binding for this Codex chat');
@@ -2308,38 +2768,74 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
         const adoption = start.expected.adoption;
+        let priorBoundary = start.closed?.boundary ?? adoption;
+        let priorReceipt;
         if (start.closed) {
-          need(sameBoundary(start.closed.boundary, await checkedClosureBoundary(client, stateRoot, start.expected)),
+          const { boundary, receipt } = await checkedClosureBoundary(client, stateRoot, start.expected, start.closed.disposition === 'accepted');
+          need(sameBoundary(start.closed.boundary, boundary),
             'History changed since closure; no dispatch');
+          priorReceipt = receipt;
+        } else if (start.expected.assignmentID) {
+          const { boundary, receipt } = await reviewedResult(start.expected);
+          if (adoption) need(sameBoundary(adoption, boundary), 'Existing session changed since preparation; no dispatch');
+          priorBoundary = boundary;
+          priorReceipt = receipt;
         } else if (adoption) {
           const current = await idleExisting(start.state, start.expected);
-          need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === adoption[key]),
-            'Existing session changed since preparation; no dispatch');
-        } else if (start.expected.assignmentID) await reviewedResult(start.expected);
+          need(sameBoundary(adoption, current), 'Existing session changed since preparation; no dispatch');
+        }
         const session = await sessionMatches(start.expected);
+        need(sessionAvailable(session), unavailableForDispatch);
         await noForms(start.expected);
         await idleWorkspace(start.state, ctx);
+        await requireQuietShells(client, ctx);
         if (session.model.variant !== EXECUTOR_MODEL.variant) {
           const sessionRoute = '/api/session/' + session.id;
-          await client.request(sessionRoute + '/model', { model: EXECUTOR_MODEL });
-          const expected = adoption ? { ...start.expected, adoption: { ...adoption, variant: EXECUTOR_MODEL.variant } } : start.expected;
-          const confirmed = await snapshot(expected);
-          need(confirmed.session.model.variant === EXECUTOR_MODEL.variant, 'OpenCode did not select High; no dispatch');
-          need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
-            confirmed.session.time?.idle === session.time?.idle, 'Session activity changed during model selection; no dispatch');
-          const boundary = start.closed?.boundary ?? adoption;
-          if (boundary) {
-            const page = await client.request(sessionRoute + '/message?limit=2&order=desc');
-            const [head, prior] = Array.isArray(page?.data) ? page.data : [false];
-            const sameHead = head !== false && (head?.id ?? null) === boundary.lastMessageID;
-            need(sameHead || (prior?.id ?? null) === boundary.lastMessageID && head?.type === 'model-switched' &&
-              head.model?.providerID === MODEL.providerID && head.model?.id === MODEL.id && head.model.variant === EXECUTOR_MODEL.variant &&
-              head.previous?.providerID === MODEL.providerID && head.previous?.id === MODEL.id &&
-              (head.previous.variant ?? null) === boundary.variant, 'Existing history changed during model selection; no dispatch');
+          const before = await client.request(sessionRoute + '/message?limit=1&order=desc');
+          const priorID = priorBoundary?.lastMessageID ?? null;
+          need(Array.isArray(before?.data) && before.data.length === (priorID === null ? 0 : 1) &&
+            (before.data[0]?.id ?? null) === priorID, 'History changed before High selection');
+          const reserved = commit(start.expected, (_state, binding) => {
+            binding.phase = 'STOPPED'; binding.uncertain = 'model';
+            binding.intent = { head: priorID, variant: session.model.variant ?? null, idleAt: session.time?.idle ?? null, at: Date.now() };
+          }).expected;
+          let failed;
+          try { await client.request(sessionRoute + '/model', { model: EXECUTOR_MODEL }); }
+          catch (error) { failed = error; }
+          if (failed?.diagnostic?.httpStatus === 400 && failed.diagnostic.errorCode === 'InvalidRequestError') {
+            const unchangedSession = await sessionMatches(start.expected);
+            const latest = await client.request(sessionRoute + '/message?limit=1&order=desc');
+            if (isDeepStrictEqual(latest, before) && isDeepStrictEqual(unchangedSession.model, session.model)) {
+              commit(reserved, (_state, binding) => {
+                delete binding.uncertain; delete binding.intent;
+                binding.phase = 'PREPARING';
+              });
+              throw failed;
+            }
+          }
+          let confirmed;
+          try { confirmed = await verifyModelChange(reserved, !!failed); }
+          catch (error) { return stoppedOutcome(reserved, failed ?? error); }
+          if (priorReceipt) {
+            const messages = await assignmentMessages(client, start.expected);
+            const { exchange } = deliveredBoundary(start.expected, messages, confirmed.session,
+              !start.closed || start.closed.disposition === 'accepted');
+            need(isDeepStrictEqual(reviewReceipt(stateRoot, start.expected, exchange), priorReceipt),
+              'Delivered history changed during model selection; no dispatch');
           }
           await idleWorkspace(start.state, ctx);
+          await requireQuietShells(client, ctx);
+          start.expected = commit(reserved, (_state, binding) => {
+            delete binding.uncertain; delete binding.intent;
+            binding.phase = 'PREPARING';
+          }).expected;
         }
         let reservationAttempted = false, reservationExpected, reserved;
+        const prompt = 'Assignment ID: ' + assignmentID + '\nCanonical plan: ' + JSON.stringify(ctx.planPath) +
+          '\nRead that plan; only the assignment below is authorized. Do not edit canonical plans/index/checkpoints, ' +
+          'commit, push, merge, switch branches, delegate, broaden scope or execute unassigned blocks. Finish all edits ' +
+          'and ordinary foreground checks before the final response. Do not detach project-changing work. Report any ' +
+          'remaining background operations; a final response does not itself transfer ownership.\n\n' + task;
         try {
           reserved = commit(start.expected, (state, binding) => {
             checkoutAvailable(state, ctx, binding);
@@ -2351,6 +2847,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             binding.messageID = 'msg_' + randomUUID().replaceAll('-', '');
             binding.submittedAt = Date.now();
             binding.phase = 'STOPPED'; binding.uncertain = 'submit';
+            binding.intent = { promptHash: createHash('sha256').update(prompt).digest('hex') };
+            recordPrompt(stateRoot, binding);
             reservationExpected = { ...structuredClone(binding), correctionCount: plan.correctionCount };
             return summary(state, binding, 'submit-pending');
           }, () => { reservationAttempted = true; });
@@ -2362,12 +2860,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         let response;
         try {
           response = await client.request('/api/session/' + reserved.expected.sessionID + '/prompt', {
-            id: reserved.expected.messageID,
-            text: 'Assignment ID: ' + assignmentID + '\nCanonical plan: ' + JSON.stringify(ctx.planPath) +
-              '\nRead that plan; only the assignment below is authorized. Do not edit canonical plans/index/checkpoints, ' +
-              'commit, push, merge, switch branches, delegate, broaden scope or execute unassigned blocks. Finish all edits ' +
-              'and ordinary foreground checks before the final response. Do not detach project-changing work. Report any ' +
-              'remaining background operations; a final response does not itself transfer ownership.\n\n' + task,
+            id: reserved.expected.messageID, text: prompt,
           });
           need(response?.data?.id === reserved.expected.messageID && response.data.sessionID === reserved.expected.sessionID,
             'Submission identity uncertain; no retry');
@@ -2377,7 +2870,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
         try {
           return commit(reserved.expected, (state, binding) => {
-            delete binding.uncertain; delete binding.nextAssignment; binding.phase = 'EXECUTING';
+            delete binding.uncertain; delete binding.intent; delete binding.nextAssignment; binding.phase = 'EXECUTING';
             return summary(state, binding, 'admitted');
           }).result;
         } catch (error) {

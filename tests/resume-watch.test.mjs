@@ -110,12 +110,14 @@ test('PostgreSQL recovery opens review with the timeout and reuses the receipt o
   assert.equal(binding.postgresRecovery, undefined);
   const receipt = join(dirname(f.statePath), 'postgres-recoveries', f.resume.messageID + '.json');
   assert.equal(JSON.parse(readFileSync(receipt)).timeline[0].timeout, true);
+  writeFileSync(evidence.log, logText + '\nRotated log\n');
+  unlinkSync(evidence.log);
   const finish = ['finish', f.workspace, f.plan, '--non-git-baseline', baseline];
   const released = await f.call(finish, undefined, 20000);
   assert.equal(released.result.kind, 'released', JSON.stringify(released.result));
   assert.equal(f.state().plans[0].correctionCount, 9);
   assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
-  assert.equal(readFileSync(evidence.log, 'utf8'), logText);
+  assert.equal(existsSync(evidence.log), false);
 });
 
 test('legacy FINISHED delivery can move to an empty session without bypassing active work', {
@@ -130,6 +132,7 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   const old = f.state().bindings[0], messages = f.messages.get(old.sessionID);
   const ran = messages[1].time.completed, completed = messages.at(-1).time.created;
   // Fixture for a delivery finished by a release that did not retain invocation proof.
+  unlinkSync(join(dirname(f.statePath), 'review-boundaries', old.messageID + '.json'));
   const command = "$run='" + dirname(dirname(evidence.dataDirectory)) + "'\n$bin=Join-Path $run 'tools/pgsql/bin'\n" +
     "$sql | & (Join-Path $bin 'psql.exe') -X -w -h 127.0.0.1 -p " + evidence.port + " -U $cred.role -d postgres -q";
   const call = { id: 'call_lost', type: 'tool', name: 'shell', time: { ran, completed }, state: {
@@ -372,14 +375,15 @@ test('resumption at correction 20 may review the result without reserving cycle 
   assert.equal(f.state().plans[0].correctionCount, 20); assert.equal(f.posts('/api/session/' + f.resume.sessionID + '/prompt'), 1);
 });
 
-test('a stream gap after successful resumption records STOPPED again without duplicate delivery', async t => {
+test('a stream gap after successful resumption polls the same delivery to review', async t => {
   const f = await stopped(t);
   let notify, reads = 0;
   const observed = new Promise(resolve => { notify = resolve; });
   f.onRequest = route => { if (route.includes('/message?') && ++reads === 2) setTimeout(notify, 25); };
   const waiting = f.observe(); await observed; assert.equal(f.state().bindings[0].phase, 'EXECUTING');
   for (const stream of f.streams) stream.end();
-  const result = await waiting; assert.equal(result.phase, 'STOPPED'); assert.equal(result.diagnostic.category, 'event-eof');
+  f.finish(f.resume.sessionID);
+  const result = await waiting; assert.equal(result.phase, 'REVIEWING'); assert.equal(result.kind, 'completed-for-review');
   assert.equal(f.state().plans[0].correctionCount, 9); assert.equal(result.assignmentID, f.resume.assignmentID);
   assert.equal(result.messageID, f.resume.messageID); assert.equal(f.posts('/api/session/' + f.resume.sessionID + '/prompt'), 1);
 });

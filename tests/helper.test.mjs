@@ -34,12 +34,13 @@ function fakeEngine() {
       if (route === '/api/session/active') return { data: structuredClone(client.active) };
       if (route === '/api/session' && body) {
         if (client.loseCreate) throw new Error('Creation connection uncertain');
-        const session = { id: 'ses_test' + (sessions.size + 1), model: structuredClone(body.model), location: structuredClone(body.location) };
+        const session = { id: 'ses_test' + (sessions.size + 1), model: structuredClone(body.model), location: structuredClone(body.location), time: {} };
         sessions.set(session.id, session);
         return { data: session };
       }
       if (route.endsWith('/form')) return { data: structuredClone(client.forms) };
       if (route.endsWith('/permission')) return { data: [] };
+      if (route.startsWith('/api/shell?')) return { data: [] };
       if (route.endsWith('/prompt')) {
         if (client.loseSubmit) throw new Error('Submission connection uncertain');
         return { data: { id: client.wrongAdmission ? 'msg_wrong' : body.id, sessionID: route.split('/')[3] } };
@@ -190,12 +191,12 @@ test('pending forms and malformed active state stop new work', async t => {
 test('credentials stay in HTTP headers, not exposed client/state/result or error bodies', async t => {
   const f = fixture(t); const registrationPath = join(f.root, 'service.json');
   const secret = 'SECRET_CANARY_002';
-  writeFileSync(registrationPath, JSON.stringify({ id: 'engine1', version: '2.1.4', url: 'http://127.0.0.1:1234', password: secret }));
+  writeFileSync(registrationPath, JSON.stringify({ id: 'engine1', version: '2.2.0', url: 'http://127.0.0.1:1234', password: secret }));
   const requests = [];
   const client = await connect({ registrationPath, fetchImpl: async (url, init) => {
     requests.push({ url, init });
     assert.equal(init.headers.Authorization, 'Basic ' + Buffer.from('opencode:' + secret).toString('base64'));
-    return Response.json(url.endsWith('/api/info') ? { version: '2.1.4' } : { data: [{ ...MODEL, enabled: true, status: 'active' }] });
+    return Response.json(url.endsWith('/api/info') ? { version: '2.2.0' } : { data: [{ ...MODEL, enabled: true, status: 'active' }] });
   } });
   assert.ok(!JSON.stringify(client).includes(secret)); assert.ok(!('headers' in client));
   assert.equal(requests.length, 2); assert.ok(requests.every(r => r.init.redirect === 'error'));
@@ -213,14 +214,14 @@ test('discovery refuses missing/corrupt registration, changed versions, unavaila
   const reg = { id: 'engine1', version: 'wrong', url: 'http://127.0.0.1:1234', password: 'canary' };
   writeFileSync(registrationPath, JSON.stringify(reg));
   await assert.rejects(connect({ registrationPath }), /Unsupported engine/);
-  reg.version = '2.1.4'; writeFileSync(registrationPath, JSON.stringify(reg));
-  await assert.rejects(connect({ registrationPath, fetchImpl: async url => Response.json(url.endsWith('/api/info') ? { version: '2.1.4' } : { data: [{ ...MODEL, enabled: false, status: 'active' }] }) }), /unavailable/);
+  reg.version = '2.2.0'; writeFileSync(registrationPath, JSON.stringify(reg));
+  await assert.rejects(connect({ registrationPath, fetchImpl: async url => Response.json(url.endsWith('/api/info') ? { version: '2.2.0' } : { data: [{ ...MODEL, enabled: false, status: 'active' }] }) }), /unavailable/);
   await assert.rejects(connect({ registrationPath, fetchImpl: async () => Response.json({}) }), /Invalid engine info/);
 });
 
 for (const fault of ['read', 'http', 'json']) test('connection ' + fault + ' keeps safe diagnosis without body or raw cause', async t => {
   const f = fixture(t), registrationPath = join(f.root, 'service.json'), secret = 'PRIVATE_TRANSPORT_007';
-  writeFileSync(registrationPath, JSON.stringify({ id: 'engine1', version: '2.1.4', url: 'http://127.0.0.1:1234', password: secret }));
+  writeFileSync(registrationPath, JSON.stringify({ id: 'engine1', version: '2.2.0', url: 'http://127.0.0.1:1234', password: secret }));
   await assert.rejects(connect({ registrationPath, fetchImpl: async () => {
     if (fault === 'read') throw Object.assign(new TypeError(secret), { cause: { code: 'ECONNRESET', message: secret } });
     return new Response(secret, { status: fault === 'http' ? 429 : 200 });

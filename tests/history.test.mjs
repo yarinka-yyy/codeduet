@@ -4,7 +4,45 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { MODEL } from '../helper/connection.mjs';
-import { inspectMessages, completion, closureBoundary } from '../helper/interaction.mjs';
+import { assignmentMessages, inspectMessages, completion, closureBoundary } from '../helper/interaction.mjs';
+
+for (const scenario of ['complete', 'repeated-cursor', 'overlap', 'empty', 'changed-head', 'page-limit', 'byte-limit', 'deadline']) {
+  test('bounded history validates ' + scenario, async t => {
+    const binding = { sessionID: 'ses_fixture', messageID: 'msg_user', assignmentID: 'fixture' };
+    const user = { id: 'msg_user', type: 'user', text: 'Assignment ID: fixture\n' };
+    const head = { id: 'msg_head', type: 'assistant', text: 'head' };
+    const body = scenario === 'byte-limit' ? 'x'.repeat(1024 * 1024) : '';
+    let requests = 0;
+    const clock = new AbortController();
+    if (scenario === 'deadline') t.mock.method(AbortSignal, 'timeout', () => clock.signal);
+    const client = { async request(route) {
+      requests++;
+      if (route.endsWith('limit=1&order=desc'))
+        return { data: [scenario === 'changed-head' ? { ...head, text: 'changed' } : head] };
+      if (scenario === 'deadline') clock.abort();
+      if (scenario === 'page-limit' || scenario === 'byte-limit') return {
+        data: [{ id: 'msg_' + requests, type: 'assistant', text: body }], cursor: { next: 'cursor' + requests },
+      };
+      if (requests === 1) return { data: [head], cursor: { next: 'first' } };
+      if (scenario === 'repeated-cursor') return { data: [{ id: 'msg_other' }], cursor: { next: 'first' } };
+      if (scenario === 'overlap') return { data: [head, user] };
+      if (scenario === 'empty') return { data: [], cursor: { next: 'second' } };
+      return { data: [user] };
+    } };
+    const read = assignmentMessages(client, binding);
+    if (scenario === 'complete') {
+      assert.deepEqual(await read, [user, head]);
+      assert.equal(requests, 3);
+    } else {
+      const reason = { 'repeated-cursor': /invalid cursor/, overlap: /Ambiguous message pagination/,
+        empty: /invalid cursor/, 'changed-head': /History head changed/,
+        'page-limit': /exceeds 200 pages/, 'byte-limit': /exceeds 64 MiB/, deadline: /exceeded 90 seconds/ };
+      await assert.rejects(read, reason[scenario]);
+      if (scenario === 'page-limit') assert.equal(requests, 200);
+      if (scenario === 'deadline') assert.equal(requests, 1);
+    }
+  });
+}
 
 // Native 2.1.4 shapes: synthetic input, then manual compaction after a final/idle.
 function exchange() {
@@ -80,6 +118,30 @@ test('automatic compaction is supported during a bound assignment without permit
   const messages = exchange().filter(m => m.type !== 'synthetic');
   messages[4].reason = 'auto';
   assert.equal(complete(inspect(messages, false)).kind, 'completed-for-review');
+});
+
+test('a recovered provider retry and a late correlated shell notice preserve their real outcomes', () => {
+  const command = 'Get-Date', messages = exchange().slice(0, 5);
+  const retry = { id: 'msg_retry', type: 'assistant', model: MODEL, time: { created: 2 }, content: [],
+    retry: { attempt: 1, at: 3, error: { type: 'provider', status: 503, message: 'PRIVATE_BODY' } } };
+  const launch = messages[1];
+  launch.time.created = 4;
+  launch.content[0] = { id: 'call_shell', type: 'tool', name: 'shell', time: { ran: 5, completed: 10 },
+    state: { status: 'completed', input: { command, background: true }, metadata: { status: 'running', shellID: 'sh_fixture' } } };
+  messages[3].time.created = 25;
+  const notice = { id: 'msg_shell', type: 'synthetic', description: command, time: { created: 31 },
+    metadata: { source: 'shell', shellID: 'sh_fixture', jobID: 'sh_fixture', state: 'completed', exit: 0, truncated: false },
+    text: '<shell id="sh_fixture" state="completed" command="Get-Date">\nOutput\n</shell>' };
+  messages.splice(2, 1); messages.splice(1, 0, retry); messages.splice(-1, 0, notice);
+  const result = complete(inspect(messages, false)).result;
+  assert.deepEqual(result.recoveredRetries, [{ messageID: 'msg_retry', attempt: 1, status: 503 }]);
+  assert.deepEqual(result.shellOutcomes, [{ callID: 'call_shell', outcome: 'succeeded', exit: 0 }]);
+  assert.ok(!JSON.stringify(result).includes('PRIVATE_BODY'));
+  notice.metadata.exit = 2;
+  assert.equal(inspect(messages, false).kind, 'failed');
+  notice.metadata.exit = 0;
+  retry.content.push({ type: 'tool', id: 'call_unknown', name: 'write', state: { status: 'running' } });
+  assert.equal(inspect(messages, false).kind, 'failed');
 });
 
 test('unsupported history diagnostics name only known API types, never arbitrary private values', () => {

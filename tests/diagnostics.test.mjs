@@ -175,6 +175,14 @@ for (const phase of ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING']) test('boot
     args = ['reply', f.workspace, f.plan, 'question', 'frm_diag', answer, '--non-git-baseline', baseline];
   }
   const stopped = await f.call(args, chat);
+  if (phase === 'REVIEWING') {
+    assert.equal(stopped.status, 1);
+    assert.equal(stopped.result.kind, 'connection-unavailable');
+    assert.equal(stopped.result.phase, 'REVIEWING');
+    assert.equal(stopped.result.stateChange, 'unchanged');
+    assert.equal(f.state().bindings.find(binding => binding.codexChat === chat).phase, 'REVIEWING');
+    return;
+  }
   assert.equal(stopped.status, 1); assert.equal(stopped.result.kind, 'connection-uncertain');
   assert.equal(stopped.result.phase, 'STOPPED'); assert.equal(stopped.result.stateChange, 'saved');
   assert.equal(stopped.result.diagnostic.operation, 'server.info');

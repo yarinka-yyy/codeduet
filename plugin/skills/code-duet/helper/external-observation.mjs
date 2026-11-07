@@ -1,16 +1,17 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { requireValue as need, diagnose } from './connection.mjs';
-import { observationContext, observationSnapshot, readState } from './binding.mjs';
-import { recentSessionMessages, inspectMessages, interactive, completion, watch } from './interaction.mjs';
+import { observationContext, observationSnapshot, planIdentity, readState } from './binding.mjs';
+import { recentSessionMessages, inspectMessages, interactive, completion, observationWake } from './interaction.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const count = (state, pin) => state.plans.find(value => value.workspace === pin.workspace && value.planPath === pin.planPath)?.correctionCount ?? null;
 
 export function externalUnchanged(pin, stateRoot) {
   const ctx = observationContext(pin.workspace, pin.planPath);
-  need(Object.keys(ctx).every(key => ctx[key] === pin[key]) && hash(readFileSync(pin.planPath)) === pin.planHash,
+  need(Object.keys(ctx).every(key => ctx[key] === pin[key]) &&
+    (pin.planHashVersion === 2 ? planIdentity(pin.planPath) : hash(readFileSync(pin.planPath))) === pin.planHash,
     'Observation physical context/plan changed');
   const state = readState(join(stateRoot, 'state.json'));
   need(!state.bindings.some(value => value.sessionID === pin.sessionID),
@@ -24,12 +25,14 @@ export async function selectExternal(client, stateRoot, workspace, planPath, ses
   const pin = { ...observationContext(workspace, planPath), mode: 'external', engineID: client.engineID, sessionID };
   const state = readState(join(stateRoot, 'state.json'));
   pin.correctionCount = count(state, pin);
-  pin.planHash = hash(readFileSync(pin.planPath));
+  pin.planHash = planIdentity(pin.planPath);
+  pin.planHashVersion = 2;
   externalUnchanged(pin, stateRoot);
   const current = await observationSnapshot(client, pin);
   const messages = await recentSessionMessages(client, sessionID), prompt = messages[0];
   need(prompt?.type === 'user' && /^msg_[a-zA-Z0-9]+$/.test(prompt.id) && typeof prompt.text === 'string' &&
-    prompt.text.toLowerCase().includes(basename(pin.planPath).toLowerCase()), 'Latest prompt does not identify the selected plan');
+    prompt.text.split(/\r?\n/).includes('Canonical plan: ' + JSON.stringify(pin.planPath)),
+  'Latest prompt does not identify the exact selected plan path');
   need(messageID === undefined || prompt.id === messageID, 'Selected message is no longer the latest prompt');
   Object.assign(pin, { messageID: prompt.id, promptHash: hash(prompt.text),
     adoption: { variant: current.session.model.variant ?? null } });
@@ -87,7 +90,7 @@ export async function waitExternal(client, stateRoot, pin, { signal, timeoutMs, 
   const deadline = AbortSignal.timeout(timeoutMs), combined = AbortSignal.any([signal, deadline]);
   let stream;
   try {
-    stream = await watch(client, pin.sessionID, combined, pin.workspace);
+    stream = await observationWake(client, pin.sessionID, combined, pin.workspace);
     while (true) {
       if (combined.aborted) return { kind: 'observer-error', diagnostic: diagnose(null, signal.aborted ? 'interrupted' : 'deadline', 'wait', stream.observation) };
       if (stream.fault) return { kind: 'observer-error', diagnostic: stream.diagnostic };

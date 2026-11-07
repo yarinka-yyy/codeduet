@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fixture, baseline, model } from './http-fixture.mjs';
@@ -19,7 +19,7 @@ async function setup(t, external = false) {
     sessionID = 'ses_manual'; messageID = 'msg_manual';
     f.sessions.set(sessionID, { id: sessionID, location: { directory: f.workspace },
       model: { providerID: model.providerID, id: model.id }, time: {} });
-    f.messages.set(sessionID, [{ id: messageID, type: 'user', text: 'Implement ' + basename(f.plan) }]);
+    f.messages.set(sessionID, [{ id: messageID, type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) }]);
     f.active[sessionID] = { type: 'running' };
   } else {
     await adapter.bind(f.workspace, f.plan, baseline, 8);

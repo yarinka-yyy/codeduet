@@ -30,6 +30,22 @@ const adoptArgs = (f, id = 'ses_existing', count = 19) => ['adopt', f.workspace,
 const submitArgs = (f, id = 'adopted-correction', kind = 'correction') => ['submit', f.workspace, f.plan, id, f.packet,
   '--kind', kind, '--non-git-baseline', baseline];
 const waitArgs = f => ['wait', f.workspace, f.plan, '--timeout-ms', '3000', '--non-git-baseline', baseline];
+
+test('a prepared adopted session verifies the reviewed exchange before its next prompt', async t => {
+  const f = await fixture(t), session = seed(f);
+  assert.equal((await f.call(adoptArgs(f, session.id, 0))).status, 0);
+  assert.equal((await f.call(submitArgs(f))).status, 0);
+  f.finish(session.id);
+  assert.equal((await f.call(waitArgs(f))).result.phase, 'REVIEWING');
+  assert.equal((await f.call(['next', f.workspace, f.plan, 'block', '--non-git-baseline', baseline])).status, 0);
+  f.messages.get(session.id).at(-2).content[0].text = 'Changed after review';
+  const result = await f.call(submitArgs(f, 'next-reviewed-block', 'block'));
+  assert.equal(result.status, 1);
+  assert.match(result.result.error, /changed since review/i);
+  assert.equal(f.posts('/api/session/' + session.id + '/prompt'), 1);
+  assert.equal(f.state().plans[0].correctionCount, 1);
+});
+
 async function streamed(f, waiting) {
   waiting.catch(() => {});
   const deadline = Date.now() + 2500;
@@ -131,6 +147,16 @@ test('failed High selection stops dispatch without spending a correction or chan
   assert.equal(result.result.diagnostic.operation, 'session.switchModel');
   assert.equal(f.posts(`/api/session/${session.id}/prompt`), 0);
   assert.deepEqual(readFileSync(f.statePath), before);
+});
+
+test('lost High selection ACK continues only with its unique matching history record', async t => {
+  const f = await fixture(t, undefined, '2.2.5'), session = seed(f);
+  assert.equal((await f.call(adoptArgs(f))).status, 0);
+  f.fault = 'model-ack-lost';
+  const result = await f.call(submitArgs(f));
+  assert.equal(result.result.kind, 'admitted', JSON.stringify(result.result));
+  assert.equal(f.posts(`/api/session/${session.id}/model`), 1);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
 });
 
 test('a saved ordinary session switches to High before its next dispatch', async t => {
