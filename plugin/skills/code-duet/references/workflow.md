@@ -114,11 +114,10 @@ outcome. After a scoped answer/reply, rearm and end the turn again. A stale even
 may return observing: rearm the unchanged assignment without resending it.
 A failed startup or uncertain queue result requires diagnosis, not another launch.
 Token deltas, submit admission, silence, timeout and final text alone
-do not transfer ownership. Bootstrap retries only the safe registration/info/model
-GETs described in the [protocol](../helper/PROTOCOL.md#connection). If they
-exhaust before dispatch, PREPARING/FINISHED remain unchanged; active/review phases
-stop with a diagnostic. POST delivery is never retried, and an established SSE
-wait never reconnects. Do not restart services, switch models or roll back.
+do not transfer ownership. Follow the helper's diagnostic and [wait and phase
+rules](../helper/PROTOCOL.md#wait). The helper can continue through HTTP after a
+recoverable SSE disconnect. Let it check the same delivery without polling it
+yourself. Never retry a delivery POST, restart services, switch models or roll back.
 The foreground wait/resume-watch commands remain diagnostic/manual alternatives;
 do not silently use them when event waiting is unavailable. No Windows service,
 autostart, recurring automation or changes to Codex settings are required.

@@ -170,7 +170,8 @@ without treating fallback exit0 as recovery or acceptance.
 Only completed-for-review (external-completed in passive mode) permits review;
 question/permission requires its fresh request and normal scoped reply.
 After reply, arm again and end the turn.
-Observing means the event is stale: rearm the unchanged delivery and end the turn.
+For a bound delivery, observing means the event is stale: rearm the unchanged
+delivery and end the turn.
 STOPPED/observer-error means report the failure, without automatic recovery.
 For passive observation, an observer-error consume also returns executorCheck:
 checked with the freshly validated outcome kind, or unavailable with a sanitized
@@ -194,10 +195,13 @@ again. A changed snapshot keeps observing; it cannot end a newly resumed run.
 An old session.outcome:succeeded while
 active is running does not complete the current exchange. Error executorCheck may
 describe a fresh completed exchange, but grants neither review nor dispatch there.
-Repeated consume returns already-consumed with no action. A failed consume attempt
-is retained for diagnosis, not replayed automatically. Cancel that exited receipt
-to release its slots, then explicitly observe/rearm after resolving the cause;
-do not retry its consume or resend a task. No observer writes plans.
+Repeated consume after success returns already-consumed with no action. If consume
+returns retryable-read, it leaves the receipt unconsumed. After the read problem
+is resolved, use the returned manualCommand to consume the same receipt in the
+owner chat without cancelling it, rearming or resending.
+For other consume failures, inspect status and diagnose the cause. Cancel the
+exited receipt to release its slots before an explicitly authorized observe or
+rearm. Do not retry that consume or resend the assignment. No observer writes plans.
 
 Only terminal completion, a correlated question/permission or a failure ends the
 software wait. Token/tool progress and ordinary polls do not wake GPT. The total
@@ -238,8 +242,10 @@ automatic retry after a crash, timeout, CLI update or missing queue response.
 Status reports sent versus uncertain delivery. Inspect/consume the existing
 receipt; never resend the OpenCode assignment to repair a notification failure.
 
-No autostart entry needs uninstalling. Before replacing/removing the skill, cancel
-its observer and confirm exited. Preserve shared state, counts and receipts;
-removing the skill does not cancel engine work or grant another writer ownership.
+No autostart entry needs uninstalling. For an update, preserve observers with a
+pinned package and follow the [package update rules](../references/runtime.md#plugin-installation-and-updates)
+for older observers that depend on the source installation. Before uninstalling,
+cancel the skill's observer and confirm it exited. Preserve shared state, counts
+and receipts. Removing the skill leaves engine work and writer ownership intact.
 Closed/restarted Desktop, host shutdown and future CLI releases are not guaranteed
 to deliver a notification; inspect status after interruption. Do not auto-restart.

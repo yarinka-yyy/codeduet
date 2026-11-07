@@ -78,9 +78,8 @@ Incomplete registration JSON, explicit timeout/reset/refused transport codes
 and HTTP 502/503/504 retry. Each attempt rereads registration. Access, malformed registration, 400/401/403/
 429, schema/version/model/identity errors and unknown transport errors are
 single-attempt failures. A failed parallel GET aborts its sibling. These retries
-never replay create, model selection, prompt or reply POSTs. SSE disconnects use
-fresh GET snapshots until the original deadline. JSON/shape/lifecycle faults
-retain their specific diagnostics.
+never replay create, model selection, prompt or reply POSTs. See [wait](#wait)
+for SSE recovery and phase handling.
 
 Only the exact validated releases 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 and 2.2.6 are accepted; registration and
 GET info versions must agree. A mismatch is a single-attempt `engine-version`
@@ -363,12 +362,16 @@ Codex turn. Only an explicitly selected manual/diagnostic foreground wait keeps
 the same process handle through host yields. The helper emits no progress output.
 A host yield does not reconnect or send another DeepSeek prompt; it may still
 return control to GPT. Do not add advisor history reads or narrate progress.
-A received stream gap stops coordination without reconnect/resubmit.
-Exhausted CLI bootstrap between calls leaves PREPARING/FINISHED byte-for-byte
-unchanged. In EXECUTING, WAITING_FOR_ANSWER or REVIEWING it records STOPPED with
-the connection diagnostic; an existing STOPPED binding remains sticky. Library
-callers use `connectionLost(error)` for the same state-only transition; it never
-sends a mutation or releases a persisted uncertainty marker.
+On a recoverable SSE transport failure, the helper uses fresh GET snapshots of
+that delivery until the original deadline, without reconnecting SSE or resending.
+Leave those reads to the helper. Invalid event data and lifecycle faults retain
+their diagnostics. A stream gap alone cannot establish a terminal outcome.
+Exhausted bootstrap leaves PREPARING and FINISHED unchanged. For `next` and
+`finish`, it also preserves REVIEWING so the same operation can recheck the
+saved delivery after recovery. When the CLI records other connection failures
+through `connectionLost(error)`, EXECUTING, WAITING_FOR_ANSWER or REVIEWING can
+become STOPPED. That transition preserves existing STOPPED state and any
+uncertainty marker and sends no mutation to OpenCode.
 
 ## Resume observation
 

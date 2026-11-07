@@ -1,6 +1,6 @@
 ---
 name: code-duet
-description: Coordinate authorized implementation through DeepSeek in the local OpenCode Desktop while Codex plans and reviews the shared working tree. Use when the user selects Code Duet or asks for this OpenCode execution route; ordinary coding requests alone do not select it.
+description: Coordinate authorized implementation through DeepSeek in local OpenCode Desktop while Codex plans and reviews the shared working tree. Use only on explicit $code-duet or $code-duet:code-duet invocation.
 ---
 
 # Code Duet
@@ -40,10 +40,11 @@ Before the ordinary helper route, run [read-only preflight](helper/PROTOCOL.md#p
 for the selected workspace and plan. It uses the current chat's saved pair, or
 proposes a new bind; pass --session only when the user explicitly selected that
 exact existing recipient. A preflight snapshot does not grant dispatch authority;
-adopt and submit repeat their own fresh checks. If preflight returns a
-[transition](helper/PROTOCOL.md#transition), handle it from the destination chat
-as part of the authorized next assignment. Preserve the previous checkpoint and
-count. Acceptance requires review; `blocked` or `without-acceptance` requires
+adopt and submit repeat their own fresh checks. On an inspection-only request,
+report the preflight result and any proposed transition, then stop. Run
+[transition](helper/PROTOCOL.md#transition) from the destination chat only when
+the next assignment is authorized. Preserve the previous checkpoint and count.
+Acceptance requires review; `blocked` or `without-acceptance` requires
 the user's explicit decision to leave the previous work unaccepted. Use inspect for diagnosis when no
 plan is ready or after an error; do not require it in addition to a complete preflight.
 Run read-only preflight even if local lifecycle maintenance failed. Use
@@ -74,7 +75,8 @@ and only its relevant technical sections. Submit one identified assignment
 once. After delivery use the [event observer](helper/OBSERVER.md): arm it for
 this actual chat, confirm observer-armed, report briefly and **end the turn**.
 Do not loop on wait/status tools or narrate unchanged progress. On its wake hint,
-consume that receipt once and revalidate the live assignment before acting.
+follow [receipt handling](helper/OBSERVER.md#handle-a-wake-hint) to consume the
+receipt and revalidate the live assignment before acting.
 If arm returns observer-terminal, consume its receipt now; it is not a running
 observer. Passive completion grants read-only review, never correction dispatch;
 use the [guarded transition](references/existing-session.md#from-passive-observation-to-a-new-correction).
