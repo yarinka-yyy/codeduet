@@ -15,6 +15,10 @@ with High reasoning. Passive observation leaves the manually started chat alone.
 
 ## Choose the route
 
+If the user is carrying the assignment and report by hand, use
+[manual assignment and review](references/workflow.md#manual-assignment-and-review).
+It applies the same acceptance standard without using the helper.
+
 For observation of work already sent manually to an explicitly selected OpenCode
 session, use [external observation](helper/OBSERVER.md#observe-manually-started-work).
 This GET/SSE-only route does not bind, adopt, submit or transfer old ownership.

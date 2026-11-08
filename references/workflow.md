@@ -1,8 +1,8 @@
 # Code Duet plan and review workflow
 
 This is the operating contract for the advisor, not an automatic Markdown
-orchestrator. Use the existing helper; do not invoke Improve Codex, install a
-skill or start an executor merely because a plan exists.
+orchestrator. Use the existing helper for managed delivery. Do not invoke
+Improve Codex, install a skill or start an executor merely because a plan exists.
 
 This file is the single source for authorization, route, baseline, assignment,
 ownership, waiting, review, corrections, handoff and checkpoints. The helper's
@@ -133,14 +133,55 @@ against actual evidence before accepting work or preparing a correction. A
 completed fallback, successful idle or empty search result does not prove that
 the missing information was obtained. Unknown errors and uncertain writes block.
 
-## Review, correct or release
+## Review evidence and decide acceptance
 
-After the gate, compare actual diff/untracked files and the executor report with
-the recorded baseline. Verify assigned behavior, preserve accepted work and
-protected dirty files, and run proportionate independent checks. Record exact
-commands, outcomes, source state, accepted contracts, missing gates and next task.
-Passing a build/fixture does not satisfy required runtime/visual/owner acceptance.
-The advisor alone decides acceptance; no helper operation changes Markdown.
+For helper-managed work, begin after the review gate above. Apply the same
+checks to [manual handoffs](#manual-assignment-and-review).
+
+1. Compare the report with the actual diff and untracked files against the
+   recorded baseline. Confirm scope, accepted work and protected dirty files.
+   Trace the changed path from its entry point to the observed effect. Check
+   existing callers, especially error handling, fallbacks and when writes occur.
+2. Match each required criterion to what the check actually exercised and
+   asserted. Keep separate claims separate: memory and database agreement can
+   hold after one of two concurrent writes was lost, and trusting a proxy CA
+   says nothing about whether the proxy rejects an untrusted upstream certificate.
+   Function, API, built application, UI and owner checks each cover their own
+   layer. A skipped required scenario remains open even with exit 0.
+3. For material risks, independently rerun the key scenario or write a minimal
+   probe. Check the intended outcome and any required absence of side effects
+   using isolated resources, such as a second local server that receives no
+   secret or an isolated database instead of someone else's database. Record
+   the commands, outcomes, source state and evidence. Distinguish product
+   failures from unavailable fixtures, permissions or other environment blockers.
+4. In the same review, trace calls to new functions and check for duplicate
+   rules or validation, unnecessary parameters and copies, and unjustified
+   dependencies. Check whether an existing mechanism or standard API suffices.
+   For each actionable finding name the file, consequence and smallest fix.
+   Style preferences and unrelated refactors do not warrant a correction round.
+
+Give one verdict: accepted, corrections required, or blocked with the missing
+prerequisite. Accept only when all mandatory criteria and applicable gates are
+satisfied. `READY FOR REVIEW` leaves any unmet criterion open. Record positive
+results with their actual coverage and give one consolidated list if fixes are
+needed. The advisor alone decides acceptance; no helper operation changes Markdown.
+
+## Manual assignment and review
+
+When the user chooses to carry the assignment and report by hand, use the
+[assignment template](assignment-template.md) with the same scope, baseline,
+criteria and executor instructions. Use the canonical plan if supplied,
+otherwise use the agreed assignment. Omit transport fields (packet header,
+OpenCode session/model and helper correction count). The user handles the
+transfer. Codex applies the review above to the supplied report and actual
+changes once the executor and any project-changing operations have ended.
+Missing evidence keeps the affected criterion open.
+
+This route uses no helper or OpenCode calls. It does not release, adopt or
+change any existing assignment, status, ownership or counter. Work under an
+existing helper-managed delivery still follows its ownership and review gates.
+
+## Correct or release
 
 For corrections: write one actionable consolidated list and updated checkpoint,
 then next <workspace> <plan> correction and submit with --kind correction and
