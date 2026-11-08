@@ -415,8 +415,21 @@ successful shell completion notice. The initial tool timestamp can precede the
 PostgreSQL startup. A foreground launch must fall inside its command window.
 The helper checks current PostgreSQL processes, the listening port, and the PID
 file, then rechecks the assignment and shell registry. Only an authorized
-resume stores the receipt under the shared state directory. Later release and
-transition checks revalidate the same evidence. Review output retains timeouts.
+resume stores an operator-provided receipt under the shared state directory.
+
+For a foreground PowerShell `pg_ctl` launch with literal `$run`, `$bin`, `$data`
+and `$log = Join-Path $run 'logs\postgres.log'`, `wait` and `resume-watch` can
+derive the receipt from the delivered history. The test cluster may be in a
+sibling run with its own `data/pgdata` and `tools/pgsql/bin`. Keep the original
+log and the launch output with exit/status 0, postmaster PID, and the loopback
+listener port/PID. The later `pg_ctl -m fast stop` and `pg_ctl status` call must
+use the same cluster, binary and port, report exit 0, status 3, no PID file and
+no listener, and contain the matching PID shutdown timestamp in its execution
+window. Windows must independently confirm that the PID, cluster process,
+listener and PID file are absent. For this recognized route, use the original
+owner chat and exact IDs with `resume-watch` without `--postgres-evidence`.
+Later release and transition checks revalidate the saved receipt and current
+Windows state. Review output retains timeouts on the operator-provided route.
 Another resume-watch cannot attach concurrently; ordinary wait remains sticky
 on STOPPED. Do not spoof a chat ID or remove a lock to enter this route.
 A known no-write edit rejection may remain pending while the engine is running;

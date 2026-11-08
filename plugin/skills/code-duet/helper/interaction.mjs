@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
-import { verifyPostgresRecovery } from './postgres-recovery.mjs';
+import { inferPostgresRecovery, verifyPostgresRecovery } from './postgres-recovery.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export function fingerprint(request) {
@@ -392,8 +392,7 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
   const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors, retries,
-    invocationProofs: binding.invocationProofs,
-    ...(binding.postgresRecovery ? { recoveryBinding: binding } : {}) };
+    invocationProofs: binding.invocationProofs, recoveryBinding: binding };
   // Keep history failure separate from current executor activity; preserve tools for questions.
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
     failed.error ? 'message-error' : failed.retry ? 'retry-record' : failed.type === 'idle' ? 'failed-idle' :
@@ -676,8 +675,11 @@ function endedShells(history, shells, closing = false, invocationCheck) {
     const tool = history.tools.find(tool => unfinished?.id && tool.state.metadata?.shellID === unfinished.id);
     throw new Error('Project shell still running or unknown (' + (tool ? 'call ' + shellEvidenceID(tool.id) : 'shell ' + shellEvidenceID(unfinished?.id)) + ')');
   }
-  const postgres = history.recoveryBinding ?
-    verifyPostgresRecovery(history.recoveryBinding, history.tools, history.idle?.time?.created, undefined, history.backgroundShells) : new Map();
+  const binding = history.recoveryBinding;
+  const evidence = binding?.postgresRecovery ?? (binding && !closing ? inferPostgresRecovery(binding, history.tools) : undefined);
+  const postgres = evidence ? verifyPostgresRecovery({ ...binding, postgresRecovery: evidence }, history.tools,
+    history.idle?.time?.created, undefined, history.backgroundShells) : new Map();
+  if (postgres.size && invocationCheck) invocationCheck.postgresEvidence = evidence;
   // A completed launcher alone cannot certify a detached process.
   for (const tool of history.tools) {
     const input = tool.state.input ?? {};
@@ -703,11 +705,12 @@ function endedShells(history, shells, closing = false, invocationCheck) {
       const recovered = postgres.get(tool.id);
       if (tool.state.metadata?.timeout === true || tool.state.metadata?.signal !== undefined)
         need(recovered || notice || listed.some(shell => shell.command === input.command), 'Shell termination is not confirmed' + call);
-      const command = recovered?.command ?? input.command;
+      const stop = [...postgres.values()].find(launch => launch.stop?.tool === tool)?.stop;
+      const command = recovered?.command ?? stop?.command ?? input.command;
       let reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),
         postgres.size > 0);
       if (reason === 'unclassified or background ampersand' && postgres.size && invocationCheck?.lostCalls?.has(tool.id)) {
-        reason = detachedReason(command, source => maskLegacyPostgresCalls(source, tool, history.recoveryBinding.postgresRecovery), true);
+        reason = detachedReason(command, source => maskLegacyPostgresCalls(source, tool, evidence), true);
         if (!reason) invocationCheck.gaps.push({ id: tool.id, messageID: tool.messageID, ran: tool.time?.ran,
           completed: tool.time?.completed, hash: createHash('sha256').update(input.command).digest('hex') });
       }

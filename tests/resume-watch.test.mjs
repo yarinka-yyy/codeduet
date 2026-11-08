@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
 import { helper, preflight as checkPreflight } from '../helper/binding.mjs';
-import { sha256, verifyPostgresRecovery } from '../helper/postgres-recovery.mjs';
+import { inferPostgresRecovery, sha256, verifyPostgresRecovery } from '../helper/postgres-recovery.mjs';
 
 async function stopped(t) {
   const f = await fixture(t, undefined, '2.2.0');
@@ -135,6 +135,93 @@ test('PostgreSQL recovery correlates a cleaned run and two OpenCode call formats
   mkdirSync(dataDirectory);
   writeFileSync(join(dataDirectory, 'postmaster.pid'), '17932');
   assert.throws(() => verify(), /PID file/);
+});
+
+function nativePostgresFixture(workspace, at, port = 55432) {
+  const cluster = join(workspace, 'native', '002-stage1-01'), run = join(workspace, 'native', '010-b4-02');
+  const data = join(cluster, 'data', 'pgdata'), bin = join(cluster, 'tools', 'pgsql', 'bin');
+  const log = join(run, 'logs', 'postgres.log'), pid = 38168;
+  mkdirSync(dirname(log), { recursive: true }); mkdirSync(data, { recursive: true });
+  const prefix = `cd '${workspace}'; $run='${run}'; $bin='${bin}'; $data='${data}'; `;
+  const call = "& (Join-Path $bin 'pg_ctl.exe') -D $data ";
+  const listener = `Get-NetTCPConnection -State Listen -LocalPort ${port}`;
+  const tool = (id, command, text, ran) => ({ id, type: 'tool', name: 'shell', time: { ran, completed: ran + 4 },
+    state: { status: 'completed', input: { command }, metadata: { status: 'completed', exit: 0, truncated: false },
+      content: [{ type: 'text', text }] } });
+  const first = tool('call_a0ed174c35dc4525b4a422b2', prefix + "$log=Join-Path $run 'logs\\postgres.log'; " +
+    call + '-l $log start; $code=$LASTEXITCODE; ' + call + 'status; ' + listener,
+    `start_exit=0\npostmaster_pid=${pid}\nstatus_exit=0\n127.0.0.1      ${port}    ${pid}`, at);
+  const stop = tool('call_eb3782b64eee4c049d9d303d', prefix + call + '-m fast stop; $code=$LASTEXITCODE; ' +
+    call + 'status; ' + listener, 'stop_exit=0\nstatus_exit=3\npid_file_exists=False\nlisteners=0\nprocesses=0', at + 10);
+  const logLine = (time, text) => new Date(time).toISOString().replace('T', ' ').replace('Z', ` UTC [${pid}] LOG:  `) + text;
+  const bytes = [logLine(at + 1, 'starting PostgreSQL 16.15'),
+    logLine(at + 2, `listening on IPv4 address "127.0.0.1", port ${port}`),
+    logLine(at + 11, 'database system is shut down')].join('\n');
+  writeFileSync(log, bytes);
+  return { first, stop, data, log, bytes, pid };
+}
+
+test('Windows pg_ctl with $data and $log matches only the stopped sibling test cluster', async t => {
+  const f = await stopped(t), binding = f.state().bindings[0], at = binding.submittedAt + 10;
+  const { first, stop, data, log, bytes, pid } = nativePostgresFixture(f.workspace, at);
+  const evidence = inferPostgresRecovery(binding, [first, stop]);
+  const verify = (tools = [first, stop], probe = () => true, changes = {}) =>
+    verifyPostgresRecovery({ ...binding, postgresRecovery: { ...evidence, ...changes } }, tools, at + 20, probe);
+  const result = verify(undefined, (...args) => { assert.deepEqual(args, [55432, false, data, [pid]]); return true; });
+  assert.equal(result.get(first.id).stop.tool.id, stop.id);
+  const extra = structuredClone(stop);
+  extra.state.input.command += '; Start-Process cmd.exe';
+  assert.match(verify([first, extra]).get(first.id).stop.command, /Start-Process cmd\.exe$/);
+  assert.throws(() => verify([first]), /lacks a matching stop/);
+  for (const [original, replacement] of [['002-stage1-01', 'foreign'], ['55432', '55433']]) {
+    const wrongStop = structuredClone(stop);
+    wrongStop.state.input.command = wrongStop.state.input.command.replaceAll(original, replacement);
+    assert.throws(() => verify([first, wrongStop]), /lacks a matching stop/);
+  }
+  const wrongStatus = structuredClone(stop);
+  wrongStatus.state.content[0].text = wrongStatus.state.content[0].text.replace('status_exit=3', 'status_exit=0');
+  assert.throws(() => verify([first, wrongStatus]), /lacks a matching stop/);
+  assert.throws(() => verify(undefined, undefined, { calls: [{ ...evidence.calls[0], pid: pid + 1 }] }), /PID or listener/);
+  assert.throws(() => verify(undefined, () => false), /process, listener or PID file/);
+  writeFileSync(join(data, 'postmaster.pid'), `${pid}`);
+  assert.throws(() => verify(), /PID file/);
+  unlinkSync(join(data, 'postmaster.pid'));
+  const incomplete = bytes.split('\n').slice(0, 2).join('\n');
+  writeFileSync(log, incomplete);
+  assert.throws(() => verify(undefined, undefined, { logHash: sha256(incomplete) }), /lifecycle evidence is incomplete/);
+});
+
+test('Windows B4-02 pg_ctl history opens ordinary and resumed review without a second prompt', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
+}, async t => {
+  for (const resume of [false, true]) await t.test(resume ? 'resume-watch at count zero' : 'ordinary wait', async t => {
+    const f = await fixture(t, undefined, '2.2.6');
+    const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+    const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
+    await adapter.bind(f.workspace, f.plan, baseline, 0);
+    await adapter.submit(f.workspace, f.plan, 'B4-02', f.packet, baseline);
+    const saved = f.state().bindings[0], at = Date.now();
+    const { first, stop, log } = nativePostgresFixture(f.workspace, at, 65429);
+    f.messages.get(saved.sessionID).push({ id: 'msg_postgres', type: 'assistant', model,
+      time: { completed: at + 15 }, content: [first, stop] });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    f.finish(saved.sessionID);
+    if (resume) await adapter.connectionLost(new Error('Detached command status unknown; no ownership transfer'));
+    const from = f.calls.length;
+    const args = [f.workspace, f.plan, '--non-git-baseline', baseline, '--timeout-ms', '15000'];
+    const result = await f.call(resume ? ['resume-watch', ...args.slice(0, 2), saved.assignmentID,
+      saved.messageID, '--session', saved.sessionID, ...args.slice(2)] : ['wait', ...args], undefined, 20000);
+    assert.equal(result.result.kind, 'completed-for-review', JSON.stringify(result.result));
+    assert.equal(result.result.phase, 'REVIEWING');
+    assert.equal(result.result.correctionCount, 0);
+    assert.equal(result.result.sessionID, saved.sessionID);
+    assert.equal(result.result.messageID, saved.messageID);
+    unlinkSync(log);
+    const finished = await f.call(['finish', f.workspace, f.plan, '--non-git-baseline', baseline], undefined, 20000);
+    assert.equal(finished.result.phase, 'FINISHED', JSON.stringify(finished.result));
+    assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+    assert.equal(f.posts('/api/session/' + saved.sessionID + '/prompt'), 1);
+  });
 });
 
 test('PostgreSQL recovery opens review with the timeout and reuses the receipt on release', {

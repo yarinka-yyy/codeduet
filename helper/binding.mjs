@@ -2378,7 +2378,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               deliveredBoundary(expected, messages, current.session, true);
               const review = reviewReceipt(stateRoot, expected, exchange);
               const shells = await projectShells(client, expected);
-              const verified = [], result = completion(history, current.session, shells, { verified });
+              const verified = [], verification = { verified };
+              const result = completion(history, current.session, shells, verification);
               const confirmed = await snapshot(expected);
               need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
                 confirmed.session.outcome === current.session.outcome &&
@@ -2391,9 +2392,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 saveReviewReceipt(stateRoot, binding, review);
                 saveInvocationProofs(stateRoot, binding, verified);
                 delete binding.pending; binding.phase = 'REVIEWING';
-                if (postgresRecovery) {
+                if (verification.postgresEvidence && (postgresRecovery || !history.recoveryBinding.postgresTimeline)) {
                   const path = postgresPath(stateRoot, binding.messageID);
-                  const receipt = { owner: deliveryFingerprint(binding), evidence: postgresRecovery, timeline: result.result.postgresRecovery };
+                  const receipt = { owner: deliveryFingerprint(binding), evidence: verification.postgresEvidence, timeline: result.result.postgresRecovery };
                   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
                   if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(receipt),
                     'A different PostgreSQL recovery receipt already exists');
