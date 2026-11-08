@@ -34,11 +34,17 @@ function shellListKnown(result) {
     (shell.status === 'running' || Number.isFinite(shell.time?.completed)));
 }
 
+function duplicateShellIDs(result) {
+  const ids = Array.isArray(result?.data) ? result.data.map(shell => shell?.id).filter(text) : [];
+  return new Set(ids).size !== ids.length;
+}
+
 export async function projectShells(client, { workspace, checkout }) {
   const local = await client.request(shellRoute(workspace));
+  if (duplicateShellIDs(local)) return { data: null };
   if (!checkout || checkout === workspace) return local;
   const root = await client.request(shellRoute(checkout));
-  if (!shellListKnown(local) || !shellListKnown(root)) return { data: null };
+  if (!shellListKnown(local) || !shellListKnown(root) || duplicateShellIDs(root)) return { data: null };
   const shells = [...local.data];
   const byID = new Map(shells.filter(shell => text(shell.id)).map(shell => [shell.id, shell]));
   for (const shell of root.data) {
@@ -47,6 +53,15 @@ export async function projectShells(client, { workspace, checkout }) {
     if (!existing) shells.push(shell);
   }
   return { data: shells };
+}
+
+export function sameProjectShells(first, second) {
+  const keyed = snapshot => {
+    if (!Array.isArray(snapshot?.data) || !snapshot.data.every(shell => text(shell?.id))) return snapshot;
+    const data = new Map(snapshot.data.map(shell => [shell.id, shell]));
+    return data.size === snapshot.data.length ? { ...snapshot, data } : snapshot;
+  };
+  return isDeepStrictEqual(keyed(first), keyed(second));
 }
 
 async function requireQuietShells(client, binding) {
@@ -58,7 +73,7 @@ async function requireQuietShells(client, binding) {
 async function confirmHistoryAndShells(client, binding, messages, shells) {
   const [latest, latestShells] = await Promise.all([assignmentMessages(client, binding), projectShells(client, binding)]);
   need(isDeepStrictEqual(latest, messages), 'History changed during completion verification');
-  need(isDeepStrictEqual(latestShells, shells), 'Project shells changed during completion verification');
+  need(sameProjectShells(latestShells, shells), 'Project shells changed during completion verification');
 }
 function bindFingerprint(state, binding) {
   if (!binding) return createHash('sha256').update('unbound').digest('hex');
@@ -381,6 +396,88 @@ function sameBoundary(a, b) {
   return ['lastMessageID', 'idleAt', 'variant'].every(key => a[key] === b[key]);
 }
 
+// Old detached workers still read state.json while newer helpers prepare deliveries.
+const preparationOwner = binding => fingerprint(['codexChat', 'workspaceID', 'checkoutID', 'planPath', 'engineID',
+  'sessionID', 'assignmentID', 'messageID', 'submittedAt'].map(key => binding[key]));
+const preparationPath = (root, owner) => join(root, 'preparations', owner + '.json');
+
+function preparation(root, binding) {
+  const owner = preparationOwner(binding);
+  let raw;
+  try { raw = readFileSync(preparationPath(root, owner), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+  const value = JSON.parse(raw), { reusedDelivery, modelSelection, modelBaseline } = value;
+  need(value.schema === 1 && value.owner === owner, 'Invalid or foreign session preparation');
+  if (reusedDelivery) {
+    const boundary = reusedDelivery.boundary;
+    need(!binding.assignmentID && /^msg_[a-zA-Z0-9]+$/.test(reusedDelivery.messageID) &&
+      text(reusedDelivery.assignmentID) && Number.isFinite(reusedDelivery.submittedAt) &&
+      isAbsolute(reusedDelivery.planPath) && reusedDelivery.planPath !== binding.planPath &&
+      text(boundary?.lastMessageID) && Number.isSafeInteger(boundary.idleAt) && (boundary.variant === null || text(boundary.variant)),
+    'Invalid reused delivery boundary');
+  }
+  if (modelSelection) need((modelSelection.head === null || text(modelSelection.head)) &&
+    (modelSelection.variant === null || text(modelSelection.variant) && modelSelection.variant.length <= 80) &&
+    (modelSelection.idleAt === null || Number.isSafeInteger(modelSelection.idleAt)) &&
+    Number.isSafeInteger(modelSelection.intentAt) &&
+    (modelSelection.event === null || fingerprintPattern.test(modelSelection.event)) &&
+    (modelSelection.history === undefined || fingerprintPattern.test(modelSelection.history)), 'Invalid model selection proof');
+  need(modelBaseline === undefined || fingerprintPattern.test(modelBaseline), 'Invalid model selection baseline');
+  return { reusedDelivery, modelSelection, modelBaseline };
+}
+
+function preparedBinding(root, binding) {
+  return binding?.phase === 'PREPARING' ? { ...binding, ...preparation(root, binding) } : binding;
+}
+
+function savePreparation(root, binding, proof) {
+  const owner = preparationOwner(binding), path = preparationPath(root, owner);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJSON(path, { schema: 1, owner, ...proof });
+}
+
+async function preparedMessages(client, binding, sessionID = binding?.sessionID) {
+  if (binding?.assignmentID) return assignmentMessages(client, binding);
+  if (binding?.modelSelection?.head !== null) return recentSessionMessages(client, sessionID);
+  const page = await client.request(`/api/session/${sessionID}/message?limit=2&order=desc`);
+  need(Array.isArray(page?.data) && page.data.length <= 1, 'Unexpected history after High selection');
+  return page.data;
+}
+
+function preparedHistory(binding, messages, session) {
+  const proof = binding?.modelSelection;
+  if (!proof) return { messages, session };
+  const original = proof.event === null ? messages : messages.slice(0, -1);
+  need(session.model?.variant === EXECUTOR_MODEL.variant && (session.time?.idle ?? null) === proof.idleAt &&
+    (original.at(-1)?.id ?? null) === proof.head &&
+    (proof.history === undefined || fingerprint(original) === proof.history) &&
+    (proof.event === null || messages.at(-1)?.type === 'model-switched' && fingerprint(messages.at(-1)) === proof.event),
+  'History or model changed after confirmed High selection');
+  const { variant, ...model } = session.model;
+  return { messages: original, session: { ...session, model: proof.variant === null ? model : { ...model, variant: proof.variant } } };
+}
+
+function existingBoundary(root, binding, messages, session, shells) {
+  if (binding?.reusedDelivery) {
+    const { boundary, ...delivery } = binding.reusedDelivery;
+    const source = { ...binding, ...delivery };
+    need(messages[0]?.id === source.messageID && readAcceptance(root, source) &&
+      existsSync(reviewPath(root, source.messageID)), 'Missing exact acceptance and review for the reused session');
+    const delivered = deliveredBoundary(source, messages, session, true);
+    need(sameBoundary(boundary, delivered.boundary), 'Reused session history changed after preparation');
+    reviewReceipt(root, source, delivered.exchange);
+    completion(inspectMessages(withShellEvidence(root, source), delivered.exchange), session, shells);
+    return boundary;
+  }
+  if (messages.length) {
+    need(session.outcome === 'succeeded', 'Existing history outcome is not confirmed successful');
+    const previous = messages[0].id === binding?.messageID ? withShellEvidence(root, binding) :
+      { workspace: binding?.workspace, messageID: messages[0].id };
+    completion(inspectMessages(previous, messages, { adopting: true }), session, shells);
+  } else need(session.outcome === undefined && session.time?.idle === undefined, 'Existing history/status mismatch');
+  return { variant: session.model.variant ?? null, lastMessageID: messages.at(-1)?.id ?? null, idleAt: session.time?.idle ?? null };
+}
+
 const transitionPath = (root, messageID) => join(root, 'assignment-transitions', messageID + '.json');
 function readTransition(root, messageID) {
   if (!/^msg_[a-zA-Z0-9]+$/.test(messageID ?? '')) return null;
@@ -414,8 +511,9 @@ async function matchingSession(client, binding) {
   const response = await client.request('/api/session/' + binding.sessionID);
   const session = response?.data;
   need(session?.id === binding.sessionID && session.model?.providerID === MODEL.providerID && session.model?.id === MODEL.id, 'Wrong session/model');
-  if (binding.adoption) need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
-    (session.model.variant ?? null) === binding.adoption.variant, 'Adopted session model options changed');
+  if (binding.adoption || binding.modelSelection) need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
+    (session.model.variant ?? null) === (binding.modelSelection ? EXECUTOR_MODEL.variant : binding.adoption.variant),
+  'Adopted session model options changed');
   need(typeof session.location?.directory === 'string' && realpathSync(session.location.directory) === binding.workspace &&
     realpathSync(binding.workspace) === binding.workspace && realpathSync(binding.checkout) === binding.checkout &&
     identity(binding.workspace) === binding.workspaceID && identity(binding.checkout) === binding.checkoutID, 'Session physical directory mismatch');
@@ -478,17 +576,18 @@ async function checkedClosureBoundary(client, stateRoot, binding, requireSuccess
   const shells = await projectShells(client, binding);
   const withEvidence = withShellEvidence(stateRoot, binding);
   const review = requireSuccess && !invocationCheck?.lostCalls;
-  const delivered = deliveredBoundary(binding, messages, current.session, review);
+  const prepared = preparedHistory(binding, messages, current.session);
+  const delivered = deliveredBoundary(binding, prepared.messages, prepared.session, review);
   if (review) {
-    completion(inspectMessages(withEvidence, delivered.exchange), current.session, shells, invocationCheck);
-  } else closureBoundary(withEvidence, messages, current.session, shells, invocationCheck, delivered);
+    completion(inspectMessages(withEvidence, delivered.exchange), prepared.session, shells, invocationCheck);
+  } else closureBoundary(withEvidence, prepared.messages, prepared.session, shells, invocationCheck, delivered);
   const receipt = reviewReceipt(stateRoot, binding, delivered.exchange);
   const confirmed = await observationSnapshot(client, binding);
   need(quiet(confirmed) && sessionAvailable(confirmed.session) && confirmed.session.outcome === current.session.outcome &&
     JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
     JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model), 'Session changed during closure verification');
   await confirmHistoryAndShells(client, binding, messages, shells);
-  return { boundary: delivered.boundary, receipt, verified };
+  return { boundary: delivered.boundary, receipt, verified, history: fingerprint(messages) };
 }
 
 function checkTransitionSource(binding, ctx, stateRoot, movedPlanPath) {
@@ -578,7 +677,7 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
         need(realpathSync(binding.planPath) === binding.planPath && statSync(binding.planPath).isFile() &&
           inside(binding.workspace, binding.planPath), 'Saved plan identity changed');
         const [session, active, forms, permissions, shells] = await Promise.all([
-          matchingSession(client, binding), client.request('/api/session/active'),
+          matchingSession(client, preparedBinding(stateRoot, binding)), client.request('/api/session/active'),
           client.request('/api/session/' + binding.sessionID + '/form'),
           client.request('/api/session/' + binding.sessionID + '/permission'),
           client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace)),
@@ -759,7 +858,9 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   const proposedRoute = explicitSavedPair ? 'reuse-saved-pair' : explicitSession ? 'adopt-existing' : savedBinding ? 'reuse-saved-pair' :
     state && hasChatID ? 'new-bind' : 'unknown';
   const selectedSessionID = explicitSession ? sessionID : savedBinding?.sessionID;
-  const candidateBinding = savedBinding && savedBinding.sessionID === selectedSessionID ? savedBinding : undefined;
+  let candidateBinding = savedBinding && savedBinding.sessionID === selectedSessionID ? savedBinding : undefined;
+  try { candidateBinding = preparedBinding(stateRoot, candidateBinding); }
+  catch (error) { add('session-preparation', 'blocked', error.message); }
   const sameSavedWorkspace = binding => !!ctx && binding.workspace === ctx.workspace &&
     binding.workspaceID === ctx.workspaceID && binding.checkout === ctx.checkout &&
     binding.checkoutID === ctx.checkoutID;
@@ -875,8 +976,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       validSelectedID ? capture(client.request('/api/session/' + selectedSessionID)) : Promise.resolve(null),
       validSelectedID ? capture(client.request('/api/session/' + selectedSessionID + '/form')) : Promise.resolve(null),
       validSelectedID ? capture(client.request('/api/session/' + selectedSessionID + '/permission')) : Promise.resolve(null),
-      validSelectedID ? capture(candidateBinding?.assignmentID ?
-        assignmentMessages(client, candidateBinding) : recentSessionMessages(client, selectedSessionID)) : Promise.resolve(null),
+      validSelectedID ? capture(preparedMessages(client, candidateBinding, selectedSessionID)) : Promise.resolve(null),
     ]);
     const [activeResult, shellsResult, sessionResult, formsResult, permissionsResult, historyResult] = probes;
     let liveSession;
@@ -893,7 +993,8 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
             'Candidate model: ' + MODEL.providerID + '/' + MODEL.id : 'Candidate uses an unsupported provider/model; no fallback');
         if (model && Object.keys(model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
           (model.variant === undefined || text(model.variant) && model.variant.length <= 80) &&
-          (!candidateBinding?.adoption || (model.variant ?? null) === candidateBinding.adoption.variant)) {
+          (candidateBinding?.modelSelection ? model.variant === EXECUTOR_MODEL.variant :
+            !candidateBinding?.adoption || (model.variant ?? null) === candidateBinding.adoption.variant)) {
           add('session-options', 'pass', 'Candidate model options are supported and match any saved adoption boundary');
         } else add('session-options', 'blocked', 'Candidate model options are unsupported or changed from the saved boundary');
         if (sessionAvailable(liveSession)) {
@@ -931,8 +1032,8 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       } else {
         const shells = shellsResult.value;
         try {
-          const messages = historyResult.value;
-          need(Array.isArray(messages), 'Unknown candidate history');
+          need(Array.isArray(historyResult.value), 'Unknown candidate history');
+          const { messages, session } = preparedHistory(candidateBinding, historyResult.value, liveSession);
           if (candidateBinding?.assignmentID) {
             const closed = preparedTransition(stateRoot, candidateBinding) ??
               (candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment === 'correction' &&
@@ -942,9 +1043,9 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
               candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment;
             if (closed || completed) {
               const review = !closed || closed.disposition === 'accepted';
-              const delivered = deliveredBoundary(candidateBinding, messages, liveSession, review);
-              if (review) completion(inspectMessages(boundHistory, delivered.exchange), liveSession, shells);
-              else closureBoundary(boundHistory, messages, liveSession, shells, undefined, delivered);
+              const delivered = deliveredBoundary(candidateBinding, messages, session, review);
+              if (review) completion(inspectMessages(boundHistory, delivered.exchange), session, shells);
+              else closureBoundary(boundHistory, messages, session, shells, undefined, delivered);
               reviewReceipt(stateRoot, candidateBinding, delivered.exchange);
               if (closed) need(sameBoundary(closed.boundary, delivered.boundary), 'History changed since closure; no dispatch');
             } else {
@@ -953,27 +1054,15 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
             }
             if (!closed && candidateBinding.phase === 'PREPARING' && candidateBinding.nextAssignment && candidateBinding.adoption) {
               need(sameBoundary(candidateBinding.adoption, { lastMessageID: messages.at(-1)?.id ?? null,
-                idleAt: liveSession.time?.idle ?? null, variant: liveSession.model?.variant ?? null }), 'Saved history boundary changed');
+                idleAt: session.time?.idle ?? null, variant: session.model?.variant ?? null }), 'Saved history boundary changed');
             }
-          } else if (candidateBinding?.adoption) {
-            if (messages.length) {
-              need(liveSession.outcome === 'succeeded', 'Existing history outcome is not confirmed successful');
-              const history = inspectMessages({ workspace: ctx.workspace, messageID: messages[0].id }, messages, { adopting: true });
-              need(!history.kind, 'Existing history failed or was interrupted');
-              completion(history, liveSession, shells);
-            } else need(liveSession.outcome === undefined && liveSession.time?.idle === undefined, 'Existing history/status mismatch');
-            need(candidateBinding.adoption.variant === (liveSession.model?.variant ?? null) &&
-              candidateBinding.adoption.lastMessageID === (messages.at(-1)?.id ?? null) &&
-              candidateBinding.adoption.idleAt === (liveSession.time?.idle ?? null), 'Saved adoption boundary changed');
+          } else if (candidateBinding?.adoption || candidateBinding?.reusedDelivery) {
+            const boundary = existingBoundary(stateRoot, candidateBinding, messages, session, shells);
+            if (candidateBinding.adoption) need(sameBoundary(candidateBinding.adoption, boundary), 'Saved adoption boundary changed');
           } else if (candidateBinding) {
-            need(!messages.length && liveSession.outcome === undefined && liveSession.time?.idle === undefined,
+            need(!messages.length && session.outcome === undefined && session.time?.idle === undefined,
               'Untracked history/status exists in the saved session');
-          } else if (messages.length) {
-            need(liveSession.outcome === 'succeeded', 'Existing history outcome is not confirmed successful');
-            const history = inspectMessages({ workspace: ctx.workspace, messageID: messages[0].id }, messages, { adopting: true });
-            need(!history.kind, 'Existing history failed or was interrupted');
-            completion(history, liveSession, shells);
-          } else need(liveSession.outcome === undefined && liveSession.time?.idle === undefined, 'Existing history/status mismatch');
+          } else existingBoundary(stateRoot, ctx, messages, session, shells);
           add('history', 'pass', 'Latest candidate history and completion boundary are valid');
         } catch (error) { add('history', 'blocked', error.message, false, diagnosticOf(error)); }
       }
@@ -1212,7 +1301,11 @@ export function withStateLock(stateRoot, operation) {
       try { if (existsSync(candidate)) unlinkSync(candidate); }
       catch (error) { releaseError ??= error; }
     }
-    if (!acquired) throw primary ?? stateFailure(releaseError, 'state-lock');
+    if (!acquired) {
+      const error = primary ?? stateFailure(releaseError, 'state-lock');
+      if (lastLockError?.code === 'EEXIST' && !releaseError) error.lockBusy = true;
+      throw error;
+    }
     try {
       if (releaseError) throw stateFailure(releaseError, 'state-lock');
       result = operation(readState(statePath));
@@ -1656,11 +1749,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(!current.active && !current.forms.length && !current.permissions.length && current.session.outcome === 'succeeded' &&
       current.session.time?.idle >= binding.submittedAt, 'Executor has not ended this assignment');
     const messages = await assignmentMessages(client, binding);
-    const { exchange, boundary } = deliveredBoundary(binding, messages, current.session, true);
+    const prepared = preparedHistory(binding, messages, current.session);
+    const { exchange, boundary } = deliveredBoundary(binding, prepared.messages, prepared.session, true);
     const history = inspectMessages(withShellEvidence(stateRoot, binding), exchange);
     need(!history.kind, 'Failed/interrupted assignment cannot be released');
     const shells = await projectShells(client, binding);
-    completion(history, current.session, shells, invocationCheck);
+    completion(history, prepared.session, shells, invocationCheck);
     const receipt = reviewReceipt(stateRoot, binding, exchange);
     const confirmed = await snapshot(binding);
     need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
@@ -1669,7 +1763,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model) &&
       JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during review transition');
     await confirmHistoryAndShells(client, binding, messages, shells);
-    return { boundary, receipt, available: sessionAvailable(current.session) };
+    return { boundary, receipt, available: sessionAvailable(current.session), history: fingerprint(messages) };
   }
   async function idleExisting(state, binding) {
     await idleWorkspace(state, binding);
@@ -1678,17 +1772,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(sessionAvailable(session), 'Archived/unknown existing session');
     need(Object.keys(session.model).every(key => ['providerID', 'id', 'variant'].includes(key)) &&
       (session.model.variant === undefined || text(session.model.variant) && session.model.variant.length <= 80), 'Unsupported existing model options');
-    const messages = await recentSessionMessages(client, binding.sessionID);
+    const messages = await preparedMessages(client, binding);
     const shells = await projectShells(client, binding);
     need(shellListKnown(shells) && shells.data.every(shell => shell.status !== 'running'), 'Project shell still running or unknown');
-    if (messages.length) {
-      need(session.outcome === 'succeeded', 'Existing session outcome is not confirmed successful');
-      const previous = messages[0].id === binding.messageID ? withShellEvidence(stateRoot, binding) :
-        { workspace: binding.workspace, messageID: messages[0].id };
-      const history = inspectMessages(previous, messages, { adopting: true });
-      need(!history.kind, 'Existing session failed/interrupted; no automatic recovery');
-      completion(history, session, shells);
-    } else need(session.outcome === undefined && session.time.idle === undefined, 'Existing history/status mismatch');
+    const prepared = preparedHistory(binding, messages, session);
+    const boundary = existingBoundary(stateRoot, binding, prepared.messages, prepared.session, shells);
     const lastMessageID = messages.at(-1)?.id ?? null;
     const head = await client.request(`/api/session/${binding.sessionID}/message?limit=1&order=desc`);
     need(Array.isArray(head?.data) && head.data.length === (lastMessageID === null ? 0 : 1) &&
@@ -1698,7 +1786,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       JSON.stringify(confirmed.session.time) === JSON.stringify(session.time) &&
       JSON.stringify(confirmed.session.model) === JSON.stringify(session.model), 'Existing session changed during inspection');
     await idleWorkspace(state, binding);
-    return { variant: session.model.variant ?? null, lastMessageID, idleAt: session.time.idle ?? null };
+    return { boundary, history: fingerprint(messages) };
   }
   function settleMutation(state, binding, reconciled, sessionID) {
     const mutation = binding.uncertain, rejected = binding.intent?.reject;
@@ -1730,8 +1818,19 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       head.model?.providerID === MODEL.providerID && head.model?.id === MODEL.id && head.model.variant === EXECUTOR_MODEL.variant &&
       head.previous?.providerID === MODEL.providerID && head.previous?.id === MODEL.id &&
       (head.previous.variant ?? null) === variant && Number.isSafeInteger(head.time?.created) && head.time.created >= at;
-    need(exact || !requireRecord && (head?.id ?? null) === priorID, 'No unique matching High selection at the reserved history boundary');
-    return { session: current.session, lastMessageID: head?.id ?? null };
+    const saved = preparation(stateRoot, binding), staged = saved.modelSelection;
+    need(exact || (!requireRecord || staged?.event === null && staged.history !== undefined) && (head?.id ?? null) === priorID,
+      'No unique matching High selection at the reserved history boundary');
+    const history = saved.modelBaseline ?? staged?.history;
+    const proof = { head: priorID, variant, idleAt, intentAt: at, event: exact ? fingerprint(head) : null,
+      ...(history === undefined ? {} : { history }) };
+    need(!staged || isDeepStrictEqual(staged, proof), 'Confirmed High selection evidence changed');
+    if (history !== undefined) {
+      const prepared = { ...binding, modelSelection: proof };
+      const messages = await preparedMessages(client, prepared);
+      preparedHistory(prepared, messages, current.session);
+    }
+    return { session: current.session, proof };
   }
   return {
     statePath,
@@ -1784,10 +1883,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             need(createHash('sha256').update(messages[0].text).digest('hex') === expected.intent.promptHash &&
               messages.slice(1).every(message => message.type !== 'user'), 'Reserved prompt or delivery boundary changed');
           } else if (expected.uncertain === 'model') {
-            const { lastMessageID } = await verifyModelChange(expected, true);
+            const { proof } = await verifyModelChange(expected, true);
             await requireQuietShells(client, ctx);
             return commit(expected, (state, binding) => {
-              if (binding.adoption) Object.assign(binding.adoption, { variant: EXECUTOR_MODEL.variant, lastMessageID });
+              savePreparation(stateRoot, binding, { reusedDelivery: preparation(stateRoot, binding).reusedDelivery, modelSelection: proof });
               delete binding.uncertain; delete binding.intent; delete binding.stopReason; delete binding.diagnostic;
               binding.phase = 'PREPARING';
               return { ...summary(state, binding, 'mutation-reconciled'), mutation: 'model', taskSent: false };
@@ -2542,7 +2641,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (start.existing) {
               if (start.expected.phase === 'FINISHED') await reviewedResult(start.expected);
               else {
-                const current = await idleExisting(start.state, start.expected);
+                const { boundary: current } = await idleExisting(start.state, preparedBinding(stateRoot, start.expected));
                 if (start.expected.adoption) need(['variant', 'lastMessageID', 'idleAt'].every(key => current[key] === start.expected.adoption[key]),
                   'Existing session changed since preparation; no dispatch');
               }
@@ -2553,7 +2652,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               });
             }
             const binding = { codexChat: chatID, ...start.ctx, engineID: client.engineID, sessionID, phase: 'PREPARING' };
-            binding.adoption = await idleExisting(start.state, binding);
+            ({ boundary: binding.adoption } = await idleExisting(start.state, binding));
             return locked(state => {
               need(!state.bindings.some(item => item.codexChat === chatID), 'Binding appeared during adoption; no takeover');
               need(!state.bindings.some(item => item.engineID === client.engineID && item.sessionID === sessionID),
@@ -2630,7 +2729,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       return withOwnership(start.lease, async () => {
         if (start.expected && !start.planSwitch) {
           try {
-            await sessionMatches(start.expected);
+            await sessionMatches(preparedBinding(stateRoot, start.expected));
             await noForms(start.expected);
           } catch (error) { throw error; }
           return locked(state => {
@@ -2646,10 +2745,14 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (!available) return rejectedOutcome(start.expected, new Error(unavailableForDispatch));
             return commit(start.expected, (state, binding) => {
               saveReviewReceipt(stateRoot, binding, receipt);
+              if (!readAcceptance(stateRoot, binding)) recordAcceptance(stateRoot, state, binding);
+              const { assignmentID, messageID, submittedAt, planPath } = binding;
+              const reusedDelivery = { assignmentID, messageID, submittedAt, planPath, boundary };
               if (binding.adoption) Object.assign(binding.adoption, boundary);
               planCounter(state, ctx, importedCount);
               binding.planPath = ctx.planPath; binding.phase = 'PREPARING';
               for (const key of ['assignmentID', 'messageID', 'submittedAt', 'nextAssignment']) delete binding[key];
+              savePreparation(stateRoot, binding, { reusedDelivery });
               return summary(state, binding, 'reused-plan');
             }).result;
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
@@ -2797,28 +2900,35 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       });
       if (start.outcome) return start.outcome;
       return withOwnership(start.lease, async () => {
-        const adoption = start.expected.adoption;
+        let prepared = preparedBinding(stateRoot, start.expected);
+        const adoption = prepared.adoption;
         let priorBoundary = start.closed?.boundary ?? adoption;
-        let priorReceipt;
+        let priorReceipt, modelBaseline = fingerprint([]);
         if (start.closed) {
-          const { boundary, receipt } = await checkedClosureBoundary(client, stateRoot, start.expected, start.closed.disposition === 'accepted');
+          const { boundary, receipt, history } = await checkedClosureBoundary(client, stateRoot, prepared, start.closed.disposition === 'accepted');
           need(sameBoundary(start.closed.boundary, boundary),
             'History changed since closure; no dispatch');
           priorReceipt = receipt;
+          modelBaseline = history;
         } else if (start.expected.assignmentID) {
-          const { boundary, receipt } = await reviewedResult(start.expected);
+          const { boundary, receipt, history } = await reviewedResult(prepared);
           if (adoption) need(sameBoundary(adoption, boundary), 'Existing session changed since preparation; no dispatch');
           priorBoundary = boundary;
           priorReceipt = receipt;
-        } else if (adoption) {
-          const current = await idleExisting(start.state, start.expected);
-          need(sameBoundary(adoption, current), 'Existing session changed since preparation; no dispatch');
+          modelBaseline = history;
+        } else if (adoption || prepared.reusedDelivery) {
+          const { boundary: current, history } = await idleExisting(start.state, prepared);
+          if (adoption) need(sameBoundary(adoption, current), 'Existing session changed since preparation; no dispatch');
+          priorBoundary = current;
+          modelBaseline = history;
         }
-        const session = await sessionMatches(start.expected);
+        let session = await sessionMatches(prepared);
         need(sessionAvailable(session), unavailableForDispatch);
         await noForms(start.expected);
         await idleWorkspace(start.state, ctx);
         await requireQuietShells(client, ctx);
+        if (!priorBoundary || priorBoundary.lastMessageID === null) need(session.outcome === undefined && session.time?.idle === undefined,
+          'Untracked history/status exists in the saved session');
         if (session.model.variant !== EXECUTOR_MODEL.variant) {
           const sessionRoute = '/api/session/' + session.id;
           const before = await client.request(sessionRoute + '/message?limit=1&order=desc');
@@ -2826,6 +2936,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           need(Array.isArray(before?.data) && before.data.length === (priorID === null ? 0 : 1) &&
             (before.data[0]?.id ?? null) === priorID, 'History changed before High selection');
           const reserved = commit(start.expected, (_state, binding) => {
+            savePreparation(stateRoot, binding, { reusedDelivery: prepared.reusedDelivery, modelBaseline });
             binding.phase = 'STOPPED'; binding.uncertain = 'model';
             binding.intent = { head: priorID, variant: session.model.variant ?? null, idleAt: session.time?.idle ?? null, at: Date.now() };
           }).expected;
@@ -2856,9 +2967,17 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           await idleWorkspace(start.state, ctx);
           await requireQuietShells(client, ctx);
           start.expected = commit(reserved, (_state, binding) => {
+            savePreparation(stateRoot, binding, { reusedDelivery: prepared.reusedDelivery, modelSelection: confirmed.proof });
             delete binding.uncertain; delete binding.intent;
             binding.phase = 'PREPARING';
           }).expected;
+          prepared = { ...prepared, modelSelection: confirmed.proof };
+          session = confirmed.session;
+        }
+        if (!priorBoundary || priorBoundary.lastMessageID === null) {
+          const head = await client.request(`/api/session/${session.id}/message?limit=2&order=desc`);
+          need(Array.isArray(head?.data) && head.data.length <= 1 &&
+            !preparedHistory(prepared, head.data, session).messages.length, 'Untracked history/status exists in the saved session');
         }
         let reservationAttempted = false, reservationExpected, reserved;
         const prompt = 'Assignment ID: ' + assignmentID + '\nCanonical plan: ' + JSON.stringify(ctx.planPath) +

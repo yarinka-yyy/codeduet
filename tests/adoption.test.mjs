@@ -31,6 +31,79 @@ const submitArgs = (f, id = 'adopted-correction', kind = 'correction') => ['subm
   '--kind', kind, '--non-git-baseline', baseline];
 const waitArgs = f => ['wait', f.workspace, f.plan, '--timeout-ms', '3000', '--non-git-baseline', baseline];
 
+for (const route of ['adopted history', 'adopted empty', 'ordinary empty']) test(`reconciled High can dispatch from ${route}`, async t => {
+  const f = await fixture(t, undefined, '2.2.6'), args = ['--non-git-baseline', baseline];
+  let session;
+  if (route === 'ordinary empty') {
+    const pair = await f.call(f.bindArgs(0));
+    assert.equal(pair.status, 0);
+    session = f.sessions.get(pair.result.sessionID);
+    session.model = { ...session.model, variant: 'low' };
+  } else {
+    session = seed(f, 'ses_existing', 'Prior work', route === 'adopted empty');
+    assert.equal((await f.call(adoptArgs(f, session.id, 0))).status, 0);
+  }
+  const submit = submitArgs(f, 'after-reconcile', 'initial');
+  const messageRoute = `/api/session/${session.id}/message?limit=2&order=desc`;
+  f.rejectRequest = (method, path) => method === 'GET' && path === messageRoute ? { _tag: 'InvalidRequestError' } : undefined;
+  assert.equal((await f.call(submit)).result.phase, 'STOPPED');
+  f.rejectRequest = undefined;
+  const reconciled = await f.call(['reconcile', f.workspace, f.plan, ...args]);
+  assert.equal(reconciled.result.kind, 'mutation-reconciled', JSON.stringify(reconciled.result));
+  assert.equal(reconciled.result.correctionCount, 0);
+  const history = f.messages.get(session.id), tail = history.at(-1);
+  const previous = tail.previous;
+  tail.previous = { ...previous, variant: 'another-variant' };
+  assert.equal((await f.call(submit)).status, 1);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 0);
+  tail.previous = previous;
+  const preview = await f.call(['preflight', f.workspace, f.plan, ...args]);
+  assert.equal(preview.status, 0, JSON.stringify(preview.result.checks));
+  const { command, args: nextArgs } = preview.result.nextCommand;
+  assert.equal((await f.call([command, ...nextArgs])).result.kind, 'reused');
+  assert.equal((await f.call(['inspect', f.workspace])).result.live.verified, true);
+  assert.equal((await f.call(submit)).result.kind, 'admitted');
+  f.finish(session.id);
+  assert.equal((await f.call(waitArgs(f))).result.kind, 'completed-for-review');
+  assert.equal((await f.call(['finish', f.workspace, f.plan, ...args])).result.phase, 'FINISHED');
+  assert.equal(f.posts(`/api/session/${session.id}/model`), 1);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
+  assert.equal(f.state().plans[0].correctionCount, 0);
+});
+
+test('reconcile retains the verified history after its state save is interrupted', async t => {
+  const f = await fixture(t), session = seed(f), stateRoot = dirname(f.statePath);
+  const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+  const adapter = helper(client, { stateRoot, chatID: 'offline-http-chat-A' });
+  const reconcile = () => adapter.reconcile(f.workspace, f.plan, baseline);
+  const submit = () => adapter.submit(f.workspace, f.plan, 'after-save', f.packet, baseline);
+  assert.equal((await adapter.adopt(f.workspace, f.plan, session.id, baseline, 0)).kind, 'adopted');
+  f.rejectRequest = (method, path) => method === 'GET' && path.endsWith('/message?limit=2&order=desc') ?
+    { _tag: 'InvalidRequestError' } : undefined;
+  assert.equal((await submit()).phase, 'STOPPED');
+  f.rejectRequest = undefined;
+  const saved = readFileSync(f.statePath), rename = fs.renameSync;
+  const hook = t.mock.method(fs, 'renameSync', (source, target) => {
+    if (target === f.statePath) throw Object.assign(new Error('Interrupted state save'), { code: 'EIO' });
+    rename(source, target);
+  });
+  syncBuiltinESMExports();
+  try { assert.equal((await reconcile()).kind, 'rejected'); }
+  finally { hook.mock.restore(); syncBuiltinESMExports(); }
+  assert.deepEqual(readFileSync(f.statePath), saved);
+  const final = f.messages.get(session.id)[1].content[0];
+  const original = final.text;
+  final.text = 'Changed final with the same IDs and timestamps';
+  const rejected = await reconcile();
+  assert.match(rejected.error, /History or model changed/);
+  assert.deepEqual(readFileSync(f.statePath), saved);
+  final.text = original;
+  assert.equal((await reconcile()).kind, 'mutation-reconciled');
+  assert.equal((await submit()).kind, 'admitted');
+  assert.equal(f.posts(`/api/session/${session.id}/model`), 1);
+  assert.equal(f.posts(`/api/session/${session.id}/prompt`), 1);
+});
+
 test('a prepared adopted session verifies the reviewed exchange before its next prompt', async t => {
   const f = await fixture(t), session = seed(f);
   assert.equal((await f.call(adoptArgs(f, session.id, 0))).status, 0);

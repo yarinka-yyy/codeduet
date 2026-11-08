@@ -503,8 +503,9 @@ const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bsaps\b|\bnohup\b|
 function detachedReason(command, maskInvocationCalls, postgresRecovery) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
   const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
+  const literalSearch = /^[ \t]*rg[ \t]+-n[ \t]+"[\w.:][\w .:-]*"(?:[ \t]+[\w.\\/][\w.\\/:-]*)+[ \t]*$/i;
   // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
-  const launcherSource = outputData.test(command) ? '' : (postgresRecovery ?
+  const launcherSource = outputData.test(command) || literalSearch.test(command) ? '' : (postgresRecovery ?
     command.replace(/^[ \t]*"--- pg_ctl start log ---"[ \t]*\r?$/gm, '') : command).replace(
     /^([ \t]*rg[ \t]+-n[ \t]+)'[\w .:-]*(\|[\w:.-]+(?:\|[\w:.-]+)*)?'(?=[ \t])/i,
     (pattern, prefix, alternatives) => detachedLauncher.test(alternatives ?? '') ? pattern : prefix + 'quoted');

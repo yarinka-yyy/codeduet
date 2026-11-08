@@ -178,6 +178,19 @@ execution. It reuses the same session only in the same physical workspace;
 each plan retains its own counter. Changing workspace requires a fresh actual
 Codex chat/pair, not silent reassociation.
 
+When bind prepares a released session for another plan, it saves the exact
+accepted delivery and review boundary. Preflight and submit check them again.
+A fresh pair must still be empty. An older preparation without this evidence
+cannot authorize an untracked exchange. Once the old checkout is quiet, use
+preflight and bind in a fresh chat for the authorized next assignment. Continue
+with the existing plan counter. Do not run start-cycle or clear the old binding.
+
+After a confirmed High selection, preparation records preserve the verified
+previous boundary and the exact change. Reconcile uses that evidence to leave
+the same session ready for one prompt. An unrelated history or model change
+still blocks dispatch. Preparation records are separate from state.json so
+older running observers can still read the store.
+
 Before submit, the helper verifies session/model/directory, forms, saved phase,
 and all active session directory metadata. An active session anywhere within
 the same Git checkout (including sibling subdirectories) blocks another writer;

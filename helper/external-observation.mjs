@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { isDeepStrictEqual } from 'node:util';
 import { requireValue as need, diagnose } from './connection.mjs';
-import { observationContext, observationSnapshot, planIdentity, projectShells, readState } from './binding.mjs';
+import { observationContext, observationSnapshot, planIdentity, projectShells, readState, sameProjectShells } from './binding.mjs';
 import { recentSessionMessages, inspectMessages, interactive, completion, observationWake } from './interaction.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -83,7 +82,7 @@ export async function externalOutcome(client, stateRoot, pin) {
   externalUnchanged(pin, stateRoot);
   need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
     confirmed.session.outcome === 'succeeded' && JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
-    hash(JSON.stringify(latest)) === hash(JSON.stringify(messages)) && isDeepStrictEqual(latestShells, shells),
+    hash(JSON.stringify(latest)) === hash(JSON.stringify(messages)) && sameProjectShells(latestShells, shells),
   'Execution changed during completion confirmation');
   return outcome('external-completed', { result: result.result });
 }

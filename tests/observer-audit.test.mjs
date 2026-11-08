@@ -5,7 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
-import { helper } from '../helper/binding.mjs';
+import { helper, projectShells } from '../helper/binding.mjs';
 import { observer } from '../helper/observer.mjs';
 import { selectExternal, externalOutcome } from '../helper/external-observation.mjs';
 
@@ -111,6 +111,35 @@ test('ordinary wait rejects unknown activity and does not claim readiness', asyn
   const f = await setup(t); f.active[f.sessionID] = { type: 'unknown' };
   const outcome = await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true });
   assert.equal(outcome.phase, 'STOPPED'); assert.match(outcome.error, /Unknown active/);
+});
+
+for (const external of [false, true]) test(`shell list order alone does not stop ${external ? 'passive' : 'bound'} review`, async t => {
+  const f = await setup(t, external), armed = await f.arm();
+  const at = Date.now();
+  f.shells = ['sh_previousA', 'sh_previousB'].map(id => ({ id, status: 'exited', exit: 0,
+    command: 'Get-Date', time: { started: at - 2, completed: at - 1 } }));
+  let reads = 0;
+  f.onRequest = route => {
+    if (route.startsWith('/api/shell?')) { f.shells.reverse(); reads++; }
+  };
+  f.finish(f.sessionID);
+  await f.end();
+  assert.equal(f.sent.length, 1);
+  const consumed = await f.o.consume(armed.id);
+  assert.ok(reads >= 4);
+  assert.equal(consumed.kind, external ? 'external-completed' : 'completed-for-review');
+  assert.equal(f.posts(`/api/session/${f.sessionID}/prompt`), external ? 0 : 1);
+});
+
+test('the same shell in both scopes is valid, a duplicate within either scope is ambiguous', async () => {
+  const shell = { id: 'sh_once', status: 'exited', time: { completed: 1 } };
+  const scope = { workspace: 'sub', checkout: 'root' };
+  let root = [shell];
+  const client = { request: async route => ({ data: route.endsWith('root') ? root : [shell] }) };
+  assert.deepEqual((await projectShells(client, scope)).data, [shell]);
+  root = [shell, shell];
+  assert.equal((await projectShells(client, scope)).data, null);
+  assert.equal((await projectShells(client, { workspace: 'root' })).data, null);
 });
 
 test('ordinary wait preserves concurrently changed count and does not write a stale phase', async t => {

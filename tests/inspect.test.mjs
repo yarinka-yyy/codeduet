@@ -154,11 +154,12 @@ test('missing registration does not discard local binding or create a lock', asy
 test('inspect during a real CLI wait does not steal its lock or poll history', async t => {
   const f = await fixture(t), bound = await f.call(f.bindArgs(0));
   await f.call(['submit', f.workspace, f.plan, 'initial', f.packet, '--non-git-baseline', baseline]);
+  const from = f.calls.length;
   const waiting = f.call(['wait', f.workspace, f.plan, '--non-git-baseline', baseline, '--timeout-ms', '3000']);
   try {
     const deadline = Date.now() + 2000;
-    while (!f.calls.some(call => call.route.includes('/message?')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
-    const before = readFileSync(f.statePath), historyBefore = f.calls.filter(call => call.route.includes('/message?')).length;
+    while (!f.calls.slice(from).some(call => call.route.includes('/message?')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    const before = readFileSync(f.statePath), historyBefore = f.calls.slice(from).filter(call => call.route.includes('/message?')).length;
     assert.equal(historyBefore, 1);
     const outcome = await f.call(['inspect', f.workspace]);
     assert.equal(outcome.result.live.active, true); assert.equal(outcome.result.stateLocked, false);
@@ -167,7 +168,7 @@ test('inspect during a real CLI wait does not steal its lock or poll history', a
     assert.deepEqual(readFileSync(f.statePath), before);
     assert.ok(!existsSync(join(dirname(f.statePath), 'state.lock')));
     assert.ok(readdirSync(join(dirname(f.statePath), 'ownership')).length > 0);
-    assert.equal(f.calls.filter(call => call.route.includes('/message?')).length, historyBefore);
+    assert.equal(f.calls.slice(from).filter(call => call.route.includes('/message?')).length, historyBefore);
   } finally {
     f.finish(bound.result.sessionID);
     assert.equal((await waiting).result.kind, 'completed-for-review');

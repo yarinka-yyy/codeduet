@@ -162,6 +162,7 @@ for (const command of [
   "$env:GOTOOLCHAIN='local'\r\n  & $go version\r\n& $node --version",
   "$nodeDir='C:/fixture'\n& (Join-Path $nodeDir 'npm.cmd') --version",
   "Write-Output 'start verification'",
+  'rg -n "start" plans',
   'Write-Output ok # Start-Job is forbidden',
   'printf ok && npm test 2>&1',
 ]) test('foreground shell syntax does not become background: ' + command, () => {
@@ -186,6 +187,11 @@ for (const [command, reason] of [
   ['python -c "subprocess.Popen(PRIVATE_INPUT)"', 'popen'],
   ['Write-Output "$(Start-Job { build })"', 'start-job'],
   ['cmd /c "start tool.exe"', 'start'],
+  ['rg -n "start" plans; Start-Job { Get-Date }', 'start'],
+  ['rg -n "start" plans\n& (\'Start-\' + \'Job\') { Get-Date }', 'start'],
+  ['rg -n "start" plans; set"si"d -f sleep 10', 'start'],
+  ['rg -n "start" plans &', 'start'],
+  ['rg -n "start" --pre=tool plans', 'start'],
 ]) test('redirection or invocation normalization cannot hide detached work: ' + reason, () => {
   for (const check of checkShell(command)) assert.throws(check, error => {
     assert.match(error.message, /Detached command status unknown.*call_shell_check/);

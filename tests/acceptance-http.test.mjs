@@ -4,6 +4,21 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { baseline, fixture, model } from './http-fixture.mjs';
 
+test('submit rechecks a fresh pair if a manual exchange followed preflight', async t => {
+  const f = await fixture(t, undefined, '2.2.6');
+  const { result: { sessionID } } = await f.call(f.bindArgs(0));
+  const args = ['--non-git-baseline', baseline];
+  assert.equal((await f.call(['preflight', f.workspace, f.plan, ...args])).status, 0);
+  f.messages.get(sessionID).push({ id: 'msg_manual', type: 'user', text: 'Untracked work' });
+  f.finish(sessionID);
+  const saved = readFileSync(f.statePath);
+  const outcome = await f.call(['submit', f.workspace, f.plan, 'first', f.packet, ...args]);
+  assert.equal(outcome.status, 1);
+  assert.match(outcome.result.error, /Untracked history/);
+  assert.deepEqual(readFileSync(f.statePath), saved);
+  assert.equal(f.posts(`/api/session/${sessionID}/prompt`), 0);
+});
+
 test('native CLI reads a long history and reports an incomplete HTTP body as a read failure', async t => {
   const f = await fixture(t, undefined, '2.2.5');
   const { status, result: { sessionID } } = await f.call(f.bindArgs(0));

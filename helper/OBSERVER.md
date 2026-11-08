@@ -40,6 +40,12 @@ outcome. The worker queues a wake hint only after arm has handed off to the
 background. Startup errors remain observer-start-failed.
 Do not call status/wait periodically; no GPT work is needed until a wake hint.
 If startup is unconfirmed, inspect this receipt, never start another observer.
+Handoff and notification briefly wait for a busy state lock. A failed handoff
+returns its receipt and leaves the current turn active. If status shows a
+result and notification not-sent with reason state-lock-busy, use consume with
+that receipt when the lock is free. The worker saved the result before trying
+to queue a notification. A notification that was attempted remains at most one
+attempt, even when its acknowledgement is unavailable.
 
 For a STOPPED delivered assignment, only an explicit human request to resume
 observation permits adding **--resume** to arm. It uses the existing resume-watch

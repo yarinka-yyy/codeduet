@@ -66,7 +66,10 @@ function engine() {
       if (route.endsWith('/reply')) { this.forms[id] = []; return; }
       if (route.endsWith('/form')) return { data: structuredClone(this.forms[id] ?? []) };
       if (route.endsWith('/permission')) return { data: structuredClone(this.permissions[id] ?? []) };
-      if (route.includes('/message?')) return { data: structuredClone(timelines.get(id)).reverse(), cursor: {} };
+      if (route.includes('/message?')) {
+        const limit = Number(new URLSearchParams(route.split('?')[1]).get('limit') ?? 100);
+        return { data: structuredClone(timelines.get(id)).reverse().slice(0, limit), cursor: {} };
+      }
       if (route.startsWith('/api/shell?')) return { data: [] };
       if (route === '/api/session/' + id) return { data: structuredClone(sessions.get(id)) };
       throw new Error('Unexpected offline route');

@@ -14,6 +14,16 @@ import { packageFiles, packageSkill } from '../tools/package.mjs';
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const delay = ms => new Promise(done => setTimeout(done, ms));
+async function observerLock(stateRoot, operation) {
+  const end = Date.now() + 2500;
+  while (true) {
+    try { return withStateLock(stateRoot, operation); }
+    catch (error) {
+      if (!error.lockBusy || Date.now() >= end) throw error;
+      await delay(100);
+    }
+  }
+}
 const pins = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath',
   'engineID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt', 'correctionCount'];
 function put(path, value) {
@@ -162,15 +172,28 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       }
       const end = Date.now() + 90000;
       while (Date.now() < end) {
-        if (existsSync(join(dir, 'ready.json')) || existsSync(join(dir, 'result.json'))) {
-          const snapshot = withStateLock(stateRoot, () => {
-            const current = status(id);
-            if (!current.result) put(join(dir, 'handoff.json'), { at: Date.now() });
-            return current;
-          });
-          return { ...snapshot, kind: snapshot.result ? snapshot.result.kind === 'observer-error' ? 'observer-start-failed' : 'observer-terminal' : 'observer-armed',
-            observerState: snapshot.result ? 'ended' : 'watching', consumeRequired: !!snapshot.result,
-            endTurn: !snapshot.result };
+        if (['ready.json', 'result.json', 'exited.json'].some(name => existsSync(join(dir, name)))) {
+          let snapshot;
+          try {
+            snapshot = await observerLock(stateRoot, () => {
+              const current = status(id);
+              if (!current.result && !current.cancelled && !current.exited) {
+                need(existsSync(active) && get(active).id === id, 'Observer slot changed before handoff');
+                same(receipt(id));
+                put(join(dir, 'handoff.json'), { at: Date.now() });
+              }
+              return current;
+            });
+          } catch (error) {
+            if (!error.lockBusy) throw error;
+            snapshot = status(id);
+            return { ...snapshot, kind: 'observer-start-failed', diagnostic: error.diagnostic,
+              consumeRequired: !!snapshot.result && !snapshot.cancelled, endTurn: false };
+          }
+          const failed = snapshot.cancelled || snapshot.exited && !snapshot.result || snapshot.result?.kind === 'observer-error';
+          return { ...snapshot, kind: failed ? 'observer-start-failed' : snapshot.result ? 'observer-terminal' : 'observer-armed',
+            observerState: snapshot.result || snapshot.exited ? 'ended' : 'watching',
+            consumeRequired: !!snapshot.result && !snapshot.cancelled, endTurn: !failed && !snapshot.result };
         }
         await delay(100);
       }
@@ -216,14 +239,14 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       clearInterval(timer); for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.off(name, interrupt);
     }
     try {
-      const notify = withStateLock(stateRoot, () => {
+      put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
+        ...(result.result?.shellOutcomes?.length ? { shellOutcomes: result.result.shellOutcomes } : {}),
+        ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
+        ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
+        ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
+      const notify = await observerLock(stateRoot, () => {
         need(get(active).id === id, 'Observer slot changed');
         if (value.mode === 'external') need(get(externalSlot(value)).id === id, 'External observer slot changed');
-        put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
-          ...(result.result?.shellOutcomes?.length ? { shellOutcomes: result.result.shellOutcomes } : {}),
-          ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
-          ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
-          ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
         // Before handoff the arming turn receives the result directly.
         if (!existsSync(join(dir, 'handoff.json')) || existsSync(join(dir, 'cancel.json'))) return false;
         put(join(dir, 'notify-attempt.json'), { at: Date.now() }); return true;
@@ -235,6 +258,9 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         need(['sent', 'uncertain', 'not-sent'].includes(notification?.status), 'Unknown queue result');
         put(join(dir, 'notify-result.json'), notification);
       }
+    } catch (error) {
+      if (!error.lockBusy) throw error;
+      put(join(dir, 'notify-result.json'), { status: 'not-sent', reason: 'state-lock-busy' });
     } finally { put(join(dir, 'exited.json'), { at: Date.now() }); }
   }
   async function consume(id) {

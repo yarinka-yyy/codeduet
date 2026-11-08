@@ -185,6 +185,25 @@ test('restoring High cannot dispatch against an exchange modified during model s
   assert.equal(f.state().bindings[0].phase, 'PREPARING');
 });
 
+test('reconciled High preserves the prepared transition boundary', async t => {
+  const f = await artex(t), session = f.sessions.get(f.sessionID), previous = session.model;
+  session.model = { ...previous, variant: 'low' };
+  f.messages.get(f.sessionID).push({ id: 'msg_lateLow', type: 'model-switched', previous, model: session.model,
+    time: { created: session.time.idle + 1 } });
+  assert.equal((await f.call(f.transition, newChat)).status, 0);
+  f.rejectRequest = (method, route) => method === 'GET' && route.endsWith('/message?limit=2&order=desc') ?
+    { _tag: 'InvalidRequestError' } : undefined;
+  assert.equal((await f.call(f.submit, newChat)).result.phase, 'STOPPED');
+  f.rejectRequest = undefined;
+  const result = await f.call(['reconcile', f.workspace, f.target, ...baselineArgs], newChat);
+  assert.equal(result.result.kind, 'mutation-reconciled', JSON.stringify(result.result));
+  assert.equal((await f.call(f.preflight, newChat)).status, 0);
+  assert.equal((await f.call(f.submit, newChat)).result.kind, 'admitted');
+  assert.equal(f.posts(f.prompt), 2);
+  assert.equal(f.posts(`/api/session/${f.sessionID}/model`), 1);
+  assert.equal(f.state().plans.find(plan => plan.planPath === f.plan).correctionCount, 6);
+});
+
 for (const action of ['finish', 'transition']) {
   test(action + ' refuses a replaced reviewed result with unchanged IDs and timestamps', async t => {
     const f = await artex(t);

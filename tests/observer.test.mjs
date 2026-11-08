@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
 import { helper } from '../helper/binding.mjs';
 import { observer, wakeHint } from '../helper/observer.mjs';
+import { processOwner } from '../helper/process-owner.mjs';
 import { fileURLToPath } from 'node:url';
 
 const chatID = '00000000-0000-4000-8000-000000000017';
@@ -61,6 +65,69 @@ test('completion available during arm goes to that turn without a second wake', 
   assert.equal((await f.o.consume(terminal.id)).kind, 'completed-for-review');
   assert.equal((await f.o.consume(terminal.id)).kind, 'already-consumed');
   assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
+for (const stage of ['handoff', 'publication', 'publication timeout']) test(`temporary state lock during observer ${stage}`, async t => {
+  const f = await setup(t), beforeHandoff = stage === 'handoff', timeout = stage === 'publication timeout';
+  let armed = beforeHandoff ? null : await f.arm();
+  const lock = join(f.stateRoot, 'state.lock'), unlink = fs.unlinkSync;
+  const record = JSON.stringify({ schema: 1, token: randomUUID(), process: processOwner() });
+  let contention;
+  const hook = t.mock.method(fs, 'unlinkSync', path => {
+    unlink(path);
+    if (path !== lock || contention) return;
+    if (beforeHandoff ? !f.o.status().ready : f.state().bindings[0].phase !== 'REVIEWING' ||
+      fs.readdirSync(join(f.stateRoot, 'ownership')).length !== 0) return;
+    fs.writeFileSync(lock, record, { flag: 'wx' });
+    contention = new Promise(done => setTimeout(() => {
+      assert.equal(readFileSync(lock, 'utf8'), record);
+      unlink(lock);
+      done();
+    }, timeout ? 3500 : 450));
+  });
+  syncBuiltinESMExports();
+  try {
+    if (beforeHandoff) armed = await f.arm();
+    assert.equal(armed.kind, 'observer-armed');
+    f.finish(f.session);
+    await f.end();
+    assert.ok(contention);
+    assert.equal(f.sent.length, timeout ? 0 : 1);
+    assert.equal(f.o.status(armed.id).notification.status, timeout ? 'not-sent' : 'sent');
+    await contention;
+    const consumed = await f.o.consume(armed.id);
+    assert.equal(consumed.kind, 'completed-for-review');
+    assert.equal(consumed.correctionCount, 9);
+    assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+  } finally {
+    await contention;
+    hook.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('cancel at readiness never tells the arming turn to wait for a wake', async t => {
+  const f = await setup(t), unlink = fs.unlinkSync, lock = join(f.stateRoot, 'state.lock');
+  let cancellation;
+  const hook = t.mock.method(fs, 'unlinkSync', path => {
+    unlink(path);
+    if (path !== lock || cancellation) return;
+    const status = f.o.status();
+    if (status.ready && !status.cancelled) cancellation = Promise.resolve().then(() => f.o.cancel(status.id));
+  });
+  syncBuiltinESMExports();
+  try {
+    const outcome = await f.arm();
+    assert.equal(outcome.cancelled, true);
+    assert.equal(outcome.endTurn, false);
+    assert.equal(outcome.consumeRequired, false);
+    assert.equal((await cancellation).exited, true);
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+  } finally {
+    hook.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 for (const fault of ['history-truncated', 'bootstrap-offline']) test('a transient observation read keeps the delivery: ' + fault, async t => {

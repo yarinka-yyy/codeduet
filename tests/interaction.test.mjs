@@ -351,6 +351,7 @@ for (const failure of ['provider-limit', 'tool-error', 'interrupted', 'stream-ga
 
 test('foreign/old events and token deltas are hints only; current assignment state decides', async t => {
   const f = await setup(t);
+  const from = f.client.calls.length;
   const waiting = f.wait({ timeoutMs: 500 });
   await new Promise(resolve => setTimeout(resolve, 15));
   for (let i = 0; i < 100; i++) f.client.event('session.text.delta');
@@ -358,10 +359,10 @@ test('foreign/old events and token deltas are hints only; current assignment sta
   f.client.event('session.execution.succeeded'); // Old event: engine remains active.
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(f.state().phase, 'EXECUTING');
-  assert.equal(f.client.calls.filter(call => call.route.includes('/message?')).length, 1);
+  assert.equal(f.client.calls.slice(from).filter(call => call.route.includes('/message?')).length, 1);
   f.client.finish(); f.client.event('session.execution.succeeded');
   assert.equal((await waiting).kind, 'completed-for-review');
-  assert.equal(f.client.calls.filter(call => call.route.includes('/message?')).length, 3);
+  assert.equal(f.client.calls.slice(from).filter(call => call.route.includes('/message?')).length, 3);
   assert.equal(f.posts().length, 2);
 });
 

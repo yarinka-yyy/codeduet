@@ -602,6 +602,18 @@ test('finished saved pair preflight gives the supported bind route for a new pla
   assert.equal(state.plans.find(item => item.planPath === nextPlan).correctionCount, 0);
   assert.equal(state.bindings[0].planPath, nextPlan);
   assert.equal(f.posts('/api/session'), 1);
+  const prepared = await f.call(args);
+  assert.equal(prepared.status, 0, JSON.stringify(prepared.result.checks));
+  const history = f.messages.get(sessionID), result = history.at(-2).content[0];
+  const text = result.text;
+  result.text = 'Changed since release';
+  const submit = ['submit', f.workspace, nextPlan, 'next-plan', f.packet, '--non-git-baseline', baseline];
+  assert.equal((await f.call(submit)).status, 1);
+  assert.equal(f.calls.filter(call => call.method === 'POST').length, postsBefore);
+  result.text = text;
+  assert.equal((await f.call(submit)).result.kind, 'admitted');
+  assert.equal(f.calls.filter(call => call.method === 'POST').length, postsBefore + 1);
+  assert.equal(f.state().plans.find(item => item.planPath === nextPlan).correctionCount, 0);
 });
 
 test('adopted submit rejects a changed completed external-history boundary without POST', async t => {
