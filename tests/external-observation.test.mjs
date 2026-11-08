@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fixture, baseline, model } from './http-fixture.mjs';
@@ -78,6 +79,23 @@ test('passive observer pins a four-hour default and completes early without chan
   f.finish(sessionID); await f.end(); assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].timeoutMs, 14_400_000);
   assert.equal((await f.o.consume(armed.id)).kind, 'external-completed');
+});
+
+test('passive completion checks the parent checkout shell registry again before review', async t => {
+  const f = await setup(t);
+  execFileSync('git', ['init', '--quiet', f.root], { windowsHide: true });
+  const pin = await f.select();
+  assert.equal(pin.checkout, f.root);
+  f.finish(sessionID);
+  const rootRoute = '/api/shell?location[directory]=' + encodeURIComponent(f.root);
+  const running = { data: [{ id: 'sh_checkout', status: 'running' }] };
+  let rootReads = 0, quietFirst = false;
+  const client = { ...f.client, request: (route, ...args) => route === rootRoute ?
+    Promise.resolve(++rootReads === 1 && quietFirst ? { data: [] } : running) : f.client.request(route, ...args) };
+  await assert.rejects(externalOutcome(client, f.stateRoot, pin), /Project shell still running/);
+  rootReads = 0; quietFirst = true;
+  await assert.rejects(externalOutcome(client, f.stateRoot, pin), /Execution changed during completion confirmation/);
+  assert.equal(rootReads, 2);
 });
 
 test('one passive observer per chat/checkout, concurrent arms and cancellation send no task or hint', async t => {
@@ -256,7 +274,7 @@ for (const terminal of ['external-completed', 'failed']) test('immediate ' + ter
   assert.equal(consumed.kind, terminal); assert.equal(consumed.observerState, 'ended');
   assert.equal(consumed.executorActivity, 'idle'); assert.equal(consumed.dispatchAllowed, false);
   assert.equal(consumed.reviewAllowed, terminal === 'external-completed');
-  assert.equal(consumed.rearm, false); assert.equal(f.sent.length, 1);
+  assert.equal(consumed.rearm, false); assert.equal(f.sent.length, 0);
 });
 
 test('pending rejected edit keeps observation and question correlation; unresolved idle remains failed', async t => {

@@ -676,7 +676,8 @@ function endedShells(history, shells, closing = false, invocationCheck) {
     const tool = history.tools.find(tool => unfinished?.id && tool.state.metadata?.shellID === unfinished.id);
     throw new Error('Project shell still running or unknown (' + (tool ? 'call ' + shellEvidenceID(tool.id) : 'shell ' + shellEvidenceID(unfinished?.id)) + ')');
   }
-  const postgres = history.recoveryBinding ? verifyPostgresRecovery(history.recoveryBinding, history.tools, history.idle?.time?.created) : new Map();
+  const postgres = history.recoveryBinding ?
+    verifyPostgresRecovery(history.recoveryBinding, history.tools, history.idle?.time?.created, undefined, history.backgroundShells) : new Map();
   // A completed launcher alone cannot certify a detached process.
   for (const tool of history.tools) {
     const input = tool.state.input ?? {};

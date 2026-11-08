@@ -151,7 +151,7 @@ test('a local submit phase rejection returns its current phase and leaves the bi
   assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
 });
 
-for (const phase of ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING']) test('bootstrap failure conservatively stops ' + phase + ' and keeps the first STOPPED diagnostic', async t => {
+for (const phase of ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING']) test('bootstrap failure during ' + phase + ' preserves read-only paths and stops reply', async t => {
   const f = await fixture(t), chat = 'offline-bootstrap-' + phase.toLowerCase();
   let sessionID;
   if (phase === 'REVIEWING') sessionID = await review(f, chat);
@@ -174,7 +174,21 @@ for (const phase of ['EXECUTING', 'WAITING_FOR_ANSWER', 'REVIEWING']) test('boot
     const answer = join(f.workspace, 'answer.json'); writeFileSync(answer, JSON.stringify({ answer: { q0: 'yes' } }));
     args = ['reply', f.workspace, f.plan, 'question', 'frm_diag', answer, '--non-git-baseline', baseline];
   }
+  const before = fs.readFileSync(f.statePath);
   const stopped = await f.call(args, chat);
+  if (phase === 'EXECUTING') {
+    assert.equal(stopped.status, 1);
+    assert.equal(stopped.result.kind, 'connection-unavailable');
+    assert.equal(stopped.result.diagnostic.operation, 'server.info');
+    assert.equal(stopped.result.stateChange, 'unchanged');
+    assert.deepEqual(fs.readFileSync(f.statePath), before);
+    f.rejectRequest = null;
+    f.finish(sessionID);
+    const recovered = await f.call(args, chat);
+    assert.equal(recovered.result.kind, 'completed-for-review');
+    assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
+    return;
+  }
   if (phase === 'REVIEWING') {
     assert.equal(stopped.status, 1);
     assert.equal(stopped.result.kind, 'connection-unavailable');

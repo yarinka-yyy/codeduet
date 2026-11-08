@@ -36,7 +36,8 @@ only after the worker has reached the verified wait without a recorded terminal
 result. Give a brief waiting notice and **finish the Codex turn**.
 If the worker already ended, observer-terminal reports result.kind, endTurn:false
 and consumeRequired:true. Consume that receipt once now, then handle its fresh
-outcome; it is not an active wait. Startup errors remain observer-start-failed.
+outcome. The worker queues a wake hint only after arm has handed off to the
+background. Startup errors remain observer-start-failed.
 Do not call status/wait periodically; no GPT work is needed until a wake hint.
 If startup is unconfirmed, inspect this receipt, never start another observer.
 
@@ -44,6 +45,8 @@ For a STOPPED delivered assignment, only an explicit human request to resume
 observation permits adding **--resume** to arm. It uses the existing resume-watch
 pin/history checks. Uncertain create/submit/reply is still rejected. No task,
 count reset, replacement binding, model or executor resume command is sent.
+If the saved stop names a PostgreSQL shell call and additional evidence is
+needed, use [foreground resume-watch](PROTOCOL.md#resume-observation) in this chat.
 
 ## Observe manually started work
 
@@ -195,8 +198,9 @@ again. A changed snapshot keeps observing; it cannot end a newly resumed run.
 An old session.outcome:succeeded while
 active is running does not complete the current exchange. Error executorCheck may
 describe a fresh completed exchange, but grants neither review nor dispatch there.
-Repeated consume after success returns already-consumed with no action. If consume
-returns retryable-read, it leaves the receipt unconsumed. After the read problem
+Repeated consume after success returns already-consumed with no action. A wake
+that was already queued when the result was read manually has the same outcome.
+If consume returns retryable-read, it leaves the receipt unconsumed. After the read problem
 is resolved, use the returned manualCommand to consume the same receipt in the
 owner chat without cancelling it, rearming or resending.
 For other consume failures, inspect status and diagnose the cause. Cancel the

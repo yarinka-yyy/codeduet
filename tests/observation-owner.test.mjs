@@ -325,7 +325,7 @@ test('two concurrent recoveries and arms admit one archive and one observer only
   const f = await setup(t), run = await foreground(t, f); run.child.kill('SIGKILL'); await run.done;
   const before = readFileSync(f.statePath), from = f.calls.length;
   const results = await Promise.all([f.command(run.value.token, 'recover'), f.command(run.value.token, 'recover')]);
-  assert.equal(results.filter(value => value.result.kind === 'observation-released').length, 1);
+  assert.equal(results.filter(value => value.result.kind === 'observation-released').length, 1, JSON.stringify(results.map(x => x.result)));
   assert.deepEqual(readFileSync(f.statePath), before);
   const arms = await Promise.allSettled([f.arm(false), f.arm(false)]);
   assert.equal(arms.filter(value => value.status === 'fulfilled').length, 1);

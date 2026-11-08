@@ -639,6 +639,34 @@ test('adopted submit rejects a changed completed external-history boundary witho
   assert.deepEqual(readFileSync(f.statePath), before);
 });
 
+for (const unavailable of ['archived', 'deleted']) test('replace ' + unavailable + ' accepted session without resending', async t => {
+  const f = await fixture(t), sessionID = await finishedPair(f, 7);
+  const old = f.state().bindings[0], before = readFileSync(f.statePath);
+  const args = ['replace-finished-session', f.workspace, f.plan, old.messageID, '--session', sessionID,
+    '--unavailable', '--non-git-baseline', baseline];
+  assert.match((await f.call(args)).result.error, /still available/);
+  if (unavailable === 'archived') f.sessions.get(sessionID).time.archived = Date.now();
+  else f.sessions.delete(sessionID);
+  f.shells = [{ id: 'sh_running', status: 'running' }];
+  assert.match((await f.call(args)).result.error, /shell still running/);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  f.shells = [];
+  const preflight = await f.call(preflightArgs(f, 7));
+  assert.equal(preflight.result.status, 'blocked');
+  assert.deepEqual([preflight.result.nextCommand.command, ...preflight.result.nextCommand.args], args);
+  const replaced = await f.call(args);
+  assert.equal(replaced.status, 0, JSON.stringify(replaced.result));
+  assert.equal(replaced.result.kind, 'finished-session-replaced');
+  assert.equal(replaced.result.previous.messageID, old.messageID);
+  assert.equal(replaced.result.correctionCount, 7);
+  assert.equal(replaced.result.taskSent, false);
+  assert.notEqual(replaced.result.sessionID, sessionID);
+  assert.deepEqual(f.messages.get(replaced.result.sessionID), []);
+  assert.equal((await f.call(preflightArgs(f, 7))).result.status, 'pass');
+  assert.equal(f.posts('/api/session'), 2);
+  assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
+});
+
 test('offline preflight preserves active and STOPPED saved bindings byte-for-byte', async t => {
   const f = await fixture(t), pair = await f.call(f.bindArgs(0));
   assert.equal(pair.status, 0);

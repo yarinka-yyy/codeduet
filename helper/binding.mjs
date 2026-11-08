@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
-import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, validateDiagnostic } from './connection.mjs';
+import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, temporaryRead, validateDiagnostic } from './connection.mjs';
 import { assignmentMessages, recentSessionMessages, closureBoundary, deliveredBoundary, deliveredExchange, sessionAvailable, completion, inspectMessages, interactive, validateAnswer, observationWake, fingerprint } from './interaction.mjs';
 import { validatePostgresRecovery } from './postgres-recovery.mjs';
 import { localWindowsBootTime, processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
@@ -26,6 +26,7 @@ const fingerprintPattern = /^[a-f0-9]{64}$/;
 const leaseTokenPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const historyFingerprint = messages => createHash('sha256').update(JSON.stringify(messages)).digest('hex');
 const unavailableForDispatch = 'Archived or unavailable session; unarchive it in OpenCode and rerun preflight before dispatch';
+const archivedSession = session => session?.archived === true || Number.isFinite(session?.time?.archived);
 const shellRoute = directory => '/api/shell?location[directory]=' + encodeURIComponent(directory);
 function shellListKnown(result) {
   return Array.isArray(result?.data) && result.data.every(shell =>
@@ -33,7 +34,7 @@ function shellListKnown(result) {
     (shell.status === 'running' || Number.isFinite(shell.time?.completed)));
 }
 
-async function projectShells(client, { workspace, checkout }) {
+export async function projectShells(client, { workspace, checkout }) {
   const local = await client.request(shellRoute(workspace));
   if (!checkout || checkout === workspace) return local;
   const root = await client.request(shellRoute(checkout));
@@ -837,10 +838,14 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       const { owners, invalid } = readOwnerships(ownershipRoot);
       const conflict = owners.some(owner => overlaps(ctx.checkout, owner.checkout));
       if (!invalid && state) legacyCandidates = owners.filter(owner => owner.schema === 1 &&
-        ['wait', 'resume-watch'].includes(owner.operation) && overlaps(ctx.checkout, owner.checkout)).flatMap(owner => {
+        ['wait', 'resume-watch', 'bind'].includes(owner.operation) && overlaps(ctx.checkout, owner.checkout)).flatMap(owner => {
         const binding = state.bindings.find(item => item.codexChat === owner.codexChat &&
           item.sessionID === owner.sessionID && item.assignmentID === owner.assignmentID &&
           item.workspace === owner.workspace && item.checkout === owner.checkout && !item.uncertain);
+        if (owner.operation === 'bind') return binding?.phase === 'FINISHED' && binding.messageID && !binding.pending ?
+          [{ token: owner.token, workspace: binding.workspace, planPath: binding.planPath, sessionID: binding.sessionID,
+            assignmentID: binding.assignmentID, action: 'recover-legacy-bind',
+            requires: 'Confirmed Windows restart after the legacy lease and idle prior delivery' }] : [];
         return binding ? [{ token: owner.token, workspace: binding.workspace, planPath: binding.planPath,
           sessionID: binding.sessionID, assignmentID: binding.assignmentID }] : [];
       });
@@ -855,6 +860,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     }
   } else add('ownership', 'unknown', 'Checkout ownership depends on a valid physical checkout');
 
+  let selectedUnavailable = false;
   if (!client) {
     for (const name of ['session', 'session-model', 'session-directory', 'session-options', 'execution', 'forms', 'permissions', 'history', 'background']) {
       add(name, 'unknown', 'OpenCode is unavailable; this dependent check cannot be made',
@@ -875,6 +881,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     const [activeResult, shellsResult, sessionResult, formsResult, permissionsResult, historyResult] = probes;
     let liveSession;
     if (validSelectedID) {
+      selectedUnavailable = sessionResult.error?.diagnostic?.httpStatus === 404 || archivedSession(sessionResult.value?.data);
       if (sessionResult.error) add('session', errorStatus(sessionResult.error), 'Exact session lookup failed: ' + errorReason(sessionResult.error),
         false, diagnosticOf(sessionResult.error));
       else if (sessionResult.value?.data?.id !== selectedSessionID) add('session', 'blocked', 'Exact session ID did not match the returned session');
@@ -1030,6 +1037,10 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
       }
     }
   }
+  const legacyBind = legacyCandidates.find(candidate => candidate.action === 'recover-legacy-bind');
+  const replacementSuggested = !explicitSession && selectedUnavailable && savedBinding?.phase === 'FINISHED' &&
+    savedBinding.messageID && !savedBinding.uncertain && sameSavedWorkspace(savedBinding) &&
+    ['ownership', 'execution', 'background'].every(name => checks.some(item => item.name === name && item.status === 'pass'));
   let nextStep, nextCommand = null;
   if (!connected && connectionDiagnostic?.category === 'engine-version') nextStep =
     'OpenCode version mismatch: expected ' + connectionDiagnostic.expectedVersions.join(' or ') + ', observed ' +
@@ -1040,6 +1051,15 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     (savedBinding.intent || savedBinding.uncertain === 'create' && savedBinding.sessionID)) {
     nextStep = 'Run reconcile to verify the exact prior mutation from OpenCode history and saved evidence; it sends no task.';
     nextCommand = { command: 'reconcile', args: [workspacePath, planRealPath, ...nonGitArgs] };
+  }
+  else if (legacyBind) {
+    nextStep = 'Check the exact legacy bind lease. A confirmed later Windows restart and an idle prior delivery allow recovery from this chat.';
+    nextCommand = { command: 'ownership', args: [legacyBind.workspace, legacyBind.planPath, legacyBind.token, '--action', 'inspect', ...nonGitArgs] };
+  }
+  else if (replacementSuggested) {
+    nextStep = 'If the prior delivery has a saved acceptance receipt, replace its unavailable session with an empty project session, then rerun preflight.';
+    nextCommand = { command: 'replace-finished-session', args: [workspacePath, planRealPath, savedBinding.messageID,
+      '--session', savedBinding.sessionID, '--unavailable', ...nonGitArgs] };
   }
   else if (blockers.length && permanentRequest) {
     const diagnostic = permanentRequest.diagnostic;
@@ -1609,11 +1629,6 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       ...(error.diagnostic ? { diagnostic: validateDiagnostic(error.diagnostic) } : {}),
       stateChange: 'unchanged', retried: false };
   }
-  function temporaryReviewRead(error) {
-    const diagnostic = error?.diagnostic;
-    return diagnostic?.method === 'GET' && (['request-timeout', 'request-read', 'request-json'].includes(diagnostic.category) ||
-      diagnostic.httpStatus === 429 || diagnostic.httpStatus >= 500);
-  }
   function unconfirmedOutcome(expected, error, reason) {
     return { kind: 'stopped', workspace: expected.workspace, planPath: expected.planPath,
       sessionID: expected.sessionID ?? null, phase: 'STOPPED', model: MODEL,
@@ -1909,10 +1924,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       const selectedOwner = ownerships().find(value => value.token === token);
       if (selectedOwner?.operation === 'bind' || selectedOwner?.schema === 3) {
         const legacy = selectedOwner.schema === 1;
+        const legacyRecovery = legacy && ['inspect', 'recover-legacy-bind'].includes(action);
         function selectBind(state) {
           const owners = ownerships();
           const owner = owners.find(item => item.token === token);
-          need(owner?.operation === selectedOwner.operation && owner.schema === selectedOwner.schema && owner.codexChat === chatID &&
+          need(owner?.operation === selectedOwner.operation && owner.schema === selectedOwner.schema && owner.codexChat === selectedOwner.codexChat &&
+            (owner.codexChat === chatID || legacyRecovery) &&
             owner.workspace === ctx.workspace && owner.checkout === ctx.checkout, 'Operation lease is missing or belongs to another chat or checkout');
           need(owners.filter(item => overlaps(ctx.checkout, item.checkout)).length === 1,
             'Another operation owns this checkout');
@@ -1939,9 +1956,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           explanation: 'This lease has no PID or process start time. Windows must confirm a restart after the lease was written.',
           steps: [
             ['ownership', workspace, planPath, token, '--action', 'recover-legacy-bind'],
-            ['replace-finished-session', workspace, planPath, binding.messageID, '--session', binding.sessionID,
+            ...(owner.codexChat === chatID ? [['replace-finished-session', workspace, planPath, binding.messageID, '--session', binding.sessionID,
               '--lost-powershell-calls', '<comma-separated-call-ids>', '--recovered-bind', token],
-            ['preflight', workspace, planPath, '--session', '<new-session-id>'],
+            ['preflight', workspace, planPath, '--session', '<new-session-id>']] :
+              [['preflight', workspace, planPath]]),
           ].map(args => nonGitBaseline ? [...args, '--non-git-baseline', nonGitBaseline] : args),
         } : undefined;
         const result = { kind: 'ownership-status', token, operation: owner.operation, ownerStatus: proof.status, reason: proof.reason,
@@ -1976,10 +1994,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             need(!snapshot.active && !snapshot.forms.length && !snapshot.permissions.length && snapshot.session.outcome === 'succeeded' &&
               Number.isFinite(snapshot.session.time?.idle),
               'Prior session is active, awaiting a reply or missing a successful outcome');
-            const shells = await client.request('/api/shell?location[directory]=' + encodeURIComponent(ctx.workspace));
-            need(Array.isArray(shells?.data) && shells.data.every(shell =>
-              ['exited', 'timeout', 'killed'].includes(shell.status) && Number.isFinite(shell.time?.completed)),
-            'Project shell is running or unknown');
+            await requireQuietShells(client, binding);
           };
           await quiet();
           const messages = await assignmentMessages(client, binding);
@@ -2069,7 +2084,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             binding.nextAssignment = kind; binding.phase = 'PREPARING';
             return summary(state, binding, 'prepared');
           }).result;
-        } catch (error) { return temporaryReviewRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
+        } catch (error) { return temporaryRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
       });
     },
     async finish(workspace, planPath, nonGitBaseline, archive) {
@@ -2088,7 +2103,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             binding.phase = 'FINISHED';
             return summary(state, binding, 'released');
           }).result;
-        } catch (error) { return archive || temporaryReviewRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
+        } catch (error) { return archive || temporaryRead(error) ? rejectedOutcome(begun.expected, error) : stoppedOutcome(begun.expected, error); }
       });
     },
     async transition(workspace, planPath, messageID, disposition, { kind, nonGitBaseline, connectionError, movedPlanPath } = {}) {
@@ -2404,7 +2419,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             await stream.next(Math.min(5_000, timeoutMs));
           }
         } catch (error) {
-          if (once && !combined.aborted && temporaryReviewRead(error))
+          if (!combined.aborted && temporaryRead(error))
             return { ...rejectedOutcome(expected, error), kind: 'retryable-read' };
           const category = signal.aborted ? 'interrupted' : deadline.aborted ? 'deadline' : null;
           const diagnostic = diagnose(category ? null : error, category ?? 'unknown', category ? 'wait' : 'snapshot',
@@ -2568,10 +2583,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     async bind(workspace, planPath, nonGitBaseline, importedCount, replacement) {
       const ctx = context(workspace, planPath, nonGitBaseline);
       if (replacement) need(/^ses_[a-zA-Z0-9]+$/.test(replacement.sessionID) && /^msg_[a-zA-Z0-9]+$/.test(replacement.messageID) &&
+        (replacement.unavailable === true && replacement.lostCalls === undefined && replacement.recoveredBind === undefined ||
         Array.isArray(replacement.lostCalls) && replacement.lostCalls.length > 0 && replacement.lostCalls.length <= 32 &&
         replacement.lostCalls.every(id => /^call_[a-zA-Z0-9_]{1,120}$/.test(id)) &&
         new Set(replacement.lostCalls).size === replacement.lostCalls.length &&
-        (replacement.recoveredBind === undefined || leaseTokenPattern.test(replacement.recoveredBind)),
+        (replacement.recoveredBind === undefined || leaseTokenPattern.test(replacement.recoveredBind))),
       'Use exact prior session, delivery, PowerShell call IDs and legacy bind token');
       need(importedCount === undefined || Number.isInteger(importedCount) && importedCount >= 0 && importedCount <= 20,
         'Invalid imported correction count');
@@ -2582,7 +2598,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           need(existing?.phase === 'FINISHED' && existing.assignmentID && existing.sessionID === replacement.sessionID &&
             existing.messageID === replacement.messageID, 'Only the exact FINISHED delivery in this chat can be replaced');
           const verifiedHistory = replacement.recoveredBind && legacyBindProof(replacement.recoveredBind, state, existing);
-          savedContext(verifiedHistory ? { ...existing, engineID: client.engineID } : existing, ctx);
+          savedContext(replacement.unavailable ? { ...existing, engineID: client.engineID, planPath: ctx.planPath } :
+            verifiedHistory ? { ...existing, engineID: client.engineID } : existing, ctx);
+          if (replacement.unavailable) need(readAcceptance(stateRoot, existing), 'Missing acceptance receipt for the finished delivery');
           need(!readClosure(stateRoot, existing) && !readTransition(stateRoot, existing.messageID), 'Another closure or transition already exists');
           need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no replacement');
           checkoutAvailable(state, ctx, existing);
@@ -2636,7 +2654,18 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
         }
         let archive;
-        if (start.source) {
+        if (start.source && replacement.unavailable) {
+          await requireQuietShells(client, start.source);
+          let session;
+          try { session = await sessionMatches(start.source); }
+          catch (error) { if (error.diagnostic?.httpStatus !== 404) throw error; }
+          if (session) {
+            need(archivedSession(session), 'Prior OpenCode session is still available');
+            await noForms(start.source);
+          }
+          archive = { schema: 1, source: start.source, correctionCount: start.correctionCount,
+            reason: 'accepted-session-unavailable' };
+        } else if (start.source) {
           const gaps = [], lostCalls = new Set(replacement.lostCalls);
           const { boundary } = await checkedClosureBoundary(client, stateRoot, start.source, true, !!start.verifiedHistory,
             { gaps, lostCalls, historyFingerprint: start.verifiedHistory });

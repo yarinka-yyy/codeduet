@@ -119,6 +119,12 @@ export function requireValue(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+export function temporaryRead(error) {
+  const diagnostic = error?.diagnostic;
+  return diagnostic?.method === 'GET' && (['request-timeout', 'request-read', 'request-json'].includes(diagnostic.category) ||
+    diagnostic.httpStatus === 429 || diagnostic.httpStatus >= 500);
+}
+
 export function localEndpoint(value) {
   let url;
   try { url = new URL(value); } catch { throw new Error('Invalid engine URL'); }

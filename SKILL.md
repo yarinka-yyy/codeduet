@@ -28,10 +28,12 @@ without accepting it, follow [close-assignment](helper/PROTOCOL.md#close-assignm
 Close it before preflight or a new correction. Treat a subsequent submit as
 separate work that requires its own authorization and packet.
 
-For an explicit request to replace a FINISHED session after loss of PowerShell
-evidence, use [replace-finished-session](helper/PROTOCOL.md#replace-a-finished-session-with-lost-powershell-evidence)
-in the original chat. Check the newly created empty session with preflight.
-Replacement alone grants no authority to submit.
+If preflight finds that the last accepted OpenCode session is archived or
+deleted, use its [replacement route](helper/PROTOCOL.md#replace-an-unavailable-accepted-session)
+for the authorized next assignment. The new OpenCode session starts empty in
+the same physical project. Rerun preflight before submitting. For lost
+PowerShell evidence on a FINISHED session, use the
+[separate proof requirements](helper/PROTOCOL.md#replace-a-finished-session-with-lost-powershell-evidence).
 
 Use the real current Codex chat ID. Reuse its valid saved pair. If there is no
 pair, bind a new OpenCode session in the selected workspace unless the user
@@ -98,6 +100,10 @@ uncertain mutation is STOPPED; never resend it.
 Only on an explicit request to resume observation of an already delivered
 assignment, use [observer arm --resume](helper/OBSERVER.md). This is a
 separate route from dispatch preflight; inspect alone does not authorize it.
+For a known PostgreSQL stop with a retained log, use
+[resume-watch with evidence](helper/PROTOCOL.md#resume-observation) in that same chat.
+If a temporary read fails, retry the same observation or consume its existing
+receipt once the engine responds. Keep the saved delivery and count.
 A foreground lease blocking that transition uses the [owner diagnosis and
 migration route](helper/OBSERVER.md#migrate-a-foreground-wait); never delete a lock.
 If the user explicitly abandons an old task blocked by a legacy observation lease,

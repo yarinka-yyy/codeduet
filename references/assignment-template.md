@@ -54,6 +54,11 @@ any new abstraction or copied dependency by the gap in existing code.
 Finish edits and ordinary foreground checks before final response. Do not
 detach project-changing commands. If any known operation remains, report its
 identifier/status and do not claim ownership can transfer.
+For a temporary PostgreSQL instance, keep the original timestamped PID log
+with startup, listening port and shutdown entries until review opens. Report
+the absolute data path, port, PID(s), launch and stop call IDs when available,
+and evidence that the PID file, processes and listener are gone. Clean up
+temporary data and credentials after shutdown. Keep credentials out of evidence.
 Use actual question/permission tools when needed, wait for their replies and
 do not bypass denied permissions.
 

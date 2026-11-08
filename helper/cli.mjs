@@ -7,7 +7,7 @@ import { notificationCapability } from './observer.mjs';
 
 let client;
 try {
-  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' }, 'lost-powershell-calls': { type: 'string' }, 'recovered-bind': { type: 'string' }, 'codex-exe': { type: 'string' }, 'manual-observation': { type: 'boolean' }, index: { type: 'string' }, 'moved-prior-plan': { type: 'string' } } });
+  const { positionals: args, values } = parseArgs({ allowPositionals: true, options: { action: { type: 'string' }, 'non-git-baseline': { type: 'string' }, 'timeout-ms': { type: 'string' }, kind: { type: 'string' }, 'correction-count': { type: 'string' }, cursor: { type: 'string' }, session: { type: 'string' }, 'postgres-evidence': { type: 'string' }, 'powershell-event-log': { type: 'string' }, 'lost-powershell-calls': { type: 'string' }, 'recovered-bind': { type: 'string' }, 'codex-exe': { type: 'string' }, 'manual-observation': { type: 'boolean' }, index: { type: 'string' }, 'moved-prior-plan': { type: 'string' }, 'unavailable': { type: 'boolean' } } });
   const [command, workspace, plan, assignment, packet] = args;
   const stateLock = command === 'state-lock';
   const checkingAcceptance = command === 'acceptance-status';
@@ -26,10 +26,11 @@ try {
   if (rebinding && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) || !/^ses_[a-zA-Z0-9]+$/.test(values.session)))
     throw new Error('Usage: rebind-engine <workspace> <plan> <message-id> --session <session-id>');
   if (replacing && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
-    !/^ses_[a-zA-Z0-9]+$/.test(values.session) || !values['lost-powershell-calls']))
-    throw new Error('Usage: replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids> [--recovered-bind <lease-token>]');
-  if (!replacing && (values['lost-powershell-calls'] !== undefined || values['recovered-bind'] !== undefined))
-    throw new Error('lost-powershell-calls and recovered-bind belong to replace-finished-session');
+    !/^ses_[a-zA-Z0-9]+$/.test(values.session) || (values.unavailable ?
+      values['lost-powershell-calls'] !== undefined || values['recovered-bind'] !== undefined : !values['lost-powershell-calls'])))
+    throw new Error('Usage: replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> (--unavailable | --lost-powershell-calls <ids> [--recovered-bind <lease-token>])');
+  if (!replacing && (values['lost-powershell-calls'] !== undefined || values['recovered-bind'] !== undefined || values.unavailable))
+    throw new Error('Replacement options belong to replace-finished-session');
   if (command === 'task-maintenance' && args.length !== 3) throw new Error('Usage: cli.mjs task-maintenance <absolute-workspace> <absolute-plan.md>');
   if (command === 'start-cycle' && args.length !== 3) throw new Error('Usage: cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>');
   if (command === 'ownership' && args.length !== 4) throw new Error('Usage: cli.mjs ' + ownershipUsage);
@@ -101,12 +102,13 @@ try {
   catch (error) {
     if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
     else {
-      try { if (!replacing && !rebinding && !['sessions', 'retire-legacy', 'reconcile'].includes(command)) result = await helper(null).connectionLost(error,
+      try { if (!replacing && !rebinding && !['sessions', 'retire-legacy', 'reconcile', 'wait', 'resume-watch'].includes(command)) result = await helper(null).connectionLost(error,
         { preserveReview: ['next', 'finish'].includes(command) }); }
       catch (stateError) {
         error.persistenceFailure = diagnose(stateError, 'state-io', 'state-write');
       }
-      result ??= { kind: 'stopped', error: error.message, diagnostic: diagnose(error, 'unknown', 'connection'),
+      result ??= { kind: ['wait', 'resume-watch'].includes(command) ? 'connection-unavailable' : 'stopped',
+        error: error.message, diagnostic: diagnose(error, 'unknown', 'connection'),
         stateChange: error?.persistenceFailure ? 'unconfirmed' : 'unchanged', retried: error?.bootstrap?.retried ?? false };
       if (error?.bootstrap) result.bootstrap = error.bootstrap;
       if (error?.persistenceFailure) result.persistenceFailure = error.persistenceFailure;
@@ -123,8 +125,9 @@ try {
     else if (command === 'reconcile') result = await adapter.reconcile(workspace, plan, baseline);
     else if (rebinding) result = await adapter.rebindEngine(workspace, plan, assignment, values.session, baseline);
     else if (replacing) result = await adapter.bind(workspace, plan, baseline, undefined, {
-      sessionID: values.session, messageID: assignment, lostCalls: values['lost-powershell-calls'].split(','),
-      recoveredBind: values['recovered-bind'],
+      sessionID: values.session, messageID: assignment,
+      ...(values.unavailable ? { unavailable: true } :
+        { lostCalls: values['lost-powershell-calls'].split(','), recoveredBind: values['recovered-bind'] }),
     });
     else if (command === 'retire-legacy') result = await adapter.retireLegacy(workspace, plan, assignment);
     else if (command === 'adopt') result = await adapter.adopt(workspace, plan, assignment, baseline, importedCount);
@@ -154,7 +157,7 @@ try {
   if (command === 'ownership') {
     if (['rejected', 'observation-stop-pending'].includes(result.kind)) process.exitCode = 1;
   } else if (result.phase === 'STOPPED' || ['close-assignment', 'transition'].includes(command) && result.ownershipReleaseFailure ||
-    ['stopped', 'connection-unavailable', 'correction-limit', 'rejected'].includes(result.kind) ||
+    ['stopped', 'connection-unavailable', 'correction-limit', 'rejected', 'retryable-read'].includes(result.kind) ||
     result.kind === 'preflight' && result.status !== 'pass') process.exitCode = 1;
 } catch (error) {
   const outcome = error.stateOutcome ?? { kind: error.diagnostic ? 'stopped' : 'rejected',

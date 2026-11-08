@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fixture, baseline, model } from './http-fixture.mjs';
 import { connect } from '../helper/connection.mjs';
 import { helper, preflight as checkPreflight } from '../helper/binding.mjs';
-import { sha256 } from '../helper/postgres-recovery.mjs';
+import { sha256, verifyPostgresRecovery } from '../helper/postgres-recovery.mjs';
 
 async function stopped(t) {
   const f = await fixture(t, undefined, '2.2.0');
@@ -90,6 +90,51 @@ test('PostgreSQL recovery refuses an unmatched shutdown and leaves STOPPED intac
   const outcome = await f.call(args);
   assert.match(outcome.result.error, /lifecycle evidence is incomplete/);
   unchanged(f, before, from);
+});
+
+test('PostgreSQL recovery correlates a cleaned run and two OpenCode call formats', async t => {
+  const f = await stopped(t), saved = f.state().bindings[0];
+  const run = join(f.workspace, 'cleaned run'), dataDirectory = join(run, 'pgdata');
+  const log = join(run, 'logs', 'postgres.log'), port = 55439;
+  mkdirSync(dirname(log), { recursive: true });
+  const at = saved.submittedAt + 100;
+  const prefix = "$run='" + run + "'; $pgbin='" + join(run, 'bin') + "'; ";
+  const start = '& "$pgbin\\pg_ctl.exe" -D "$run\\pgdata" -l "$run\\logs\\postgres.log"';
+  const first = { id: 'chatcmpl-tool-timeout', name: 'shell', time: { ran: at, completed: at + 2000 },
+    state: { status: 'completed', metadata: { status: 'completed', timeout: true },
+      input: { command: prefix + start + " -o '\"-p 55439 -c listen_addresses=127.0.0.1 -c logging_collector=off\"' start" } } };
+  const second = { id: 'call_background', messageID: 'msg_shell', name: 'shell', time: { ran: at + 3000, completed: at + 3001 },
+    state: { status: 'completed', metadata: { status: 'running', shellID: 'sh_fixture' },
+      input: { background: true, command: prefix + start + ' -o "-p 55439 -c listen_addresses=127.0.0.1" -w start' } } };
+  const background = new Map([['sh_fixture', { toolID: second.id, messageID: second.messageID,
+    notice: { metadata: { state: 'completed', exit: 0 }, time: { created: at + 4000 } } }]]);
+  const logLines = (pid, launch, stop) => ['starting PostgreSQL 16', 'listening on IPv4 address "127.0.0.1", port 55439',
+    'database system is shut down'].map((message, index) =>
+    new Date([launch, launch + 1, stop][index]).toISOString().replace('T', ' ').replace('Z', ' UTC [' + pid + '] LOG:  ') + message);
+  const bytes = [...logLines(17932, at + 1, at + 1999), ...logLines(58504, at + 3391, at + 5000)].join('\n');
+  writeFileSync(log, bytes);
+  const evidence = { messageID: saved.messageID, dataDirectory, log, logHash: sha256(bytes), port,
+    calls: [first, second].map((tool, index) => ({ id: tool.id, pid: [17932, 58504][index], commandHash: sha256(tool.state.input.command) })) };
+  const verify = (postgresRecovery = evidence, probe = () => true, jobs = background) =>
+    verifyPostgresRecovery({ ...saved, postgresRecovery }, [first, second], at + 6000, probe, jobs);
+  assert.equal(existsSync(dataDirectory), false);
+  const result = verify(evidence, (...args) => {
+    assert.deepEqual(args, [55439, true, dataDirectory, [17932, 58504]]);
+    return true;
+  });
+  assert.equal(result.get(first.id).timeout, true);
+  assert.equal(result.get(second.id).startedAt - second.time.completed, 390);
+  assert.throws(() => verify(evidence, undefined, new Map()), /launch does not match call call_background/);
+  assert.throws(() => verify(evidence, () => false), /process, listener or PID file/);
+  assert.throws(() => verify(evidence, () => { throw new Error('access denied'); }), /Windows CIM and listener access/);
+  assert.throws(() => verify({ ...evidence, logHash: sha256('foreign') }), /log changed/);
+  const foreignLog = join(f.workspace, 'different run', 'logs', 'postgres.log');
+  mkdirSync(dirname(foreignLog), { recursive: true }); writeFileSync(foreignLog, bytes);
+  assert.throws(() => verify({ ...evidence, log: foreignLog, dataDirectory: join(dirname(dirname(foreignLog)), 'pgdata') }),
+    /launch directory does not match/);
+  mkdirSync(dataDirectory);
+  writeFileSync(join(dataDirectory, 'postmaster.pid'), '17932');
+  assert.throws(() => verify(), /PID file/);
 });
 
 test('PostgreSQL recovery opens review with the timeout and reuses the receipt on release', {
@@ -183,12 +228,16 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   ]);
   assert.match((await run()).result.error, /ownership locked/);
   const restarted = { ...f.client, engineID: 'offline-restarted-engine' };
-  const recover = boot => helper(restarted, { stateRoot, chatID: old.codexChat, probeBootTime: () => boot })
+  const newChat = 'offline-http-chat-recovery';
+  const candidate = await checkPreflight(f.client, { stateRoot, chatID: newChat, workspace: f.workspace,
+    planPath: f.plan, nonGitBaseline: baseline });
+  assert.equal(candidate.legacyCandidates.find(x => x.token === token).action, 'recover-legacy-bind');
+  const recover = boot => helper(restarted, { stateRoot, chatID: newChat, probeBootTime: () => boot })
     .observationOwner(f.workspace, f.plan, token, { action: 'recover-legacy-bind', nonGitBaseline: baseline });
   const rejected = await recover(0);
   assert.equal(rejected.kind, 'rejected');
   assert.match(rejected.error, /confirmed Windows restart/);
-  assert.deepEqual(rejected.legacyBind, inspected.legacyBind);
+  assert.deepEqual(rejected.legacyBind.steps.map(args => args[0]), ['ownership', 'preflight']);
   const createReceipt = join(stateRoot, 'finished-session-replacements', old.messageID + '.json');
   mkdirSync(dirname(createReceipt), { recursive: true });
   writeFileSync(createReceipt, '{}');
@@ -197,6 +246,9 @@ test('legacy FINISHED delivery can move to an empty session without bypassing ac
   f.forms.push({ id: 'frm_waiting', sessionID: old.sessionID });
   await assert.rejects(recover(Date.now() + 1000), /awaiting a reply/);
   f.forms.length = 0;
+  f.shells = [{ id: 'sh_running', status: 'running' }];
+  await assert.rejects(recover(Date.now() + 1000), /shell still running/);
+  f.shells = [];
   assert.ok(existsSync(lease));
   assert.equal((await recover(Date.now() + 1000)).kind, 'bind-ownership-released');
   assert.ok(existsSync(join(stateRoot, 'ownership-history', token + '.lock')));

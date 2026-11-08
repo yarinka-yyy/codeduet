@@ -5,7 +5,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { connect, diagnose, requireValue as need } from './connection.mjs';
+import { connect, diagnose, requireValue as need, temporaryRead } from './connection.mjs';
 import { context, helper, readState, withStateLock, WAIT_TIMEOUT_MS } from './binding.mjs';
 import { processOwner, ownerLiveness } from './process-owner.mjs';
 import { selectExternal, externalUnchanged, externalOutcome, waitExternal } from './external-observation.mjs';
@@ -163,7 +163,11 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       const end = Date.now() + 90000;
       while (Date.now() < end) {
         if (existsSync(join(dir, 'ready.json')) || existsSync(join(dir, 'result.json'))) {
-          const snapshot = status(id);
+          const snapshot = withStateLock(stateRoot, () => {
+            const current = status(id);
+            if (!current.result) put(join(dir, 'handoff.json'), { at: Date.now() });
+            return current;
+          });
           return { ...snapshot, kind: snapshot.result ? snapshot.result.kind === 'observer-error' ? 'observer-start-failed' : 'observer-terminal' : 'observer-armed',
             observerState: snapshot.result ? 'ended' : 'watching', consumeRequired: !!snapshot.result,
             endTurn: !snapshot.result };
@@ -206,21 +210,22 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         onReady: ready });
     } catch (error) {
       // Do not persist exception bodies or executor transcripts in notification receipts.
-      result = { kind: 'observer-error', diagnostic: diagnose(error, 'unknown', 'connection') };
+      result = { kind: value.mode !== 'external' && temporaryRead(error) ? 'retryable-read' : 'observer-error',
+        diagnostic: diagnose(error, 'unknown', 'connection') };
     } finally {
       clearInterval(timer); for (const name of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.off(name, interrupt);
     }
     try {
-      put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
-        ...(result.result?.shellOutcomes?.length ? { shellOutcomes: result.result.shellOutcomes } : {}),
-        ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
-        ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
-        ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
-      // A failed pin check still needs one hint; only consume can grant any action.
       const notify = withStateLock(stateRoot, () => {
         need(get(active).id === id, 'Observer slot changed');
         if (value.mode === 'external') need(get(externalSlot(value)).id === id, 'External observer slot changed');
-        if (existsSync(join(dir, 'cancel.json'))) return false;
+        put(join(dir, 'result.json'), { kind: result.kind, at: Date.now(),
+          ...(result.result?.shellOutcomes?.length ? { shellOutcomes: result.result.shellOutcomes } : {}),
+          ...(result.toolErrors?.length ? { toolErrors: result.toolErrors } : {}),
+          ...(result.exchangeFailure ? { exchangeFailure: result.exchangeFailure } : {}),
+          ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
+        // Before handoff the arming turn receives the result directly.
+        if (!existsSync(join(dir, 'handoff.json')) || existsSync(join(dir, 'cancel.json'))) return false;
         put(join(dir, 'notify-attempt.json'), { at: Date.now() }); return true;
       });
       if (notify) {
@@ -270,10 +275,15 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
             exchangeOutcome: current.exchangeOutcome, reviewAllowed: false, dispatchAllowed: false };
         } catch (error) { executorCheck = { status: 'unavailable', diagnostic: diagnose(error, 'unknown', 'snapshot') }; }
       }
+      const resume = value.resume && event.kind === 'retryable-read' && binding().phase === 'STOPPED' ?
+        { sessionID: value.sessionID, assignmentID: value.assignmentID, messageID: value.messageID } : undefined;
       const result = event.kind === 'observer-error' ? { ...event, executorStopped: false, ...(executorCheck ? { executorCheck } : {}) } : value.mode === 'external' ?
         await externalOutcome(await connectEngine(), stateRoot, value) :
-        await helper(await connectEngine(), { stateRoot, chatID }).wait(value.workspace, value.planPath,
-          { nonGitBaseline: value.nonGitBaseline, once: true });
+        await connectEngine().then(client => helper(client, { stateRoot, chatID }).wait(value.workspace, value.planPath,
+          { nonGitBaseline: value.nonGitBaseline, once: true, resume }), error => {
+          if (!temporaryRead(error)) throw error;
+          return { kind: 'retryable-read', diagnostic: diagnose(error, 'unknown', 'connection'), stateChange: 'unchanged' };
+        });
       if (result.kind === 'retryable-read') return { ...result, receiptID: id, taskSent: false,
         manualCommand: { command: 'consume', args: [id] } };
       withStateLock(stateRoot, () => {

@@ -406,9 +406,13 @@ accepts an operator-reviewed JSON object with `messageID`, absolute `dataDirecto
 and `log`, `logHash` (SHA-256 of the file), `port`, and chronological `calls`
 with `id`, `pid`, and `commandHash` (SHA-256 of the exact UTF-8 shell command).
 Use reviewed paths and launch identities, including indirect script launches.
-The supported layout is `data/pgdata` and `logs/postgres.log` under the same run
-directory. Each log launch needs a matching listener and shutdown for its PID.
-All launches must match the selected delivery and the command time windows.
+Keep the original `logs/postgres.log` under the run directory. The data path can
+be `data/pgdata` or `pgdata` in that run, including a directory already removed
+during verified cleanup. Each log launch needs a matching listener and shutdown
+for its PID. Use each actual OpenCode call ID, including `chatcmpl-tool-…`.
+For a correlated native background launch, the time window ends at the native
+successful shell completion notice. The initial tool timestamp can precede the
+PostgreSQL startup. A foreground launch must fall inside its command window.
 The helper checks current PostgreSQL processes, the listening port, and the PID
 file, then rechecks the assignment and shell registry. Only an authorized
 resume stores the receipt under the shared state directory. Later release and
@@ -430,6 +434,8 @@ executorStopped false and retried false. The same optional diagnostic is saved
 on its schema-1 STOPPED binding and appears on later stopped outcomes/inspection.
 Older schema-1 records without it remain valid; invalid/extra diagnostic fields
 are rejected rather than silently copied.
+A temporary GET failure returns retryable-read with the delivery unchanged.
+Retry wait or consume for that delivery when the engine is reachable again.
 
 Outcomes report `stateChange` as `saved`, `unchanged` or `unconfirmed`. Bootstrap
 failures include bounded attempt count and the last validated typed diagnostic.
@@ -644,6 +650,18 @@ with the existing baseline option if required. The helper applies the same
 event checks to the archived Windows PowerShell log when live evidence is
 missing. Unmatched or missing events leave the saved phase and count intact.
 
+## Replace an unavailable accepted session
+
+`replace-finished-session <workspace> <target-plan> <prior-message-id> --session <prior-session-id> --unavailable`
+
+Use this from the current saved Codex chat when preflight finds its last accepted
+session archived or missing (HTTP 404). The helper requires its durable acceptance
+receipt, a quiet physical checkout and the absence of unresolved observers or
+leases. If the old session still exists, it must be archived and have no pending
+forms or permissions. The helper archives the old binding and creates one empty
+session in that same project. It preserves old delivery IDs and plan counts.
+Rerun preflight before sending the next authorized assignment.
+
 ## Replace a finished session with lost PowerShell evidence
 
 `replace-finished-session <workspace> <plan> <prior-message-id> --session <prior-session-id> --lost-powershell-calls <comma-separated-call-ids>`
@@ -673,13 +691,17 @@ New binds require a verifiable owner process identity before acquiring the lease
 A create reservation stays `STOPPED` with `uncertain: create`, even after the lease
 is archived. Recovery never retries a create or sends a prompt.
 
-For a bind lease without process identity, explicitly use `--action recover-legacy-bind`.
+For a bind lease without process identity, explicitly use `--action recover-legacy-bind`
+with the exact lease token and original plan. The current chat can do this when
+the old owning chat is unavailable. Preflight lists eligible legacy bind candidates.
 This requires a confirmed Windows restart after the lease was written on the local
 fixed drive because the old lease has no PID or process start time. For an eligible
 FINISHED delivery, `inspect` and a refusal due to missing restart proof return
 `legacyBind.steps`, the CLI argument lists for recovery, replacement and preflight.
 Supply the exact lost call IDs and use the new session ID returned by replacement.
 Run each step only after the preceding one succeeds.
+From a different chat, recovery only archives the lease. Rerun preflight for the
+authorized work there and let the new-bind route create an empty project session.
 Recovery also requires the original FINISHED binding, no create reservation
 or replacement receipt, and fresh idle checks for the checkout and session. The
 existing lease keeps other helper operations out during validation. If the proof

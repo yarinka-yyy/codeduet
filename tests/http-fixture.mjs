@@ -24,6 +24,7 @@ export async function fixture(t, cli = defaultCli, version = '2.2.0') {
   const secret = 'OFFLINE_HTTP_CANARY_007';
   const expectedAuth = 'Basic ' + Buffer.from('opencode:' + secret).toString('base64');
   const calls = [], sessions = new Map(), streams = new Set(), messages = new Map();
+  let createdSessions = 0;
   const f = { root, home, workspace, plan, packet, statePath, calls, sessions, streams, messages,
     models: [model], fault: null, active: {}, forms: [], permissions: [], shells: [], streamOpens: 0 };
   const server = createServer(async (request, response) => {
@@ -67,8 +68,9 @@ export async function fixture(t, cli = defaultCli, version = '2.2.0') {
         return send({ data: selected.slice(offset, offset + limit), cursor: { next: String(offset + limit) } });
       }
       if (route === '/api/session' && request.method === 'POST') {
-        const session = { id: 'ses_http' + (sessions.size + 1), title: body.title, location: body.location, model: body.model, time: {} };
+        const session = { id: 'ses_http' + ++createdSessions, title: body.title, location: body.location, model: body.model, time: {} };
         sessions.set(session.id, session);
+        messages.set(session.id, []);
         return f.fault === 'create-truncated' ? truncated() : send({ data: session });
       }
       if (route.endsWith('/model') && request.method === 'POST') {

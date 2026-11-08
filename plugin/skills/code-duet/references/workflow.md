@@ -49,7 +49,8 @@ Runtime STOPPED or uncertain delivery is a blocker, not a reason to start a
 fresh chat or another executor. On an explicit continuation request, first read
 the checkpoint and inspect old execution. For observation of a delivered
 assignment, use explicitly authorized [observer arm --resume](../helper/OBSERVER.md).
-It does not retry delivery or permit project edits during execution. No automatic recovery is supplied.
+It preserves delivery and count. For a retained PostgreSQL log, use the
+[evidence route](../helper/PROTOCOL.md#resume-observation) in the original chat.
 For explicit closure without acceptance, use [close-assignment](../helper/PROTOCOL.md#close-assignment).
 It prepares a separate correction in the same binding. Use a fresh assignment
 ID and the existing counter, and record the old run as closed without acceptance.
@@ -77,6 +78,9 @@ exact next step. It does not create a recipient, change helper state, test
 writability or send a task. A pass is a snapshot, not authority: bind/adopt and
 submit recheck current state. An explicit exact recipient needs no second
 confirmation.
+For an accepted but unavailable prior session, follow preflight's
+[replacement route](../helper/PROTOCOL.md#replace-an-unavailable-accepted-session).
+Continue from the accepted checkpoint in the empty project session.
 
 Use assignment-template.md for the next connected block. Fill all placeholders
 and preserve the canonical plan path; the plan is reference, not permission for
@@ -113,6 +117,9 @@ one wake hint. Consume its receipt, recheck live state and handle the actual
 outcome. After a scoped answer/reply, rearm and end the turn again. A stale event
 may return observing: rearm the unchanged assignment without resending it.
 A failed startup or uncertain queue result requires diagnosis, not another launch.
+If a read is temporarily unavailable, keep the delivery and retry consume with
+the same receipt when available. If the receipt returns observing, rearm for the
+same delivery.
 Token deltas, submit admission, silence, timeout and final text alone
 do not transfer ownership. Follow the helper's diagnostic and [wait and phase
 rules](../helper/PROTOCOL.md#wait). The helper can continue through HTTP after a

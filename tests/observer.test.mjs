@@ -49,6 +49,56 @@ test('detached contract: arm returns ready, waits without a model, one completio
   assert.ok(!JSON.stringify(f.o.status(armed.id)).includes('Simulator completed'));
 });
 
+test('completion available during arm goes to that turn without a second wake', async t => {
+  const f = await setup(t);
+  f.finish(f.session);
+  const terminal = await f.arm();
+  await f.end();
+  assert.equal(terminal.kind, 'observer-terminal');
+  assert.equal(terminal.endTurn, false);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.o.status(terminal.id).attempted, false);
+  assert.equal((await f.o.consume(terminal.id)).kind, 'completed-for-review');
+  assert.equal((await f.o.consume(terminal.id)).kind, 'already-consumed');
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
+for (const fault of ['history-truncated', 'bootstrap-offline']) test('a transient observation read keeps the delivery: ' + fault, async t => {
+  const f = await setup(t);
+  f.fault = fault;
+  const first = await f.arm();
+  await f.end();
+  assert.equal(f.o.status(first.id).result.kind, 'retryable-read');
+  assert.equal(f.state().bindings[0].phase, 'EXECUTING');
+  assert.equal((await f.o.consume(first.id)).kind, 'retryable-read');
+  f.fault = null;
+  const observed = await f.o.consume(first.id);
+  assert.equal(observed.kind, 'observing');
+  assert.equal(observed.rearm, true);
+  assert.equal(observed.correctionCount, 9);
+  const next = await f.arm();
+  f.finish(f.session);
+  await f.end();
+  assert.equal((await f.o.consume(next.id)).kind, 'completed-for-review');
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
+test('a resumed receipt can recover a transient read while the same delivery is still STOPPED', async t => {
+  const f = await setup(t);
+  await f.adapter.connectionLost(new Error('First observation stopped'));
+  f.fault = 'history-truncated';
+  const first = await f.arm({ resume: true });
+  await f.end();
+  assert.equal(f.o.status(first.id).result.kind, 'retryable-read');
+  assert.equal(f.state().bindings[0].phase, 'STOPPED');
+  f.fault = null;
+  f.finish(f.session);
+  const outcome = await f.o.consume(first.id);
+  assert.equal(outcome.kind, 'completed-for-review');
+  assert.equal(outcome.correctionCount, 9);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
 test('bound wait and observer use a four-hour default while invalid deadlines leave state unchanged', async t => {
   const f = await setup(t), before = readFileSync(f.statePath), from = f.calls.length;
   for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 14_400_001]) {
