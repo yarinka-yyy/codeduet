@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const chatID = '00000000-0000-4000-8000-000000000017';
 async function setup(t, deliver = async () => ({ status: 'sent', exitCode: 0 })) {
-  const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath);
+  const f = await fixture(t, undefined, '2.2.1'), stateRoot = dirname(f.statePath);
   const connectEngine = () => connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const client = await connectEngine(), adapter = helper(client, { stateRoot, chatID });
   await adapter.bind(f.workspace, f.plan, baseline, 8);

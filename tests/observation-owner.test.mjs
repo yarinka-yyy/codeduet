@@ -20,7 +20,7 @@ async function until(check) {
   assert.fail('Disposable foreground did not reach expected checkpoint');
 }
 async function setup(t) {
-  const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath);
+  const f = await fixture(t, undefined, '2.2.1'), stateRoot = dirname(f.statePath);
   const connectEngine = () => connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const client = await connectEngine(), adapter = helper(client, { stateRoot, chatID });
   await adapter.bind(f.workspace, f.plan, baseline, 8);

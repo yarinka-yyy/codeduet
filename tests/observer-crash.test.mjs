@@ -15,7 +15,7 @@ const moduleURL = new URL('../helper/observer.mjs', import.meta.url).href;
 const connectionURL = new URL('../helper/connection.mjs', import.meta.url).href;
 
 test('killed real worker is explicitly retired by exact process evidence; rearm is exclusive and sends no task', async t => {
-  const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
+  const f = await fixture(t, undefined, '2.2.1'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
   f.sessions.set(sessionID, { id: sessionID, location: { directory: f.workspace },
     model: { id: model.id, providerID: model.providerID }, time: {} });
   f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) }]);
@@ -66,7 +66,7 @@ test('killed real worker is explicitly retired by exact process evidence; rearm 
 });
 
 test('cancel and consume are serialized; a cancelled receipt never grants a late fresh result', async t => {
-  const f = await fixture(t, undefined, '2.2.0'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
+  const f = await fixture(t, undefined, '2.2.1'), stateRoot = dirname(f.statePath), sessionID = 'ses_manual';
   f.sessions.set(sessionID, { id: sessionID, location: { directory: f.workspace },
     model: { id: model.id, providerID: model.providerID }, time: {} });
   f.messages.set(sessionID, [{ id: 'msg_manual', type: 'user', text: 'Canonical plan: ' + JSON.stringify(f.plan) }]);

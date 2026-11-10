@@ -16,7 +16,7 @@ const chatID = '00000000-0000-4000-8000-000000000020';
 const sessionID = 'ses_manual', messageID = 'msg_manual';
 async function setup(t) {
   let dispose;
-  const f = await fixture({ after: fn => { dispose = fn; } }, fileURLToPath(new URL('../helper/observer.mjs', import.meta.url)), '2.2.0'), stateRoot = dirname(f.statePath);
+  const f = await fixture({ after: fn => { dispose = fn; } }, fileURLToPath(new URL('../helper/observer.mjs', import.meta.url)), '2.2.1'), stateRoot = dirname(f.statePath);
   const connectEngine = () => connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const client = await connectEngine(), adapter = helper(client, { stateRoot, chatID: 'old-owner' });
   await adapter.bind(f.workspace, f.plan, baseline, 8);

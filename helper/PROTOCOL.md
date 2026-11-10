@@ -57,7 +57,7 @@ it does not infer execution authorization from the mere existence of a plan.
 
 The shared `connection.mjs` also serves the original transport probe. It reads
 the current user's `.local/state/opencode/service.json`, accepts loopback HTTP
-only, rejects redirects, validates installed/API version 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 or 2.2.6 and the enabled
+only, rejects redirects, validates installed/API version 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 or 2.2.7 and the enabled
 `opencode-go/deepseek-v4.1-flash` model. Credentials stay inside HTTP closures;
 the exposed client, state, results and errors contain no auth/response-body data.
 New Code Duet sessions start at High. Before dispatch on a saved idle session,
@@ -81,7 +81,7 @@ single-attempt failures. A failed parallel GET aborts its sibling. These retries
 never replay create, model selection, prompt or reply POSTs. See [wait](#wait)
 for SSE recovery and phase handling.
 
-Only the exact validated releases 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 and 2.2.6 are accepted; registration and
+Only the exact validated releases 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 and 2.2.7 are accepted; registration and
 GET info versions must agree. A mismatch is a single-attempt `engine-version`
 diagnostic with expectedVersions, observedVersion (numeric release or unknown)
 and versionSource (registration or server-info). Inspect and preflight expose

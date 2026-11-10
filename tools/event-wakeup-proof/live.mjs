@@ -31,7 +31,7 @@ function history(chatID) {
 if (command === 'serve') {
   mkdirSync(evidence, { recursive: true });
   assert.ok(!existsSync(join(evidence, 'fixture.json')), 'Never replace a live fixture');
-  const cleanup = [], f = await fixture({ after: callback => cleanup.push(callback) }, undefined, '2.2.0');
+  const cleanup = [], f = await fixture({ after: callback => cleanup.push(callback) }, undefined, '2.2.1');
   writeFileSync(join(evidence, 'fixture.json'), JSON.stringify({ root: f.root, workspace: f.workspace, plan: f.plan,
     packet: f.packet, stateRoot: dirname(f.statePath), registration: join(f.home, '.local/state/opencode/service.json') }));
   log({ kind: 'fixture-started', pid: process.pid });

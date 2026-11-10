@@ -79,7 +79,7 @@ test('one read can load ordered nested instruction files, but unrelated parallel
   assert.throws(() => inspectMessages(bound, [user, ...records]), /not correlated/);
 });
 
-for (const version of ['2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6']) test(version + ' wait accepts in-flight instruction load and completes without resending', async t => {
+for (const version of ['2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7']) test(version + ' wait accepts in-flight instruction load and completes without resending', async t => {
   const f = await fixture(t, undefined, version), client = await connect({
     registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'synthetic-fixture' });
@@ -107,7 +107,7 @@ for (const version of ['2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6']) te
 });
 
 test('unmatched synthetic persists truthful STOPPED and cannot trigger a retry or duplicate delivery', async t => {
-  const f = await fixture(t, undefined, '2.2.0');
+  const f = await fixture(t, undefined, '2.2.1');
   await f.call(f.bindArgs(8));
   await f.call(f.submitArgs);
   const binding = f.state().bindings[0];

@@ -21,7 +21,7 @@ release. Update the plugin version for a release.
 ## Check an installed helper
 
 Routine use requires Windows, Node.js 24 and the already-running OpenCode
-Desktop engine 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 or 2.2.6 with the enabled opencode-go/deepseek-v4.1-flash model.
+Desktop engine 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 or 2.2.7 with the enabled opencode-go/deepseek-v4.1-flash model.
 The helper uses Node built-ins; no npm install is needed. If access is missing,
 report it; do not install software, start a service or change global settings.
 
@@ -35,7 +35,7 @@ configured runtime's absolute executable path.
     $duetCli = Join-Path $duetRoot 'helper\cli.mjs'
     & $duetNode $duetCli inspect
 
-Expected: JSON kind connected, version 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 or 2.2.6 and the exact Go/Flash model.
+Expected: JSON kind connected, version 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 or 2.2.7 and the exact Go/Flash model.
 Only these validated releases are accepted. A version mismatch reports safe
 expected/observed versions and registration versus server-info origin; revalidate
 a later release before using it, without disabling the guard or retrying dispatch.

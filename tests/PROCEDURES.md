@@ -142,11 +142,11 @@ Direct API/helper component proof does not establish actual skill-entry routing.
 
 ## Engine release compatibility
 
-`node --test tests/version.test.mjs` checks exact releases 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.5 and 2.2.6,
+`node --test tests/version.test.mjs` checks exact releases 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 and 2.2.7,
 including multi-page completed native synthetic/compaction history, explicit
 adoption, variant/count preservation, SSE review/correction and safe version
 mismatches before any dispatch. New releases are not accepted by a version range.
-Compare the tagged upstream `packages/protocol/openapi.json` for all14 helper
+Compare the tagged upstream `packages/protocol/openapi.json` for all 16 helper
 operations and their referenced schemas before extending ENGINE_VERSIONS.
 
 A separately authorized native compatibility probe must create its own empty

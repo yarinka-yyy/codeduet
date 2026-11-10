@@ -12,7 +12,7 @@ const defaultCli = fileURLToPath(new URL('../helper/cli.mjs', import.meta.url));
 export const baseline = 'Baseline: disposable native HTTP acceptance fixture';
 export const model = { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', enabled: true, status: 'active' };
 
-export async function fixture(t, cli = defaultCli, version = '2.2.0') {
+export async function fixture(t, cli = defaultCli, version = '2.2.1') {
   const temporary = realpathSync(tmpdir()), root = mkdtempSync(join(temporary, 'duet-http-'));
   const home = join(root, 'empty-user'), workspace = join(root, 'workspace space & test');
   mkdirSync(join(home, '.local', 'state', 'opencode'), { recursive: true });

@@ -8,7 +8,7 @@ import { connect, MODEL } from '../helper/connection.mjs';
 function fixture(t) {
   const parent = realpathSync(tmpdir()), root = mkdtempSync(join(parent, 'duet-retry-'));
   const registrationPath = join(root, 'service.json');
-  const registration = { id: 'offline-engine', version: '2.2.0', url: 'http://127.0.0.1:1234', password: 'PRIVATE_RETRY_CANARY' };
+  const registration = { id: 'offline-engine', version: '2.2.1', url: 'http://127.0.0.1:1234', password: 'PRIVATE_RETRY_CANARY' };
   writeFileSync(registrationPath, JSON.stringify(registration));
   t.after(() => { assert.ok(resolve(root).startsWith(parent + sep)); rmSync(root, { recursive: true }); });
   return { root, registrationPath, registration };
@@ -27,7 +27,7 @@ function clock() {
   };
 }
 
-const goodInfo = () => Response.json({ version: '2.2.0' });
+const goodInfo = () => Response.json({ version: '2.2.1' });
 const goodModel = () => Response.json({ data: [{ ...MODEL, enabled: true, status: 'active' }] });
 
 test('partial registration and transient GET recover, while POST is never repeated', async t => {

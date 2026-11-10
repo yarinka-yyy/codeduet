@@ -8,7 +8,7 @@ import { helper, preflight as checkPreflight } from '../helper/binding.mjs';
 import { inferPostgresRecovery, sha256, verifyPostgresRecovery } from '../helper/postgres-recovery.mjs';
 
 async function stopped(t) {
-  const f = await fixture(t, undefined, '2.2.0');
+  const f = await fixture(t, undefined, '2.2.1');
   const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
   await adapter.bind(f.workspace, f.plan, baseline, 8);
