@@ -224,6 +224,83 @@ test('Windows B4-02 pg_ctl history opens ordinary and resumed review without a s
   });
 });
 
+test('B4-05-R1 uses the historical pgdata wrapper and its paired stop to resume correction two', async t => {
+  const f = await fixture(t, undefined, '2.2.6');
+  const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+  const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
+  await adapter.bind(f.workspace, f.plan, baseline, 1);
+  await adapter.submit(f.workspace, f.plan, 'B4-05-R1', f.packet, baseline, 'correction');
+  const binding = f.state().bindings[0], run = join(f.workspace, 'pgdata run');
+  const path = join(run, 'pg.ps1'), data = join(run, 'data', 'pgdata'), log = join(run, 'logs', 'postgres.log');
+  const port = 65427, pid = 35944, at = Date.now();
+  mkdirSync(dirname(log), { recursive: true }); mkdirSync(data, { recursive: true });
+  const recipe = readFileSync(new URL('../helper/PROTOCOL.md', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+    .split('### PowerShell `pg.ps1` with `data/pgdata`')[1].split('## Diagnostics')[0];
+  const [content, startCommand, stopCommand] = [...recipe.matchAll(/```powershell\n([\s\S]*?)\n```/g)].map(match =>
+    match[1].replace('<RUN>\\pg.ps1', () => path).replace('<RUN>', () => run)
+      .replace('<BIN>', () => join(f.workspace, 'pgsql', 'bin')).replace('55461', String(port)));
+  const tool = (id, name, input, step, output) => ({ id, name, type: 'tool', time: { ran: at + step, completed: at + step + 4 },
+    state: { status: 'completed', input, metadata: { status: 'completed', exit: 0, truncated: false },
+      content: [{ type: 'text', text: output }] } });
+  const write = tool('call_write', 'write', { path, content }, 0, 'Created file successfully');
+  const start = tool('call_23631d4733ae4c8eb299e27d', 'shell', { command: startCommand }, 5,
+    `status_before_start=3\nlisteners_before_start=0\nstart_exit=0\npg_isready_ok=True\nstatus_after_start=0\nlisteners_after_start=1\npostmaster_pid=${pid}\nport=${port}`);
+  const stop = tool('call_334e199a12a84adc8174134d', 'shell', { command: stopCommand }, 20,
+    `status_before_stop=0\nlisteners_before_stop=1\npostmaster_pid_before_stop=${pid}\ndata_dir=${data}\nlog=${log}\nport=${port}\nstop_exit=0\nstatus_after_stop=3\nlisteners_after_stop=0\npidfile_present=False\npostgres_procs=0`);
+  const tools = [write, start, stop];
+  const logLine = (step, text) => new Date(at + step).toISOString().replace('T', ' ').replace('Z', ` UTC [${pid}] LOG:  `) + text;
+  const bytes = [logLine(6, 'starting PostgreSQL 16.15'), logLine(7, `listening on IPv4 address "127.0.0.1", port ${port}`),
+    logLine(22, 'database system is shut down')].join('\n');
+  writeFileSync(log, bytes);
+  writeFileSync(path, 'This working copy is not the version OpenCode ran.');
+  const evidence = { messageID: binding.messageID, dataDirectory: data, log, logHash: sha256(bytes), port,
+    calls: [{ id: start.id, commandHash: sha256(startCommand), pid }] };
+  assert.deepEqual(inferPostgresRecovery(binding, tools, at + 30), evidence);
+  const verify = (history = tools, probe = () => true, changes = {}) =>
+    verifyPostgresRecovery({ ...binding, postgresRecovery: { ...evidence, ...changes } }, history, at + 30, probe);
+  assert.equal(verify(tools, (...args) => { assert.deepEqual(args, [port, false, data, [pid]]); return true; }).get(start.id).stop.tool, stop);
+  assert.throws(() => verify([start, stop]), /Unsupported PostgreSQL launch syntax/);
+  assert.throws(() => verify([write, start]), /lacks a matching stop/);
+  const newer = tool('call_edit', 'edit', { path, oldString: "$Run    =", newString: "$Run =" }, 12, 'Edited file');
+  assert.throws(() => verify([write, start, newer, stop]), /lacks a matching stop/);
+  for (const [original, replacement] of [[`=${pid}`, '=1'], [`port=${port}`, 'port=1'], [`data_dir=${data}`, `data_dir=${run}`],
+    ['status_after_stop=3', 'status_after_stop=0']]) {
+    const changed = structuredClone(stop);
+    changed.state.content[0].text = changed.state.content[0].text.replace(original, () => replacement);
+    assert.throws(() => verify([write, start, changed]), /lacks a matching stop/);
+  }
+  const late = { ...stop, time: { ran: at + 23, completed: at + 25 } };
+  assert.throws(() => verify([write, start, late]), /lacks a matching stop/);
+  assert.throws(() => verify(tools, () => false), /process, listener or PID file/);
+
+  await t.test('CLI resume-watch uses Windows checks and writes only review state', {
+    skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
+  }, async () => {
+    f.messages.get(binding.sessionID).push({ id: 'msg_postgres', type: 'assistant', model,
+      time: { completed: at + 25 }, content: tools });
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, at + 30 - Date.now())));
+    f.finish(binding.sessionID);
+    await adapter.connectionLost(new Error('Detached command status unknown; no ownership transfer'));
+    const args = ['resume-watch', f.workspace, f.plan, binding.assignmentID, binding.messageID,
+      '--session', binding.sessionID, '--non-git-baseline', baseline, '--timeout-ms', '18000'];
+    const from = f.calls.length, stoppedState = readFileSync(f.statePath), pidFile = join(data, 'postmaster.pid');
+    writeFileSync(pidFile, String(pid));
+    const blocked = await f.call(args, undefined, 22000);
+    assert.match(blocked.result.error, /PID file/);
+    assert.deepEqual(readFileSync(f.statePath), stoppedState);
+    unlinkSync(pidFile);
+    const { result } = await f.call(args, undefined, 22000);
+    assert.equal(result.kind, 'completed-for-review', JSON.stringify(result));
+    assert.equal(result.phase, 'REVIEWING');
+    assert.equal(result.correctionCount, 2);
+    assert.equal(result.taskSent, false);
+    for (const key of ['assignmentID', 'sessionID', 'messageID']) assert.equal(result[key], binding[key]);
+    assert.deepEqual(result.result.postgresRecovery, [{ id: start.id, pid, startedAt: at + 6, endedAt: at + 22, timeout: false }]);
+    assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+    assert.equal(f.posts('/api/session/' + binding.sessionID + '/prompt'), 1);
+  });
+});
+
 async function fourLaunchFixture(t) {
   const f = await fixture(t, undefined, '2.2.6');
   const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });

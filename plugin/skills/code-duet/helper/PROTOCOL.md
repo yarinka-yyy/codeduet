@@ -484,6 +484,87 @@ failures/interruption remain failed exchange evidence. While activity is running
 they do not end observation or suppress correlated requests; after stable idle
 they block completion and dispatch.
 
+### PowerShell `pg.ps1` with `data/pgdata`
+
+Use this recipe for an isolated Windows cluster already initialized at
+`<RUN>\data\pgdata` and configured to listen on `127.0.0.1` at the chosen
+`$Port`. Create `<RUN>\logs` first. Replace `<RUN>` and `<BIN>` with absolute
+paths and set `$Port` to the cluster port. Save the following as `<RUN>\pg.ps1`
+with OpenCode's `write` tool, so the exact script is available in the delivery
+history. Use the same version for both commands.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$Run    = '<RUN>'
+$Bin    = '<BIN>'
+$PgCtl  = Join-Path $Bin 'pg_ctl.exe'
+$Data   = Join-Path $Run 'data\pgdata'
+$Log    = Join-Path $Run 'logs\postgres.log'
+$Port   = 55461
+
+function Invoke-PgCtl {
+    param([string[]]$PgCtlArgs, [int]$TimeoutMs = 90000)
+    $argLine = ($PgCtlArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $PgCtl
+    $psi.Arguments = $argLine
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill() } catch { }
+            throw "pg_ctl did not exit within ${TimeoutMs}ms"
+        }
+        # Do not read the redirected streams to EOF: the started postgres server
+        # inherits those handles and would keep the pipe open after pg_ctl exits.
+        return $proc.ExitCode
+    } finally { $proc.Dispose() }
+}
+
+function Get-ClusterStatus {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $PgCtl -D $Data status *> $null
+        return $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previous }
+}
+
+function Get-PortListeners {
+    param([int]$Port)
+    return @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+        Where-Object { $_.Port -eq $Port })
+}
+```
+
+Launch in one foreground OpenCode shell call. Replace `<RUN>` in the command.
+Check that `start_exit=0`, `pg_isready_ok=True`, and `status_after_start=0`
+before running tests.
+
+```powershell
+. "<RUN>\pg.ps1"; $lines=@(); $lines += "status_before_start=$(Get-ClusterStatus)"; $lines += "listeners_before_start=$((Get-PortListeners $Port).Count)"; $code = Invoke-PgCtl -PgCtlArgs @('-D', $Data, '-l', $Log, '-w', '-t', '60', 'start'); $lines += "start_exit=$code"; $deadline=(Get-Date).AddSeconds(60); $ready=$false; while((Get-Date) -lt $deadline){ & (Join-Path $Bin 'pg_isready.exe') -h 127.0.0.1 -p $Port *> $null; if($LASTEXITCODE -eq 0){ $ready=$true; break }; Start-Sleep -Milliseconds 500 }; $lines += "pg_isready_ok=$ready"; $lines += "status_after_start=$(Get-ClusterStatus)"; $lines += "listeners_after_start=$((Get-PortListeners $Port).Count)"; $lines += "postmaster_pid=$((Get-Content -LiteralPath (Join-Path $Data 'postmaster.pid') -TotalCount 1))"; $lines += "port=$Port"; $lines | Set-Content -LiteralPath (Join-Path $Run 'logs\pg-start.log') -Encoding ascii; $lines | Out-String
+```
+
+After tests, shut down in a second foreground OpenCode shell call. Run cleanup
+even if readiness or tests fail after launch. Replace `<RUN>` here too. Keep
+`logs/postgres.log` through review and report the test result separately from
+the shutdown result.
+
+```powershell
+. "<RUN>\pg.ps1"; $lines=@(); $lines += "status_before_stop=$(Get-ClusterStatus)"; $lines += "listeners_before_stop=$((Get-PortListeners $Port).Count)"; $lines += "postmaster_pid_before_stop=$((Get-Content -LiteralPath (Join-Path $Data 'postmaster.pid') -TotalCount 1))"; $lines += "data_dir=$Data"; $lines += "log=$Log"; $lines += "port=$Port"; $code = Invoke-PgCtl -PgCtlArgs @('-D', $Data, '-m', 'fast', '-w', '-t', '60', 'stop'); Start-Sleep -Seconds 2; $lines += "stop_exit=$code"; $lines += "status_after_stop=$(Get-ClusterStatus)"; $lines += "listeners_after_stop=$((Get-PortListeners $Port).Count)"; $lines += "pidfile_present=$((Test-Path -LiteralPath (Join-Path $Data 'postmaster.pid')))"; $lines += "postgres_procs=$((@(Get-Process postgres -ErrorAction SilentlyContinue)).Count)"; $lines | Set-Content -LiteralPath (Join-Path $Run 'logs\pg-stop.log') -Encoding ascii; $lines | Out-String; Get-Content -LiteralPath $Log -Tail 4 | Out-String -Width 200
+```
+
+The recovery gate recognizes this wrapper and these command bodies. It uses the
+wrapper reconstructed from OpenCode history, the exact launch command hash,
+both shell outputs, and the PID, port, and timestamps in `logs/postgres.log`.
+It checks Windows for the process, listener and PID file. `resume-watch` can
+infer this evidence without `--postgres-evidence`. Use the original owner chat
+and exact delivery IDs.
+
 ## Diagnostics
 
 A failed wait includes diagnostic alongside its existing kind/phase/error,

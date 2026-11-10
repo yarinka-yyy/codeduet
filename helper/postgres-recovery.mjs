@@ -124,18 +124,21 @@ const pgWrapperBodies = new Set([
 ]);
 
 function wrapperVersion(tools, path, before) {
-  let script;
+  let script, versionAt = 0;
   for (const tool of tools) {
     const { path: target, content, oldString, newString, replaceAll } = tool.state?.input ?? {};
+    const { ran, completed } = tool.time ?? {};
     if (!['write', 'edit'].includes(tool.name) || typeof target !== 'string' || !isAbsolute(target) ||
-      relative(path, target) || tool.time?.ran >= before) continue;
-    if (tool.state.status !== 'completed' || !Number.isSafeInteger(tool.time?.completed) || tool.time.completed > before) return;
+      relative(path, target) || ran > before) continue;
+    if (tool.state.status !== 'completed' || !Number.isSafeInteger(ran) || !Number.isSafeInteger(completed) ||
+      ran < versionAt || ran >= before || completed < ran || completed > before) return;
     if (tool.name === 'write') script = content;
     else if (typeof script === 'string' && typeof oldString === 'string' && oldString &&
       typeof newString === 'string' && replaceAll !== true && script.split(oldString).length === 2) {
       script = script.replace(oldString, () => newString);
     } else return;
     if (typeof script !== 'string' || script.length > 32_768) return;
+    versionAt = completed;
   }
   return script;
 }
@@ -185,6 +188,19 @@ function nativePostgresCall(tool) {
   const ports = [...command.matchAll(/\bGet-NetTCPConnection -State Listen -LocalPort (\d+)\b/gi)];
   if (ports.length !== 1) return;
   const port = Number(ports[0][1]);
+  const fields = completedShellFields(tool);
+  if (!fields) return;
+  const { lines, field } = fields;
+  const pid = Number(field('postmaster_pid'));
+  if (start ? field('start_exit') !== '0' || field('status_exit') !== '0' || !Number.isSafeInteger(pid) || pid <= 0 ||
+    !lines.some(line => line.split(/\s+/).join(' ') === `127.0.0.1 ${port} ${pid}`) :
+    field('stop_exit') !== '0' || field('status_exit') !== '3' || field('pid_file_exists') !== 'False' || field('listeners') !== '0') return;
+  return { tool, run, data, bin, port, start, pid, command: command.replace(nativeCall,
+    (match, boundary, indent, args, startVerb, stopVerb) => boundary + indent + ' ' + args +
+      (startVerb ? '-l $log      ' : stopVerb)) };
+}
+
+function completedShellFields(tool) {
   const { status, exit, signal, timeout, background, truncated } = tool.state.metadata ?? {};
   if (tool.state.status !== 'completed' || status !== 'completed' || exit !== 0 || signal !== undefined ||
     timeout === true || background === true || tool.state.input.background === true || truncated === true ||
@@ -195,18 +211,50 @@ function nativePostgresCall(tool) {
     const matches = lines.filter(line => line.startsWith(name + '='));
     return matches.length === 1 ? matches[0].slice(name.length + 1) : undefined;
   };
-  const pid = Number(field('postmaster_pid'));
-  if (start ? field('start_exit') !== '0' || field('status_exit') !== '0' || !Number.isSafeInteger(pid) || pid <= 0 ||
-    !lines.some(line => line.split(/\s+/).join(' ') === `127.0.0.1 ${port} ${pid}`) :
-    field('stop_exit') !== '0' || field('status_exit') !== '3' || field('pid_file_exists') !== 'False' || field('listeners') !== '0') return;
-  return { tool, run, data, bin, port, start, pid, command: command.replace(nativeCall,
-    (match, boundary, indent, args, startVerb, stopVerb) => boundary + indent + ' ' + args +
-      (startVerb ? '-l $log      ' : stopVerb)) };
+  return { lines, field };
+}
+
+// shortcut: pin the documented pg.ps1 and its two shell bodies; broaden only with a parser that verifies all executed statements.
+const pgdataStart = '5ad1799a83498e8b08114582dceb3d0c19f1f08f457ec4daace40d5d96edca1e';
+const pgdataStop = '38b0aa40e6425dd7a29c1a29c7e7891d80c459667901ea3fd9f751f4042aabbb';
+const pgdataBody = 'fb2612cb00464ac9ff275c685b95715944a6e520cf994da1c628027c59789c7c';
+
+function wrappedPgdataCall(tool, tools) {
+  const command = tool.state?.input?.command;
+  if (tool.name !== 'shell' || typeof command !== 'string' || !Number.isSafeInteger(tool.time?.ran)) return;
+  const dot = command.match(dotSource);
+  const path = dot && literalPath(dot[1] + dot[2] + dot[1]);
+  if (!path) return;
+  const bodyHash = sha256(command.slice(dot[0].length).replace(/^[ \t]*/, ''));
+  if (bodyHash !== pgdataStart && bodyHash !== pgdataStop) return;
+  const start = bodyHash === pgdataStart;
+  const source = wrapperVersion(tools, path, tool.time.ran);
+  if (!source) return;
+  const body = source.replaceAll('\r\n', '\n').replace(/^# [^\n]*\n/, '').trimEnd();
+  const run = literalPath(body.match(/^\$Run[ \t]*=[ \t]*('[^'\r\n]+')$/m)?.[1]);
+  const bin = literalPath(body.match(/^\$Bin[ \t]*=[ \t]*('[^'\r\n]+')$/m)?.[1]);
+  const port = Number(body.match(/^\$Port[ \t]*=[ \t]*(\d+)$/m)?.[1]);
+  if (!run || !bin || relative(path, join(run, 'pg.ps1')) || !Number.isInteger(port) || port <= 0 || port > 65535 ||
+    sha256(body.replace(/^\$(Run|Bin|Port)[ \t]*=.*$/gm, (_, name) => '$' + name + ' = <' + name.toUpperCase() + '>')) !== pgdataBody) return;
+  const fields = completedShellFields(tool);
+  if (!fields) return;
+  const { field } = fields;
+  const data = join(run, 'data', 'pgdata'), log = join(run, 'logs', 'postgres.log');
+  const pid = Number(field(start ? 'postmaster_pid' : 'postmaster_pid_before_stop'));
+  if (!Number.isSafeInteger(pid) || pid <= 0 || field('port') !== String(port)) return;
+  if (start ? field('start_exit') !== '0' || field('status_before_start') !== '3' || field('listeners_before_start') !== '0' ||
+    field('pg_isready_ok') !== 'True' || field('status_after_start') !== '0' || field('listeners_after_start') !== '1' :
+    field('stop_exit') !== '0' || field('status_before_stop') !== '0' || field('listeners_before_stop') !== '1' ||
+    field('status_after_stop') !== '3' || field('listeners_after_stop') !== '0' || field('pidfile_present') !== 'False' ||
+    field('postgres_procs') !== '0' || ![field('data_dir'), field('log')].every(value => value && isAbsolute(value)) ||
+    relative(data, field('data_dir')) || relative(log, field('log'))) return;
+  return { tool, run, data, bin, port, start, pid, wrapperHash: sha256(source),
+    command: start ? command.replace("'-t', '60', 'start'", "'-t', '60', '     '") : command };
 }
 
 export function inferPostgresRecovery(binding, tools, idleAt) {
   if (!Number.isSafeInteger(binding.submittedAt) || !binding.messageID) return;
-  const starts = tools.map(nativePostgresCall).filter(call => call?.start);
+  const starts = tools.map(tool => nativePostgresCall(tool) ?? wrappedPgdataCall(tool, tools)).filter(call => call?.start);
   if (starts.length === 1) {
     const { tool, run, data, port, pid } = starts[0];
     const log = join(run, 'logs', 'postgres.log');
@@ -279,14 +327,18 @@ export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresI
   need(evidence.messageID === binding.messageID && Number.isSafeInteger(binding.submittedAt) &&
     Number.isSafeInteger(idleAt) && idleAt >= binding.submittedAt, 'PostgreSQL evidence has a different delivery or unknown time boundary');
   const run = inWorkspace(binding.workspace, dirname(dirname(evidence.log)), true);
-  const native = evidence.calls.length === 1 && nativePostgresCall(tools.find(tool => tool.id === evidence.calls[0].id) ?? {});
+  const launchTool = tools.find(tool => tool.id === evidence.calls[0].id) ?? {};
+  const foreground = evidence.calls.length === 1 && (nativePostgresCall(launchTool) ?? wrappedPgdataCall(launchTool, tools));
   let cluster = run;
-  if (native?.start) {
-    cluster = inWorkspace(binding.workspace, dirname(dirname(native.data)), true);
-    need(!relative(run, native.run) && !relative(dirname(run), dirname(cluster)) &&
-      !relative(native.data, join(cluster, 'data', 'pgdata')) && !relative(native.data, evidence.dataDirectory) &&
-      !relative(native.bin, join(cluster, 'tools', 'pgsql', 'bin')) && native.port === evidence.port &&
-      native.pid === evidence.calls[0].pid, 'PostgreSQL run, cluster, PID or listener does not match the launch call');
+  if (foreground?.start) {
+    if (!foreground.wrapperHash) {
+      cluster = inWorkspace(binding.workspace, dirname(dirname(foreground.data)), true);
+      need(!relative(dirname(run), dirname(cluster)) && !relative(foreground.bin, join(cluster, 'tools', 'pgsql', 'bin')),
+        'PostgreSQL launcher does not belong to the cluster in the launch call');
+    }
+    need(!relative(run, foreground.run) && !relative(foreground.data, join(cluster, 'data', 'pgdata')) &&
+      !relative(foreground.data, evidence.dataDirectory) && foreground.port === evidence.port &&
+      foreground.pid === evidence.calls[0].pid, 'PostgreSQL run, cluster, PID or listener does not match the launch call');
   }
   const data = recoveryData(cluster, evidence.dataDirectory);
   need(!relative(evidence.log, join(run, 'logs', 'postgres.log')), 'Expected logs/postgres.log in the PostgreSQL run directory');
@@ -329,15 +381,17 @@ export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresI
       recovered.set(call.id, { ...launch, timeout: tool.state.metadata.timeout === true, command: classified });
       continue;
     }
-    if (native?.start) {
-      const stops = tools.map(nativePostgresCall).filter(stop => stop && !stop.start && !relative(run, stop.run) &&
-        !relative(data, stop.data) && !relative(native.bin, stop.bin) && stop.port === evidence.port &&
+    if (foreground?.start) {
+      const stops = tools.map(candidate => foreground.wrapperHash ? wrappedPgdataCall(candidate, tools) : nativePostgresCall(candidate))
+        .filter(stop => stop && !stop.start && !relative(run, stop.run) && !relative(data, stop.data) &&
+        !relative(foreground.bin, stop.bin) && stop.port === evidence.port &&
+        (!foreground.wrapperHash || stop.wrapperHash === foreground.wrapperHash && stop.pid === launch.pid) &&
         Number.isSafeInteger(stop.tool.time?.ran) && Number.isSafeInteger(stop.tool.time?.completed) &&
         endedAt <= stop.tool.time.ran && stop.tool.time.ran <= launch.endedAt &&
         launch.endedAt <= stop.tool.time.completed && stop.tool.time.completed <= idleAt);
       need(tool.time.ran >= binding.submittedAt && stops.length === 1,
         'PostgreSQL shutdown lacks a matching stop and status=3 call for the same cluster and port');
-      recovered.set(call.id, { ...launch, timeout: false, command: native.command, stop: stops[0] });
+      recovered.set(call.id, { ...launch, timeout: false, command: foreground.command, stop: stops[0] });
       continue;
     }
     need(direct + indirect + portable.length === 1, 'Unsupported PostgreSQL launch syntax in call ' + call.id);

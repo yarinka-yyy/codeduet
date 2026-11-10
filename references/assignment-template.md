@@ -59,6 +59,8 @@ with startup, listening port and shutdown entries until review opens. Report
 the absolute data path, port, PID(s), launch and stop call IDs when available,
 and evidence that the PID file, processes and listener are gone. Clean up
 temporary data and credentials after shutdown. Keep credentials out of evidence.
+For a Windows cluster at `data/pgdata` using `Invoke-PgCtl`, use the
+[documented foreground launch and stop commands](../helper/PROTOCOL.md#powershell-pgps1-with-datapgdata).
 For a temporary web test stand, prefer one foreground test runner that starts the
 server with a verified absolute executable path, waits for readiness, runs the
 checks, and stops its own process tree in cleanup. Propagate the actual test exit.
