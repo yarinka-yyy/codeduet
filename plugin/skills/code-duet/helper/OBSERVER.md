@@ -53,6 +53,8 @@ pin/history checks. Uncertain create/submit/reply is still rejected. No task,
 count reset, replacement binding, model or executor resume command is sent.
 If the saved stop names a PostgreSQL shell call and additional evidence is
 needed, use [foreground resume-watch](PROTOCOL.md#resume-observation) in this chat.
+If a saved stop is re-read without reclassifying the history, consume includes
+the original sanitized toolErrors as observedToolErrors when available.
 
 ## Observe manually started work
 

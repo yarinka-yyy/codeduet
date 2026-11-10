@@ -260,7 +260,28 @@ For an explicit background `shell` launch, a native completion notice can prove
 exit zero when `/api/shell` has dropped the command. It must match the preceding
 launch in this assignment by shell ID, command and ordered times, and precede the
 final response. An active shell, conflicting API data, unsuccessful command or
-separate unresolved tool error blocks review.
+separate unresolved tool error blocks review. Without a notice, ordinary
+background work needs a matching terminal registry entry. A recorded failure or
+conflict blocks review. Older entries can omit the exit code, which remains unknown.
+
+For the supported literal Windows Next.js dev-server sequence, a native exit 1
+after tree shutdown can be reconciled. An earlier failed background launch can
+also be reconciled when the retry differs only by adding the local Node directory
+to PATH. The original run log and its timestamp, Next readiness, recorded
+listener PID, passing Playwright commands against that port, the matching
+taskkill/free-port output, and a current Windows process/listener check are
+required. When PowerShell prints a browser command's exit before reading its
+log, that inner exit must be zero. An unsuccessful check needs a later successful
+run of the same script while the stand is alive. An exact Start-Process parameter
+binding rejection before launch can be retained as a failed attempt in this
+sequence. Other launch forms and unproven cleanup remain blocking.
+
+The completion reports the shell/check IDs, PID and ports in backgroundRecovery.
+The original nonzero outcomes remain visible and semanticRecoveryVerified is
+false. This evidence opens independent review. It does not accept the product
+changes or certify test coverage. A delivery previously stopped on this sequence
+can use [resume-watch](#resume-observation) in its original Codex chat with its
+existing assignment, message and session IDs. It does not send a task.
 
 These warnings need no inferred fallback to permit independent read-only review.
 They remain error operations with semanticRecoveryVerified:false, even when a
@@ -271,7 +292,7 @@ The final must follow every completed tool, with successful correlated idle,
 no pending requests, known ended shells and an unchanged assignment boundary.
 
 toolErrors lists every tool error with sanitized message/call/tool IDs,
-classification (read-only-warning, recovered-edit or blocking), known warning
+classification (read-only-warning, recovered-edit, recovered-background-shell or blocking), known warning
 category and semanticRecoveryVerified:false. It never includes raw errors,
 URLs, commands or paths. exchangeFailure retains the first blocking reason for
 compatibility; inspect the complete toolErrors list, including warnings when a

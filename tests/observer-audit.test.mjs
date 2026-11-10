@@ -67,6 +67,7 @@ for (const external of [true, false]) for (const name of ['webfetch', 'read', 's
     const consumed = await f.o.consume(started.id);
     assert.equal(consumed.kind, external ? 'failed' : 'stopped');
     assert.equal(consumed.observedExchangeFailure.toolID, 'call_error');
+    assert.deepEqual(external ? consumed.toolErrors : consumed.observedToolErrors, saved.toolErrors);
     assert.equal(consumed.observerFailure, undefined);
     assert.equal(f.posts(`/api/session/${f.sessionID}/prompt`), external ? 0 : 1);
     if (!external) assert.equal(f.state().plans[0].correctionCount, 9);

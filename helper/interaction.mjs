@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { MODEL, requireValue as need, diagnose, diagnosticError, diagnosticEvent } from './connection.mjs';
 import { inferPostgresRecovery, verifyPostgresRecovery } from './postgres-recovery.mjs';
+import { nextRecovery, nextStandEnded } from './next-recovery.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export function fingerprint(request) {
@@ -358,14 +359,19 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     ...(/^msg_[a-zA-Z0-9]{1,160}$/.test(messageID) ? { messageID } : {}),
     ...(tool && /^[a-zA-Z0-9_-]{1,160}$/.test(tool.id) ? { toolID: tool.id } : {}),
     ...(tool && /^[a-zA-Z0-9_-]{1,80}$/.test(tool.name) ? { toolName: tool.name } : {}) });
+  const next = nextRecovery(binding, tools, backgroundShells, final, idle);
+  const stand = next?.retry ? next : undefined;
   const recoveredToolErrors = [], unresolved = [], toolErrors = [];
   for (const [index, tool] of tools.entries()) {
     const launch = backgroundShells.get(tool.state?.metadata?.shellID);
     const result = launch?.notice?.metadata;
     if (result && launch.toolID === tool.id && launch.messageID === tool.messageID &&
       (result.state !== 'completed' || result.exit !== 0 || result.timeout || result.signal !== undefined)) {
-      unresolved.push({ tool, recoverable: false });
-      toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: 'blocking', semanticRecoveryVerified: false });
+      const recoveredBy = stand?.failed === tool ? stand.retry.id : stand?.retry === tool ? stand.cleanup.id : undefined;
+      if (!recoveredBy) unresolved.push({ tool, recoverable: false });
+      toolErrors.push({ ...evidence('tool-error', tool.messageID, tool),
+        classification: recoveredBy ? 'recovered-background-shell' : 'blocking',
+        ...(recoveredBy ? { recoveredBy: shellEvidenceID(recoveredBy) } : {}), semanticRecoveryVerified: false });
     }
     if (tool.state?.status !== 'error') continue;
     const category = readOnlyToolError(tool);
@@ -391,7 +397,7 @@ export function inspectMessages(binding, messages, { adopting = false } = {}) {
     toolErrors.push({ ...evidence('tool-error', tool.messageID, tool), classification: repair ? 'recovered-edit' : 'blocking',
       ...(repair ? { recoveredBy: repair.id } : {}), semanticRecoveryVerified: false });
   }
-  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors, retries,
+  const history = { tools, final, idle, tail, backgroundShells, recoveredToolErrors, toolErrors, retries, stand, standIssue: next?.missing,
     invocationProofs: binding.invocationProofs, recoveryBinding: binding };
   // Keep history failure separate from current executor activity; preserve tools for questions.
   if (failed) return { ...history, kind: 'failed', exchangeFailure: evidence(
@@ -492,6 +498,10 @@ export function completion(history, session, shells, invocationCheck) {
   return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
     ...(tool.state.metadata?.timeout === true ? { timeout: true } : {}) })),
     ...(postgres.length ? { postgresRecovery: postgres } : {}),
+    ...(history.stand ? { backgroundRecovery: { ...(history.stand.failed ? { failedLaunch: shellEvidenceID(history.stand.failed.id) } : {}),
+      launch: shellEvidenceID(history.stand.retry.id),
+      rejectedLaunches: history.stand.rejected.map(tool => shellEvidenceID(tool.id)), stop: shellEvidenceID(history.stand.cleanup.id),
+      checks: history.stand.checks.map(shellEvidenceID), pid: history.stand.pid, port: history.stand.port, backendPort: history.stand.backend } } : {}),
     ...(shellOutcomes.length ? { shellOutcomes } : {}),
     ...(history.toolErrors?.length ? { toolErrors: history.toolErrors } : {}),
     ...(history.retries?.size ? { recoveredRetries: [...history.retries.values()] } : {}),
@@ -681,6 +691,9 @@ function endedShells(history, shells, closing = false, invocationCheck) {
   const postgres = evidence ? verifyPostgresRecovery({ ...binding, postgresRecovery: evidence }, history.tools,
     history.idle?.time?.created, undefined, history.backgroundShells) : new Map();
   if (postgres.size && invocationCheck) invocationCheck.postgresEvidence = evidence;
+  const { stand } = history;
+  if (stand) need(nextStandEnded(stand), 'Next.js shutdown is not confirmed by the Windows process and listener check (call ' +
+    shellEvidenceID(stand.cleanup.id) + ')');
   // A completed launcher alone cannot certify a detached process.
   for (const tool of history.tools) {
     const input = tool.state.input ?? {};
@@ -697,8 +710,18 @@ function endedShells(history, shells, closing = false, invocationCheck) {
       'Project shell disagrees with completion notice' + call);
     const shellEnded = listed.length === 1 || Boolean(notice && (!closing ||
       notice.metadata.state === 'completed' && Number.isSafeInteger(notice.metadata.exit)));
-    need(!/background/i.test(tool.name) && (!(input.background === true || tool.state.metadata?.background === true) ||
+    const background = input.background === true || tool.state.metadata?.background === true;
+    need(!/background/i.test(tool.name) && (!background ||
       shellEnded), 'Background operation status unknown; no ownership transfer' + call);
+    if (background && !notice && listed.length && !closing && !postgres.has(tool.id)) {
+      const [registered] = listed;
+      const ran = tool.time?.ran ?? tool.time?.created ?? 0;
+      const started = registered.time.started ?? ran;
+      need(registered.status === 'exited' && (registered.command === undefined || registered.command === input.command) &&
+        (registered.exit === undefined || registered.exit === 0) && registered.signal == null &&
+        Number.isFinite(started) && started >= ran && registered.time.completed >= started,
+      'Background shell did not exit successfully in the project registry' + call);
+    }
     if (/^(bash|shell|exec|terminal|powershell)$/.test(tool.name)) {
       need(typeof input.command === 'string', 'Unknown shell command' + call);
       need(tool.state.metadata?.status === 'completed' || shellEnded || closing && tool.state.status === 'error' &&
@@ -706,6 +729,7 @@ function endedShells(history, shells, closing = false, invocationCheck) {
       const recovered = postgres.get(tool.id);
       if (tool.state.metadata?.timeout === true || tool.state.metadata?.signal !== undefined)
         need(recovered || notice || listed.some(shell => shell.command === input.command), 'Shell termination is not confirmed' + call);
+      if (stand && (tool === stand.failed || tool === stand.retry || stand.rejected.includes(tool))) continue;
       const stop = [...postgres.values()].find(launch => launch.stop?.tool === tool)?.stop;
       const command = recovered?.command ?? stop?.command ?? input.command;
       let reason = detachedReason(command, source => maskVerifiedInvocationCalls(source, tool, history.invocationProofs, invocationCheck),

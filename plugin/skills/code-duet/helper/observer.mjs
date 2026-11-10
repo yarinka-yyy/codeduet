@@ -320,6 +320,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         unlinkSync(attempt);
       });
       return { ...result, ...(event.exchangeFailure ? { observedExchangeFailure: event.exchangeFailure } : {}),
+        ...(!result.toolErrors?.length && event.toolErrors?.length ? { observedToolErrors: event.toolErrors } : {}),
         receiptID: id, observerEvent: event.kind, observerState: 'ended', taskSent: false, rearm: result.kind === 'observing' };
     } finally {
       if (existsSync(attempt)) withStateLock(stateRoot, () => {

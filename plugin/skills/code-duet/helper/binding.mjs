@@ -2456,7 +2456,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 JSON.stringify(latest) !== JSON.stringify(messages)) {
                 history = undefined; continue;
               }
-              return { ...stopWait(failure, 'Bound assignment failed/interrupted; inspect its session'), ...progress };
+              return { ...stopWait(failure, history.toolFailure && history.standIssue ||
+                'Bound assignment failed/interrupted; inspect its session'), ...progress };
             }
             const pending = current.permissions.length ? ['permission', current.permissions[0]] :
               current.forms.length ? ['question', current.forms[0]] : null;

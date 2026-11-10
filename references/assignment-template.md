@@ -59,6 +59,12 @@ with startup, listening port and shutdown entries until review opens. Report
 the absolute data path, port, PID(s), launch and stop call IDs when available,
 and evidence that the PID file, processes and listener are gone. Clean up
 temporary data and credentials after shutdown. Keep credentials out of evidence.
+For a temporary web test stand, prefer one foreground test runner that starts the
+server with a verified absolute executable path, waits for readiness, runs the
+checks, and stops its own process tree in cleanup. Propagate the actual test exit.
+If a separate background shell is required, keep its original timestamped log
+and record the launch, readiness, listener PID and port, test exits, and matching
+stop call. Confirm the owned process and listeners are gone before handoff.
 Use actual question/permission tools when needed, wait for their replies and
 do not bypass denied permissions.
 

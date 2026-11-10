@@ -131,7 +131,8 @@ test('unmatched synthetic persists truthful STOPPED and cannot trigger a retry o
 
 test('OpenCode 2.2.5 wait reconciles an exited background shell from native history', async t => {
   for (const scenario of ['success', 'fast exit', 'API agrees', 'wrong ID', 'duplicate notice', 'bad time',
-    'bad envelope', 'running', 'API conflict', 'nonzero exit', 'other shell error']) {
+    'bad envelope', 'running', 'API conflict', 'nonzero exit', 'other shell error', 'registry only',
+    'registry nonzero', 'registry command mismatch']) {
     const f = await fixture(t, undefined, '2.2.5');
     const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
     const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'background-shell' });
@@ -148,16 +149,18 @@ test('OpenCode 2.2.5 wait reconciles an exited background shell from native hist
     text: `<shell id="${noticeID}" state="completed" command="${command}">\n${privateText}\n</shell>` };
     const records = f.messages.get(sessionID);
     if (scenario === 'bad envelope') notice.text = privateText;
-    records.push({ id: 'msg_shell', type: 'assistant', model, time: { created: now, completed: now + 3 }, content: [tool] }, notice);
+    records.push({ id: 'msg_shell', type: 'assistant', model, time: { created: now, completed: now + 3 }, content: [tool] });
+    if (!scenario.startsWith('registry ')) records.push(notice);
     if (scenario === 'duplicate notice') records.push({ ...notice, id: 'msg_duplicate' });
     if (scenario === 'other shell error') records[1].content.push({ ...tool, id: 'call_other',
       state: { status: 'error', input: { command: 'separate command' }, error: { type: 'tool.execution', message: privateText } } });
     if (scenario === 'running') f.shells = [{ id: shellID, status: 'running' }];
-    if (['API agrees', 'API conflict'].includes(scenario)) f.shells = [{ id: shellID, status: 'exited', command,
-      exit: scenario === 'API agrees' ? 0 : 1, time: { started: now + 1, completed: now + 3 } }];
+    if (['API agrees', 'API conflict'].includes(scenario) || scenario.startsWith('registry ')) f.shells = [{
+      id: shellID, status: 'exited', command: scenario === 'registry command mismatch' ? 'another command' : command,
+      exit: ['API conflict', 'registry nonzero'].includes(scenario) ? 1 : 0, time: { started: now + 1, completed: now + 3 } }];
     f.finish(sessionID);
     const result = await adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, timeoutMs: 3000 });
-    if (['success', 'fast exit', 'API agrees'].includes(scenario)) {
+    if (['success', 'fast exit', 'API agrees', 'registry only'].includes(scenario)) {
       assert.equal(result.kind, 'completed-for-review', JSON.stringify(result));
       assert.equal((await adapter.finish(f.workspace, f.plan, baseline)).phase, 'FINISHED');
     } else {
@@ -169,6 +172,7 @@ test('OpenCode 2.2.5 wait reconciles an exited background shell from native hist
       if (scenario === 'nonzero exit' || scenario === 'other shell error') {
         assert.equal(result.exchangeFailure?.toolID, scenario === 'nonzero exit' ? 'call_shell' : 'call_other');
       }
+      if (scenario.startsWith('registry ')) assert.match(result.error, /Background shell did not exit successfully.*call_shell/);
     }
     assert.equal(f.posts(`/api/session/${sessionID}/prompt`), 1);
     assert.ok(!JSON.stringify(result).includes(privateText));

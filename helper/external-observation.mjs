@@ -69,7 +69,7 @@ export async function externalOutcome(client, stateRoot, pin) {
       hash(JSON.stringify(latest)) !== hash(JSON.stringify(messages))) {
       return outcome('observing', { executorActivity: confirmed.active ? 'running' : 'idle' });
     }
-    return outcome(failure);
+    return outcome(failure, history.toolFailure && history.standIssue ? { error: history.standIssue } : {});
   }
   const pending = current.permissions.length ? ['permission', current.permissions[0]] : current.forms.length ? ['question', current.forms[0]] : null;
   if (pending) { const request = interactive(...pending, pin, history); return outcome(request.kind, request); }
