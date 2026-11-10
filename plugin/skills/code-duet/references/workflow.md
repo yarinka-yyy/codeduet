@@ -117,9 +117,9 @@ one wake hint. Consume its receipt, recheck live state and handle the actual
 outcome. After a scoped answer/reply, rearm and end the turn again. A stale event
 may return observing: rearm the unchanged assignment without resending it.
 A failed startup or uncertain queue result requires diagnosis, not another launch.
-If a read is temporarily unavailable, keep the delivery and retry consume with
-the same receipt when available. If the receipt returns observing, rearm for the
-same delivery.
+If a read is temporarily unavailable or the execution snapshot changes during
+consume, retry with the same receipt. If the receipt returns observing, rearm
+for the same delivery.
 Token deltas, submit admission, silence, timeout and final text alone
 do not transfer ownership. Follow the helper's diagnostic and [wait and phase
 rules](../helper/PROTOCOL.md#wait). The helper can continue through HTTP after a

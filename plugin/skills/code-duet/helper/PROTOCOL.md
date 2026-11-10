@@ -441,7 +441,7 @@ and `log`, `logHash` (SHA-256 of the file), `port`, and chronological `calls`
 with `id`, `pid`, and `commandHash` (SHA-256 of the exact UTF-8 shell command).
 Use reviewed paths and launch identities, including indirect script launches.
 Keep the original `logs/postgres.log` under the run directory. The data path can
-be `data/pgdata` or `pgdata` in that run, including a directory already removed
+be `data`, `data/pgdata` or `pgdata` in that run, including a directory already removed
 during verified cleanup. Each log launch needs a matching listener and shutdown
 for its PID. Use each actual OpenCode call ID, including `chatcmpl-tool-…`.
 For a correlated native background launch, the time window ends at the native
@@ -450,6 +450,16 @@ PostgreSQL startup. A foreground launch must fall inside its command window.
 The helper checks current PostgreSQL processes, the listening port, and the PID
 file, then rechecks the assignment and shell registry. Only an authorized
 resume stores an operator-provided receipt under the shared state directory.
+
+For `data` in the run, the direct `pg_ctl -w start` command must identify the
+literal run directory, its data directory and its log. If the same delivery
+uses the supported PowerShell `Invoke-PgCtl` wrapper, the original write and
+edits in OpenCode history must establish the wrapper used for each launch.
+A launcher timeout can remain in the report when the log confirms startup and
+shutdown for that PID and Windows confirms no remaining process, listener or PID
+file. Retain the unmodified PostgreSQL log through review. If the direct command
+also records the loopback port in its `pg_isready` invocation, ordinary `wait`
+and `resume-watch` can derive the receipt from these same records.
 
 For a foreground PowerShell `pg_ctl` launch with literal `$run`, `$bin`, `$data`
 and `$log = Join-Path $run 'logs\postgres.log'`, `wait` and `resume-watch` can

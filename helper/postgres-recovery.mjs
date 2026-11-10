@@ -31,7 +31,7 @@ function inWorkspace(workspace, path, directory) {
 
 function recoveryData(run, path) {
   const layout = relative(run, path);
-  need(layout === 'pgdata' || layout === join('data', 'pgdata'), 'PostgreSQL data and log must belong to the same run');
+  need(['data', 'pgdata', join('data', 'pgdata')].includes(layout), 'PostgreSQL data and log must belong to the same run');
   let current = run;
   for (const part of layout.split(sep)) {
     current = join(current, part);
@@ -97,6 +97,76 @@ const wrapper = /^[ \t]*& powershell\.exe -NoProfile -ExecutionPolicy Bypass -Fi
 const portableStart = /((?:^|;)[ \t]*& "\$pgbin[\\/]pg_ctl\.exe" -D "\$run[\\/]pgdata" -l "\$run[\\/]logs[\\/]postgres\.log" -o (?:"-p (\d+) -c listen_addresses=127\.0\.0\.1" -w |'"-p (\d+) -c listen_addresses=127\.0\.0\.1 -c logging_collector=off"' ))start(?=[ \t;\r\n]|$)/gm;
 const nativeCall = /(^|[;\r\n])([ \t]*)&([ \t]+\(Join-Path \$bin 'pg_ctl\.exe'\) -D \$data )(?:-l \$log (start)|(-m fast stop|status))(?=[ \t]*(?:[;\r\n]|$))/gim;
 
+const runDataStart = /((?:^|[;\r\n])[ \t]*&[ \t]+"\$pg[\\/]pg_ctl\.exe"[ \t]+-D \$data -l \(Join-Path \$root (?:'logs[\\/]postgres\.log'|"logs[\\/]postgres\.log")\) -w(?: -t \d+)? )start(?=[ \t]*(?:\*>|;|\r?\n|$))/gi;
+const runDataProbe = /\bpg_isready\.exe" -h 127\.0\.0\.1 -p (\d+)(?=[ \t;\r\n]|$)/i;
+const scriptStart = /(\bInvoke-PgCtl -PgCtlArgs @\('-D', \$PgData, '-l', \$PgLog, '-w'(?:, '-t', '\d+')?, ')start('\))/gi;
+const dotSource = /^\.[ \t]+(['"])([^'"\r\n]+\.ps1)\1[ \t]*;/i;
+
+function literalPath(expression) {
+  const path = expression?.match(/^'([^']+)'$|^"([^"$\x60]+)"$/);
+  const value = path?.[1] ?? path?.[2];
+  return value && isAbsolute(value) ? value : undefined;
+}
+
+function runDataRoot(command, before) {
+  const declaration = name => {
+    const found = [...command.matchAll(new RegExp('(?:^|[;\\r\\n])[ \\t]*\\$' + name + '[ \\t]*=[ \\t]*([^;\\r\\n]+)', 'gi'))];
+    return found.length === 1 && found[0].index <= before ? found[0][1].trim() : undefined;
+  };
+  if (!literalPath(declaration('pg')) || !/^Join-Path \$root (?:'data'|"data")$/i.test(declaration('data') ?? '')) return;
+  return literalPath(declaration('root'));
+}
+
+// shortcut: recognize the two archived versions of this pg_ctl wrapper; never execute a historical script.
+const pgWrapperBodies = new Set([
+  '23e9946a489f67f3f96bf3abebfe9c46ac762327974c2ae693464cbac840593a',
+  'e49a2a61e7d7511ca18a9ab9f5a4d76cf71268979963bdaaca7b2725ba3eaabc',
+]);
+
+function wrapperVersion(tools, path, before) {
+  let script;
+  for (const tool of tools) {
+    const { path: target, content, oldString, newString, replaceAll } = tool.state?.input ?? {};
+    if (!['write', 'edit'].includes(tool.name) || typeof target !== 'string' || !isAbsolute(target) ||
+      relative(path, target) || tool.time?.ran >= before) continue;
+    if (tool.state.status !== 'completed' || !Number.isSafeInteger(tool.time?.completed) || tool.time.completed > before) return;
+    if (tool.name === 'write') script = content;
+    else if (typeof script === 'string' && typeof oldString === 'string' && oldString &&
+      typeof newString === 'string' && replaceAll !== true && script.split(oldString).length === 2) {
+      script = script.replace(oldString, () => newString);
+    } else return;
+    if (typeof script !== 'string' || script.length > 32_768) return;
+  }
+  return script;
+}
+
+function runDataCommand(tool, tools, run, port) {
+  const command = tool.state?.input?.command;
+  if (tool.name !== 'shell' || typeof command !== 'string') return;
+  const direct = [...command.matchAll(runDataStart)], wrapped = [...command.matchAll(scriptStart)];
+  if (direct.length + wrapped.length !== 1) return;
+  if (direct.length) {
+    const root = runDataRoot(command, direct[0].index);
+    const probe = command.match(runDataProbe);
+    if (root && !relative(run, root) && (!probe || Number(probe[1]) === port)) return command.replace(runDataStart, '$1     ')
+      .replace(/;([ \t]*)"start exit=\$LASTEXITCODE"/gi, ';$1"pg_ctl exit=$LASTEXITCODE"');
+    return;
+  }
+  const dot = command.match(dotSource);
+  const path = dot && literalPath(dot[1] + dot[2] + dot[1]);
+  if (!path || relative(run, dirname(path))) return;
+  const source = wrapperVersion(tools, path, tool.time?.ran);
+  if (!source) return;
+  const body = source.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  const root = literalPath(body[1]?.match(/^\$Root[ \t]*=[ \t]*(.+)$/i)?.[1]);
+  const bin = literalPath(body[2]?.match(/^\$PgBin[ \t]*=[ \t]*(.+)$/i)?.[1]);
+  const declaredPort = Number(body[6]?.match(/^\$Port[ \t]*=[ \t]*(\d+)$/i)?.[1]);
+  if (!root || !bin || relative(run, root) || declaredPort !== port) return;
+  const paths = body.slice(3, 6).map(line => line.replace(/^(\$\w+)[ \t]*=[ \t]*/, '$1 = '));
+  if (!pgWrapperBodies.has(sha256([body[0], ...paths, ...body.slice(7)].join('\n')))) return;
+  return command.replace(scriptStart, '$1     $2');
+}
+
 function nativePostgresCall(tool) {
   const command = tool.state?.input?.command;
   if (tool.name !== 'shell' || typeof command !== 'string') return;
@@ -134,15 +204,74 @@ function nativePostgresCall(tool) {
       (startVerb ? '-l $log      ' : stopVerb)) };
 }
 
-export function inferPostgresRecovery(binding, tools) {
+export function inferPostgresRecovery(binding, tools, idleAt) {
   if (!Number.isSafeInteger(binding.submittedAt) || !binding.messageID) return;
   const starts = tools.map(nativePostgresCall).filter(call => call?.start);
-  if (starts.length !== 1) return;
-  const { tool, run, data, port, pid } = starts[0];
-  const log = join(run, 'logs', 'postgres.log');
-  return validatePostgresRecovery({ messageID: binding.messageID, dataDirectory: data, log,
-    logHash: sha256(readRecoveryLog(binding.workspace, log)), port,
-    calls: [{ id: tool.id, commandHash: sha256(tool.state.input.command), pid }] });
+  if (starts.length === 1) {
+    const { tool, run, data, port, pid } = starts[0];
+    const log = join(run, 'logs', 'postgres.log');
+    return validatePostgresRecovery({ messageID: binding.messageID, dataDirectory: data, log,
+      logHash: sha256(readRecoveryLog(binding.workspace, log)), port,
+      calls: [{ id: tool.id, commandHash: sha256(tool.state.input.command), pid }] });
+  }
+  if (starts.length || !Number.isSafeInteger(idleAt)) return;
+  const candidates = tools.flatMap(tool => {
+    const command = tool.state?.input?.command;
+    if (tool.name !== 'shell' || typeof command !== 'string') return [];
+    const launch = [...command.matchAll(runDataStart)];
+    if (launch.length !== 1) return [];
+    const run = runDataRoot(command, launch[0].index);
+    const port = Number(command.match(runDataProbe)?.[1]);
+    return run && Number.isInteger(port) && port > 0 && port <= 65535 ? [{ run, port }] : [];
+  });
+  if (!candidates.length) return;
+  const [{ run, port }] = candidates;
+  need(candidates.every(candidate => !relative(run, candidate.run) && candidate.port === port),
+    'Multiple PostgreSQL runs or ports in the delivery; no single recovery receipt');
+  const log = join(run, 'logs', 'postgres.log'), bytes = readRecoveryLog(binding.workspace, log);
+  const launches = parsePostgresLog(bytes, port, binding.submittedAt, idleAt);
+  const eligible = tools.filter(tool => runDataCommand(tool, tools, run, port));
+  need(launches.length && launches.length === eligible.length,
+    'PostgreSQL lifecycle evidence is incomplete; match every launch and shutdown to the exact shell call');
+  const calls = launches.map(({ pid, startedAt }) => {
+    const matches = eligible.filter(tool => tool.time?.ran <= startedAt && startedAt <= tool.time?.completed);
+    need(matches.length === 1, 'PostgreSQL launch has no unique shell call for PID ' + pid);
+    return { id: matches[0].id, commandHash: sha256(matches[0].state.input.command), pid };
+  });
+  return validatePostgresRecovery({ messageID: binding.messageID, dataDirectory: join(run, 'data'), log,
+    logHash: sha256(bytes), port, calls });
+}
+
+// shortcut: Windows recovery supports PostgreSQL's UTC and MSK timestamped PID log format.
+function parsePostgresLog(bytes, port, submittedAt, idleAt) {
+  const running = new Map(), launches = [];
+  for (const line of bytes.toString('utf8').split(/\r?\n/)) {
+    if (!/LOG:\s+(?:starting PostgreSQL |listening on IPv[46] address |database system is shut down\s*$)/.test(line)) continue;
+    const event = line.match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d\.\d{3}) (UTC|MSK) \[(\d+)\] LOG:\s+(starting PostgreSQL .+|listening on IPv[46] address .+, port \d+|database system is shut down)\s*$/);
+    need(event, 'Unsupported PostgreSQL lifecycle log entry');
+    const [, date, time, zone, rawPID, message] = event;
+    const at = Date.parse(date + 'T' + time + (zone === 'MSK' ? '+03:00' : 'Z')), pid = Number(rawPID);
+    need(Number.isSafeInteger(at) && Number.isSafeInteger(pid) && pid > 0, 'Invalid PostgreSQL lifecycle log entry');
+    if (at < submittedAt) continue;
+    need(at <= idleAt, 'PostgreSQL lifecycle extends beyond the delivered history');
+    if (message.startsWith('starting ')) {
+      need(!running.size && (!launches.length || launches.at(-1).endedAt < at), 'Overlapping PostgreSQL launches in recovery log');
+      running.set(pid, { startedAt: at, portConfirmed: false });
+    } else {
+      const instance = running.get(pid);
+      need(instance && instance.startedAt <= at, 'PostgreSQL log entry cannot be paired to its launch');
+      if (message.startsWith('listening ')) {
+        need(message.endsWith(', port ' + port), 'PostgreSQL listener disagrees with recovery evidence');
+        instance.portConfirmed = true;
+      } else {
+        need(instance.portConfirmed && instance.startedAt < at, 'PostgreSQL shutdown lacks its launch or listener evidence');
+        launches.push({ pid, startedAt: instance.startedAt, endedAt: at });
+        running.delete(pid);
+      }
+    }
+  }
+  need(!running.size, 'PostgreSQL lifecycle evidence is incomplete');
+  return launches;
 }
 
 export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresIdle, backgroundShells) {
@@ -176,37 +305,6 @@ export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresI
     need(launches.length === evidence.calls.length, 'PostgreSQL lifecycle evidence is incomplete');
   }
   const recovered = new Map();
-  // shortcut: Windows recovery supports PostgreSQL's UTC and MSK timestamped PID log format.
-  function parsePostgresLog(bytes, port, submittedAt, idleAt) {
-    const running = new Map(), launches = [];
-    for (const line of bytes.toString('utf8').split(/\r?\n/)) {
-      if (!/LOG:\s+(?:starting PostgreSQL |listening on IPv[46] address |database system is shut down\s*$)/.test(line)) continue;
-      const event = line.match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d\.\d{3}) (UTC|MSK) \[(\d+)\] LOG:\s+(starting PostgreSQL .+|listening on IPv[46] address .+, port \d+|database system is shut down)\s*$/);
-      need(event, 'Unsupported PostgreSQL lifecycle log entry');
-      const [, date, time, zone, rawPID, message] = event;
-      const at = Date.parse(date + 'T' + time + (zone === 'MSK' ? '+03:00' : 'Z')), pid = Number(rawPID);
-      need(Number.isSafeInteger(at) && Number.isSafeInteger(pid) && pid > 0, 'Invalid PostgreSQL lifecycle log entry');
-      if (at < submittedAt) continue;
-      need(at <= idleAt, 'PostgreSQL lifecycle extends beyond the delivered history');
-      if (message.startsWith('starting ')) {
-        need(!running.size && (!launches.length || launches.at(-1).endedAt < at), 'Overlapping PostgreSQL launches in recovery log');
-        running.set(pid, { startedAt: at, portConfirmed: false });
-      } else {
-        const instance = running.get(pid);
-        need(instance && instance.startedAt <= at, 'PostgreSQL log entry cannot be paired to its launch');
-        if (message.startsWith('listening ')) {
-          need(message.endsWith(', port ' + port), 'PostgreSQL listener disagrees with recovery evidence');
-          instance.portConfirmed = true;
-        } else {
-          need(instance.portConfirmed && instance.startedAt < at, 'PostgreSQL shutdown lacks its launch or listener evidence');
-          launches.push({ pid, startedAt: instance.startedAt, endedAt: at });
-          running.delete(pid);
-        }
-      }
-    }
-    need(!running.size, 'PostgreSQL lifecycle evidence is incomplete');
-    return launches;
-  }
   let includeClients = binding.legacyPostgresClients === true;
   for (const [index, launch] of launches.entries()) {
     const call = evidence.calls[index];
@@ -224,6 +322,13 @@ export function verifyPostgresRecovery(binding, tools, idleAt, probe = postgresI
     'PostgreSQL launch does not match call ' + call.id + '; check the command SHA-256, PID and correlated launch/completion timestamps');
     const direct = [...command.matchAll(pgStart)].length, indirect = [...command.matchAll(wrapper)].length;
     const portable = [...command.matchAll(portableStart)];
+    if (!relative(data, join(run, 'data'))) {
+      const classified = runDataCommand(tool, tools, run, evidence.port);
+      need(classified && tool.time.ran >= binding.submittedAt, 'PostgreSQL launch does not identify the run data and log in call ' + call.id +
+        '; check the literal pg_ctl paths or the wrapper write/edit history');
+      recovered.set(call.id, { ...launch, timeout: tool.state.metadata.timeout === true, command: classified });
+      continue;
+    }
     if (native?.start) {
       const stops = tools.map(nativePostgresCall).filter(stop => stop && !stop.start && !relative(run, stop.run) &&
         !relative(data, stop.data) && !relative(native.bin, stop.bin) && stop.port === evidence.port &&

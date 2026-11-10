@@ -70,10 +70,14 @@ async function requireQuietShells(client, binding) {
   need(shells.data.every(shell => shell.status !== 'running'), 'Project shell still running; no dispatch');
 }
 
-async function confirmHistoryAndShells(client, binding, messages, shells) {
+async function confirmHistoryAndCheckShells(client, binding, messages, shells) {
   const [latest, latestShells] = await Promise.all([assignmentMessages(client, binding), projectShells(client, binding)]);
   need(isDeepStrictEqual(latest, messages), 'History changed during completion verification');
-  need(sameProjectShells(latestShells, shells), 'Project shells changed during completion verification');
+  return sameProjectShells(latestShells, shells);
+}
+
+async function confirmHistoryAndShells(client, binding, messages, shells) {
+  need(await confirmHistoryAndCheckShells(client, binding, messages, shells), 'Project shells changed during completion verification');
 }
 function bindFingerprint(state, binding) {
   if (!binding) return createHash('sha256').update('unbound').digest('hex');
@@ -2479,15 +2483,25 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               const review = reviewReceipt(stateRoot, expected, exchange);
               const shells = await projectShells(client, expected);
               const verified = [], verification = { verified };
-              const result = completion(history, current.session, shells, verification);
+              let result, completionError;
+              try { result = completion(history, current.session, shells, verification); }
+              catch (error) { completionError = error; }
               const confirmed = await snapshot(expected);
-              need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
+              const sameExecution = !confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
                 confirmed.session.outcome === current.session.outcome &&
                 sessionAvailable(confirmed.session) === sessionAvailable(current.session) &&
                 JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model) &&
-                JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time), 'Execution changed during completion confirmation');
-              await confirmHistoryAndShells(client, expected, messages, shells);
+                JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time);
+              const stable = sameExecution && await confirmHistoryAndCheckShells(client, expected, messages, shells);
               if (stream.fault || combined.aborted) continue;
+              if (!stable) {
+                const change = sameExecution ? 'Project shells changed during completion verification' :
+                  'Execution changed during completion confirmation';
+                if (once) return { ...rejectedOutcome(expected, new Error(change)), kind: 'retryable-read' };
+                await stream.next(Math.min(250, timeoutMs));
+                continue;
+              }
+              if (completionError) throw completionError;
               return { ...record((state, binding) => {
                 saveReviewReceipt(stateRoot, binding, review);
                 saveInvocationProofs(stateRoot, binding, verified);

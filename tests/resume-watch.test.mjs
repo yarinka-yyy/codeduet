@@ -224,6 +224,106 @@ test('Windows B4-02 pg_ctl history opens ordinary and resumed review without a s
   });
 });
 
+async function fourLaunchFixture(t) {
+  const f = await fixture(t, undefined, '2.2.6');
+  const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
+  const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
+  await adapter.bind(f.workspace, f.plan, baseline, 0);
+  await adapter.submit(f.workspace, f.plan, 'B4-05', f.packet, baseline, 'correction');
+  const binding = f.state().bindings[0], run = join(f.workspace, 'test run');
+  const dataDirectory = join(run, 'data'), log = join(run, 'logs', 'postgres.log'), path = join(run, 'pg.ps1');
+  mkdirSync(dirname(log), { recursive: true }); mkdirSync(dataDirectory);
+  const bin = join(f.workspace, 'pgsql', 'bin'), port = 65428;
+  const content = readFileSync(new URL('./fixtures/postgres-wrapper.ps1', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
+    .replace('<RUN>', run).replace('<BIN>', bin);
+  const removed = '        $proc.StandardOutput.ReadToEnd() | Out-Null\n        $proc.StandardError.ReadToEnd() | Out-Null\n';
+  const base = Date.now(), at = step => base + step;
+  const tool = (id, name, input, step, end, metadata) => ({ id, name, type: 'tool',
+    time: { ran: at(step), completed: at(end) }, state: { status: 'completed', input, metadata } });
+  const shell = (id, command, step, end, timeout = false) => tool(id, 'shell', { command }, step, end,
+    { status: 'completed', ...(timeout ? { timeout: true } : { exit: 0 }) });
+  const direct = '$root="' + run + '"; $pg="' + bin + '"; $data=Join-Path $root "data"; ' +
+    '& "$pg\\pg_ctl.exe" -D $data -l (Join-Path $root "logs\\postgres.log") -w start *> $null; ' +
+    '"start exit=$LASTEXITCODE"; & "$pg\\pg_isready.exe" -h 127.0.0.1 -p ' + port;
+  const dot = '. "' + path + '"; ';
+  const start = "$code = Invoke-PgCtl -PgCtlArgs @('-D', $PgData, '-l', $PgLog, '-w', '-t', '60', 'start'); " +
+    "if ($code -eq 0) { & (Join-Path $PgBin 'pg_isready.exe') -h 127.0.0.1 -p $Port *> $null }; ";
+  const stop = "Invoke-PgCtl -PgCtlArgs @('-D', $PgData, '-m', 'fast', '-w', '-t', '60', 'stop')";
+  const first = shell('call_direct', direct, 1, 4, true);
+  const second = shell('call_wrapped_timeout', dot + start, 7, 9, true);
+  const third = shell('call_wrapped_cycle', dot + start + stop, 18, 23);
+  const fourth = shell('call_wrapped_last', dot + start, 26, 29);
+  const tools = [first, tool('call_write', 'write', { path, content }, 5, 6, {}), second,
+    tool('call_edit', 'edit', { path, oldString: removed, newString: '        # Skip inherited output pipes\n' }, 10, 11, {}),
+    shell('call_stop_second', dot + stop, 14, 17), third, fourth, shell('call_stop_last', dot + stop, 31, 34)];
+  const pids = [25224, 27560, 36400, 11592], starts = [2, 8, 19, 27], stops = [3, 16, 22, 33];
+  const bytes = pids.flatMap((pid, i) => [
+    [starts[i], 'starting PostgreSQL 16'], [starts[i], 'listening on IPv4 address "127.0.0.1", port ' + port],
+    [stops[i], 'database system is shut down'],
+  ].map(([step, message]) => new Date(at(step)).toISOString().replace('T', ' ').replace('Z', ' UTC [' + pid + '] LOG:  ') + message)).join('\n');
+  writeFileSync(log, bytes);
+  const evidence = { messageID: binding.messageID, dataDirectory, log, logHash: sha256(bytes), port,
+    calls: [first, second, third, fourth].map((call, i) => ({ id: call.id, pid: pids[i], commandHash: sha256(call.state.input.command) })) };
+  f.messages.get(binding.sessionID).push({ id: 'msg_postgres', type: 'assistant', model, time: { completed: at(35) }, content: tools });
+  await new Promise(resolve => setTimeout(resolve, Math.max(0, at(40) - Date.now())));
+  f.finish(binding.sessionID);
+  return { f, binding, adapter, tools, evidence, bytes, pids, idleAt: f.sessions.get(binding.sessionID).time.idle };
+}
+
+test('four PostgreSQL lifecycles correlate the data layout, exact calls and historical wrapper revisions', async t => {
+  const { binding, tools, evidence, bytes, pids, idleAt } = await fourLaunchFixture(t);
+  const verify = (changes = {}, history = tools, probe = () => true) =>
+    verifyPostgresRecovery({ ...binding, postgresRecovery: { ...evidence, ...changes } }, history, idleAt, probe);
+  assert.deepEqual(inferPostgresRecovery(binding, tools, idleAt), evidence);
+  const result = verify({}, tools, (...args) => {
+    assert.deepEqual(args, [evidence.port, false, evidence.dataDirectory, pids]); return true;
+  });
+  assert.deepEqual([...result.values()].map(item => item.timeout), [true, true, false, false]);
+  assert.throws(() => verify({ calls: evidence.calls.slice(1) }), /lifecycle evidence is incomplete/);
+  assert.throws(() => verify({ calls: [{ ...evidence.calls[0], pid: 1 }, ...evidence.calls.slice(1)] }), /launch does not match call/);
+  assert.throws(() => verify({ calls: [{ ...evidence.calls[0], commandHash: '0'.repeat(64) }, ...evidence.calls.slice(1)] }), /command SHA-256/);
+  assert.throws(() => verify({ dataDirectory: join(dirname(evidence.dataDirectory), 'foreign') }), /same run/);
+  assert.throws(() => verify({ port: evidence.port - 1 }), /listener disagrees/);
+  assert.throws(() => verify({}, tools.filter(tool => tool.id !== 'call_write')), /wrapper write\/edit history/);
+  assert.throws(() => verify({}, tools, () => false), /process, listener or PID file/);
+  const incomplete = bytes.split('\n').slice(0, -1).join('\n');
+  writeFileSync(evidence.log, incomplete);
+  assert.throws(() => verify({ logHash: sha256(incomplete) }), /lifecycle evidence is incomplete/);
+});
+
+test('Windows B4-05 opens the same correction for review with or without an explicit receipt', {
+  skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
+}, async t => {
+  for (const resume of [true, false]) await t.test(resume ? 'resume-watch' : 'wait', async t => {
+    const { f, binding, adapter, evidence, pids } = await fourLaunchFixture(t);
+    const args = [f.workspace, f.plan], options = ['--non-git-baseline', baseline, '--timeout-ms', '18000'];
+    const file = join(f.home, 'postgres-evidence.json');
+    writeFileSync(file, JSON.stringify(evidence));
+    if (resume) await adapter.connectionLost(new Error('Shell termination is not confirmed'));
+    const from = f.calls.length;
+    const resumeArgs = ['resume-watch', ...args, binding.assignmentID, binding.messageID,
+      '--session', binding.sessionID, '--postgres-evidence', file, ...options];
+    if (resume) {
+      const stopped = readFileSync(f.statePath), pidFile = join(evidence.dataDirectory, 'postmaster.pid');
+      writeFileSync(pidFile, String(pids[0]));
+      const blocked = await f.call(resumeArgs, undefined, 22000);
+      assert.match(blocked.result.error, /PID file/);
+      assert.deepEqual(readFileSync(f.statePath), stopped);
+      unlinkSync(pidFile);
+    }
+    const result = await f.call(resume ? resumeArgs : ['wait', ...args, ...options], undefined, 22000);
+    assert.equal(result.result.kind, 'completed-for-review', JSON.stringify(result.result));
+    for (const field of ['assignmentID', 'sessionID', 'messageID']) assert.equal(result.result[field], binding[field]);
+    assert.equal(result.result.correctionCount, 1);
+    assert.deepEqual(result.result.result.postgresRecovery.map(item => item.pid), pids);
+    assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+    assert.equal(f.posts('/api/session/' + binding.sessionID + '/prompt'), 1);
+    unlinkSync(evidence.log);
+    const finished = await f.call(['finish', ...args, '--non-git-baseline', baseline], undefined, 22000);
+    assert.equal(finished.result.kind, 'released', JSON.stringify(finished.result));
+  });
+});
+
 test('PostgreSQL recovery opens review with the timeout and reuses the receipt on release', {
   skip: process.platform !== 'win32' || process.env.DUET_TEST_POSTGRES_RECOVERY !== '1',
 }, async t => {

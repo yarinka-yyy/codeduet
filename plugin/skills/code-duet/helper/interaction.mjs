@@ -534,7 +534,7 @@ function detachedReason(command, maskInvocationCalls, postgresRecovery) {
   const normalize = source => (separateLines ? source.replace(/(^|\r?\n)[ \t]*&[ \t]*(?=\(|['"\$\w])/g, '$1') : source)
     .replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, 'quoted')
     .replace(/\b\d+>&\d+\b/g, 'redirect')
-    .replace(/(^|[;{])\s*&\s*(?=quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
+    .replace(/(^|[;{])\s*&\s*(?=\(|quoted|\$[a-zA-Z_]|[a-zA-Z_])/g, '$1 ');
   const loneAmpersand = /(^|[^&])&([^&]|$)/;
   if (loneAmpersand.test(normalize(command)) &&
     loneAmpersand.test(normalize(verifiedSource())))
@@ -687,7 +687,8 @@ function endedShells(history, shells, closing = false, invocationCheck) {
     throw new Error('Project shell still running or unknown (' + (tool ? 'call ' + shellEvidenceID(tool.id) : 'shell ' + shellEvidenceID(unfinished?.id)) + ')');
   }
   const binding = history.recoveryBinding;
-  const evidence = binding?.postgresRecovery ?? (binding && !closing ? inferPostgresRecovery(binding, history.tools) : undefined);
+  const evidence = binding?.postgresRecovery ?? (binding && !closing ?
+    inferPostgresRecovery(binding, history.tools, history.idle?.time?.created) : undefined);
   const postgres = evidence ? verifyPostgresRecovery({ ...binding, postgresRecovery: evidence }, history.tools,
     history.idle?.time?.created, undefined, history.backgroundShells) : new Map();
   if (postgres.size && invocationCheck) invocationCheck.postgresEvidence = evidence;

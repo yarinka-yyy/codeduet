@@ -67,6 +67,30 @@ test('completion available during arm goes to that turn without a second wake', 
   assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
 });
 
+test('consume rereads a changed shell registry without stopping or spending the receipt', async t => {
+  const f = await setup(t);
+  f.finish(f.session);
+  const terminal = await f.arm();
+  await f.end();
+  assert.equal(terminal.kind, 'observer-terminal');
+  const before = readFileSync(f.statePath), from = f.calls.length, now = Date.now();
+  let reads = 0;
+  f.onRequest = route => {
+    if (!route.startsWith('/api/shell?')) return;
+    if (++reads === 1) f.shells = [{ id: 'sh_ending', status: 'running', time: { started: now } }];
+    if (reads === 2) f.shells = [{ id: 'sh_ending', status: 'exited', exit: 0, time: { started: now, completed: now + 1 } }];
+  };
+  const retryable = await f.o.consume(terminal.id);
+  assert.equal(retryable.kind, 'retryable-read');
+  assert.match(retryable.error, /Project shells changed/);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  assert.deepEqual(retryable.manualCommand.args, [terminal.id]);
+  assert.equal((await f.o.consume(terminal.id)).kind, 'completed-for-review');
+  assert.equal(f.state().plans[0].correctionCount, 9);
+  assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+  assert.equal(f.posts('/api/session/' + f.session + '/prompt'), 1);
+});
+
 for (const stage of ['handoff', 'publication', 'publication timeout']) test(`temporary state lock during observer ${stage}`, async t => {
   const f = await setup(t), beforeHandoff = stage === 'handoff', timeout = stage === 'publication timeout';
   let armed = beforeHandoff ? null : await f.arm();
