@@ -115,7 +115,8 @@ export async function watch(client, sessionID, signal, workspace) {
 
 export async function observationWake(client, sessionID, signal, workspace, pollOnly = false) {
   const started = Date.now();
-  const recoverable = diagnostic => ['event-eof', 'event-read', 'event-open', 'event-handshake-timeout'].includes(diagnostic?.category);
+  const recoverable = diagnostic => ['event-eof', 'event-read', 'event-open', 'event-handshake-timeout'].includes(diagnostic?.category) ||
+    diagnostic?.category === 'event-http' && [429, 502, 503, 504].includes(diagnostic.httpStatus);
   let stream, disconnected, refreshed = false;
   try { if (!pollOnly) stream = await watch(client, sessionID, signal, workspace); }
   catch (error) {
@@ -270,6 +271,23 @@ function rejectedEdit(tool, workspace) {
   } catch { return null; }
 }
 
+const shellSearch = /^(?:(?:cd|Set-Location)[ \t]+(?:'[\w .:/\\-]+'|"[\w .:/\\-]+"|[\w.:/\\-]+)[ \t]*;[ \t]*)?Select-String[ \t]+-Path[ \t]+(?:'[\w .:/\\*?-]+'|"[\w .:/\\*?-]+"|[\w.:/\\*?-]+)[ \t]+(?:-SimpleMatch[ \t]+)?-Pattern[ \t]+/i;
+
+function rejectedShellSearch(tool) {
+  const { status, input, error, metadata } = tool.state ?? {};
+  if (tool.name !== 'shell' || status !== 'error' || metadata !== undefined || input?.background ||
+    error?.type !== 'unknown' || error.message !== 'Portable shell scanner cannot analyze command: unterminated-quote' ||
+    typeof input?.command !== 'string' || input.command.length > 8192) return false;
+  const search = shellSearch.exec(input.command);
+  if (!search) return false;
+  // The scanner refused before spawning. Recognize only the search and its optional output formatting.
+  const fields = input.command.slice(search[0].length).match(
+    /^"((?:\\["]|[\w .:|/\\*?^()[\]{}+,-])*)"(?:(?:[ \t]*\|[ \t]*ForEach-Object[ \t]*\{[ \t]*"([^"\r\n]*)"[ \t]*\})?[ \t]*\|[ \t]*Select-Object[ \t]+-First[ \t]+\d+)?[ \t]*$/i);
+  if (!fields) return false;
+  return fields[2] === undefined || /^[\w .:/\\-]*$/.test(fields[2].replace(
+    /\$\(\$_\.(?:Path|Filename|LineNumber|Line(?:\.Trim\(\))?(?:\.Substring\(0,[ \t]*\[Math\]::Min\((?:\d+,[ \t]*\$_\.Line(?:\.Trim\(\))?\.Length|\$_\.Line(?:\.Trim\(\))?\.Length,[ \t]*\d+)\)\))?)\)/gi, ''));
+}
+
 function readOnlyToolError(tool) {
   const { input, error } = tool.state ?? {};
   if (!['unknown', 'tool.execution'].includes(error?.type) ||
@@ -283,6 +301,7 @@ function readOnlyToolError(tool) {
   }
   if (error.type === 'tool.execution' && ['read', 'glob', 'grep'].includes(tool.name) &&
     (typeof input?.path === 'string' || typeof input?.pattern === 'string')) return 'read-operation-failed';
+  if (rejectedShellSearch(tool)) return 'shell-search-rejected-before-launch';
   return null;
 }
 
@@ -453,13 +472,20 @@ export function validateAnswer(request, payload) {
   }
 }
 
+export function finalReport({ final, idle }, session) {
+  need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
+  need(idle?.type === 'idle' && idle.outcome === 'succeeded' && idle.time?.created >= final.time.completed && session.time.idle >= idle.time.created, 'No correlated terminal idle');
+  const text = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+  need(text.trim(), 'Empty final response');
+  return { assistantID: final.id, text };
+}
+
 export function completion(history, session, shells, invocationCheck) {
   need(!history.kind, 'Failed/interrupted exchange cannot complete');
   const { final, idle, tools } = history;
-  need(final?.finish === 'stop' && Number.isFinite(final.time?.completed), 'No completed final assistant response');
+  const report = finalReport(history, session);
   need(history.tail.filter(message => message.type === 'assistant').every(message => history.retries?.has(message) ||
     Number.isFinite(message.time?.completed)), 'Unfinished assistant step');
-  need(idle?.type === 'idle' && idle.outcome === 'succeeded' && idle.time?.created >= final.time.completed && session.time.idle >= idle.time.created, 'No correlated terminal idle');
   const finalIndex = history.tail.indexOf(final);
   const notices = new Set([...history.backgroundShells?.values() ?? []].map(launch => launch?.notice).filter(Boolean));
   for (const [index, message] of history.tail.entries()) {
@@ -483,7 +509,7 @@ export function completion(history, session, shells, invocationCheck) {
       Number.isFinite(tool.time?.completed) && tool.time.completed <= final.time.completed;
   }), 'Outstanding/unknown tool operation');
   const postgres = endedShells(history, shells, false, invocationCheck);
-  const shellOutcomes = tools.filter(tool => /^(bash|shell|exec|terminal|powershell)$/.test(tool.name)).map(tool => {
+  const shellOutcomes = tools.filter(tool => /^(bash|shell|exec|terminal|powershell)$/.test(tool.name) && !rejectedShellSearch(tool)).map(tool => {
     const metadata = tool.state.metadata ?? {}, registered = shells.data.find(shell => shell.id && shell.id === metadata.shellID);
     const notice = history.backgroundShells?.get(metadata.shellID)?.notice?.metadata;
     const exit = notice?.exit ?? registered?.exit ?? metadata.exit, signal = notice?.signal ?? registered?.signal ?? metadata.signal;
@@ -493,9 +519,7 @@ export function completion(history, session, shells, invocationCheck) {
       ...(Number.isSafeInteger(exit) ? { exit } : {}), ...(timeout ? { timeout } : {}),
       ...(typeof signal === 'string' && /^[a-zA-Z0-9_-]{1,24}$/.test(signal) ? { signal } : {}) };
   });
-  const output = final.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
-  need(output.trim(), 'Empty final response');
-  return { kind: 'completed-for-review', result: { assistantID: final.id, text: output, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
+  return { kind: 'completed-for-review', result: { ...report, tools: tools.map(tool => ({ id: tool.id, name: tool.name, status: tool.state.status,
     ...(tool.state.metadata?.timeout === true ? { timeout: true } : {}) })),
     ...(postgres.length ? { postgresRecovery: postgres } : {}),
     ...(history.stand ? { backgroundRecovery: { ...(history.stand.failed ? { failedLaunch: shellEvidenceID(history.stand.failed.id) } : {}),
@@ -510,12 +534,18 @@ export function completion(history, session, shells, invocationCheck) {
 
 const detachedLauncher = /Start-Process|Start-(?:Thread)?Job|\bsaps\b|\bnohup\b|\bdisown\b|\bsetsid\b|\bdetach(?:ed)?\b|\bspawn\b|\bPopen\b|\bstart(?=[\s'";|&]|$)/i;
 
+function literalSearchCommand(command) {
+  const search = shellSearch.exec(command.trim());
+  return search && /^(?:"[\w .:-]+"|'[\w .:-]+')$/.test(command.trim().slice(search[0].length)) ||
+    /^[ \t]*git[ \t]+log[ \t]+--oneline[ \t]+--grep=(?:"[\w .:-]+"|'[\w .:-]+')[ \t]*$/i.test(command);
+}
+
 function detachedReason(command, maskInvocationCalls, postgresRecovery) {
   // shortcut: only exempt simple output data when the engine omits the shell dialect.
   const outputData = /^[ \t]*Write-(?:Output|Host)(?:[ \t]+(?:[\w.-]+|'[\w .-]*'))*(?:[ \t]+#[\w .-]*)?[ \t]*$/i;
   const literalSearch = /^[ \t]*rg[ \t]+-n[ \t]+"[\w.:][\w .:-]*"(?:[ \t]+[\w.\\/][\w.\\/:-]*)+[ \t]*$/i;
   // Keep the existing exemption for a literal rg search pattern, within a simple invocation.
-  const launcherSource = outputData.test(command) || literalSearch.test(command) ? '' : (postgresRecovery ?
+  const launcherSource = outputData.test(command) || literalSearch.test(command) || literalSearchCommand(command) ? '' : (postgresRecovery ?
     command.replace(/^[ \t]*"--- pg_ctl start log ---"[ \t]*\r?$/gm, '') : command).replace(
     /^([ \t]*rg[ \t]+-n[ \t]+)'[\w .:-]*(\|[\w:.-]+(?:\|[\w:.-]+)*)?'(?=[ \t])/i,
     (pattern, prefix, alternatives) => detachedLauncher.test(alternatives ?? '') ? pattern : prefix + 'quoted');
@@ -697,6 +727,7 @@ function endedShells(history, shells, closing = false, invocationCheck) {
     shellEvidenceID(stand.cleanup.id) + ')');
   // A completed launcher alone cannot certify a detached process.
   for (const tool of history.tools) {
+    if (rejectedShellSearch(tool)) continue;
     const input = tool.state.input ?? {};
     const shellID = tool.state.metadata?.shellID;
     const call = ' (call ' + shellEvidenceID(tool.id) + ')';

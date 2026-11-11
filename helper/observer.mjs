@@ -24,8 +24,8 @@ async function observerLock(stateRoot, operation) {
     }
   }
 }
-const pins = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath',
-  'engineID', 'sessionID', 'assignmentID', 'messageID', 'submittedAt', 'correctionCount'];
+const sessionPins = ['codexChat', 'workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath', 'engineID', 'sessionID'];
+const pins = [...sessionPins, 'assignmentID', 'messageID', 'submittedAt', 'correctionCount'];
 function put(path, value) {
   const candidate = path + '.' + randomUUID() + '.tmp';
   try {
@@ -70,7 +70,7 @@ function queue(receipt) {
 
 // Injectable boundaries are for isolated engine fixtures; the CLI always uses the real store/chat.
 export function observer({ stateRoot = resolve(homedir(), '.local/state/code-duet'), chatID = process.env.CODEX_THREAD_ID,
-  connectEngine = connect, deliver = queue, launch, checkCapability = path => notificationCapability(chatID, path) } = {}) {
+  connectEngine = () => connect({ requireModel: false }), deliver = queue, launch, checkCapability = path => notificationCapability(chatID, path) } = {}) {
   need(uuid.test(chatID), 'The actual current Codex thread UUID is required');
   const directory = join(stateRoot, 'observers', hash(chatID)), active = join(directory, 'active');
   const pathFor = id => { need(uuid.test(id), 'Invalid observer receipt'); return join(directory, id); };
@@ -105,13 +105,29 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     }
     if (existsSync(active) && get(active).id === id) unlinkSync(active);
   }
+  function retirePriorDelivery(current) {
+    if (!existsSync(active)) return;
+    const slot = get(active), prior = receipt(slot.id), dir = pathFor(slot.id);
+    const receiptHash = hash(readFileSync(join(dir, 'receipt.json')));
+    if (prior.mode === 'external' || slot.receiptHash !== receiptHash || !Number.isSafeInteger(prior.submittedAt) ||
+      prior.submittedAt >= current.submittedAt || prior.messageID === current.messageID ||
+      sessionPins.some(key => prior[key] !== current[key])) return;
+    const startedPath = join(dir, 'started.json'), attemptPath = join(dir, 'consume-attempt.json');
+    const started = existsSync(startedPath) ? get(startedPath) : null;
+    if (!existsSync(join(dir, 'exited.json')) && !(started?.receiptHash === receiptHash && ownerLiveness(started.process).status === 'dead')) return;
+    if (existsSync(attemptPath) && ownerLiveness(get(attemptPath).process).status !== 'dead') return;
+    const consumed = join(dir, 'consumed.json');
+    if (!existsSync(consumed)) put(consumed, { at: Date.now(), kind: 'stale' });
+    release(prior.id);
+  }
   function status(id = existsSync(active) ? get(active).id : undefined) {
     if (!id) return { kind: 'observer-status', state: 'absent', executorStopped: false };
     const value = receipt(id), dir = pathFor(id);
     const read = name => existsSync(join(dir, name)) ? get(join(dir, name)) : null;
     const attempted = !!read('notify-attempt.json'), notification = read('notify-result.json'), result = read('result.json'), started = read('started.json');
+    const exited = read('exited.json');
     const receiptHash = hash(readFileSync(join(dir, 'receipt.json'))), slot = existsSync(active) ? get(active) : null;
-    const startup = !started && slot?.id === id ? ownerLiveness(slot.receiptHash === receiptHash ? slot.launcher : null) : undefined;
+    const startup = !started && !exited && slot?.id === id ? ownerLiveness(slot.receiptHash === receiptHash ? slot.launcher : null) : undefined;
     return { kind: 'observer-status', id, codexChat: chatID, workspace: value.workspace, planPath: value.planPath,
       sessionID: value.sessionID, assignmentID: value.assignmentID, messageID: value.messageID,
       correctionCount: value.correctionCount, mode: value.mode ?? 'bound', started, ready: !!read('ready.json'),
@@ -119,7 +135,8 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
       result, notification: notification ?? (attempted ? { status: 'uncertain' } : null), attempted,
       ...(result ? { manualCommand: { command: 'consume', args: [id] } } : {}),
       cancelled: existsSync(join(dir, 'cancel.json')), consumed: existsSync(join(dir, 'consumed.json')),
-      exited: !!read('exited.json'), taskSent: false, executorStopped: false };
+      exited: !!exited, ...(exited?.kind === 'startup-failed' ? { startupFailure: 'Worker exited before confirming startup' } : {}),
+      taskSent: false, executorStopped: false };
   }
   async function inspectExternal(workspace, planPath, sessionID) {
     const value = await selectExternal(await connectEngine(), stateRoot, workspace, planPath, sessionID);
@@ -139,7 +156,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     'No eligible delivered assignment; explicit resume is required for STOPPED');
     const codex = checkCapability(codexExe), id = randomUUID(), dir = pathFor(id);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    let reserved = false, launched = false;
+    let reserved = false, launched = false, childExited = false;
     try {
       mkdirSync(dir, { mode: 0o700 });
       const snapshot = join(dir, 'code-duet');
@@ -157,26 +174,37 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         else {
           const current = binding();
           need(pins.every(key => current[key] === value[key]), 'Observer pins/count changed before startup');
+          retirePriorDelivery(current);
         }
         put(active, { id, launcher: processOwner(), receiptHash: hash(readFileSync(receiptPath)) });
         reserved = true;
         if (external) put(externalSlot(saved), { id, codexChat: chatID });
       });
       put(join(dir, 'spawn-intent.json'), { at: Date.now() });
-      if (launch) { await launch(id); launched = true; }
+      const markExited = () => { childExited = true; };
+      if (launch) { await launch(id, markExited); launched = true; }
       else {
         const child = spawn(process.execPath, [join(dir, 'code-duet', 'helper', 'observer.mjs'), 'worker', id],
           { detached: true, windowsHide: true, stdio: 'ignore' });
+        child.once('exit', markExited);
         await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); });
         launched = true; child.unref();
       }
       const end = Date.now() + 90000;
       while (Date.now() < end) {
-        if (['ready.json', 'result.json', 'exited.json'].some(name => existsSync(join(dir, name)))) {
+        if (childExited && !existsSync(join(dir, 'result.json')) && !existsSync(join(dir, 'exited.json'))) {
+          try { put(join(dir, 'exited.json'), { at: Date.now(), kind: 'startup-failed' }); }
+          catch (error) { if (error.code !== 'EEXIST') throw error; }
+        }
+        if (childExited || ['ready.json', 'result.json', 'exited.json'].some(name => existsSync(join(dir, name)))) {
           let snapshot;
           try {
             snapshot = await observerLock(stateRoot, () => {
               const current = status(id);
+              if (childExited && !current.result) {
+                release(id);
+                return { ...current, exited: true };
+              }
               if (!current.result && !current.cancelled && !current.exited) {
                 need(existsSync(active) && get(active).id === id, 'Observer slot changed before handoff');
                 same(receipt(id));
@@ -193,6 +221,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
           const failed = snapshot.cancelled || snapshot.exited && !snapshot.result || snapshot.result?.kind === 'observer-error';
           return { ...snapshot, kind: failed ? 'observer-start-failed' : snapshot.result ? 'observer-terminal' : 'observer-armed',
             observerState: snapshot.result || snapshot.exited ? 'ended' : 'watching',
+            ...(failed && !snapshot.result && childExited ? { error: 'Observer worker exited before confirming startup' } : {}),
             consumeRequired: !!snapshot.result && !snapshot.cancelled, endTurn: !failed && !snapshot.result };
         }
         await delay(100);
@@ -203,7 +232,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
   async function worker(id) {
     const value = receipt(id), dir = pathFor(id);
     const owner = processOwner();
-    withStateLock(stateRoot, () => {
+    await observerLock(stateRoot, () => {
       need(existsSync(active) && get(active).id === id, 'Observer slot changed');
       const slot = get(active), receiptHash = hash(readFileSync(join(dir, 'receipt.json')));
       need(slot.receiptHash === undefined || slot.receiptHash === receiptHash && existsSync(join(dir, 'spawn-intent.json')),
@@ -220,7 +249,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
     try {
       same(value);
       const client = await connectEngine();
-      const ready = () => withStateLock(stateRoot, () => {
+      const ready = () => observerLock(stateRoot, () => {
         same(value);
         need(!existsSync(join(dir, 'cancel.json')), 'Observer cancelled before readiness');
         put(join(dir, 'ready.json'), { at: Date.now() });
@@ -301,12 +330,15 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
             exchangeOutcome: current.exchangeOutcome, reviewAllowed: false, dispatchAllowed: false };
         } catch (error) { executorCheck = { status: 'unavailable', diagnostic: diagnose(error, 'unknown', 'snapshot') }; }
       }
-      const resume = value.resume && event.kind === 'retryable-read' && binding().phase === 'STOPPED' ?
+      const saved = value.mode === 'external' ? null : binding();
+      const stopped = saved?.phase === 'STOPPED' && !saved.uncertain && !saved.nextAssignment;
+      const retryResume = stopped && value.resume && event.kind === 'retryable-read';
+      const resume = stopped ?
         { sessionID: value.sessionID, assignmentID: value.assignmentID, messageID: value.messageID } : undefined;
       const result = event.kind === 'observer-error' ? { ...event, executorStopped: false, ...(executorCheck ? { executorCheck } : {}) } : value.mode === 'external' ?
         await externalOutcome(await connectEngine(), stateRoot, value) :
         await connectEngine().then(client => helper(client, { stateRoot, chatID }).wait(value.workspace, value.planPath,
-          { nonGitBaseline: value.nonGitBaseline, once: true, resume }), error => {
+          { nonGitBaseline: value.nonGitBaseline, once: true, resume, readStopped: stopped && !retryResume }), error => {
           if (!temporaryRead(error)) throw error;
           return { kind: 'retryable-read', diagnostic: diagnose(error, 'unknown', 'connection'), stateChange: 'unchanged' };
         });
@@ -320,7 +352,7 @@ export function observer({ stateRoot = resolve(homedir(), '.local/state/code-due
         unlinkSync(attempt);
       });
       return { ...result, ...(event.exchangeFailure ? { observedExchangeFailure: event.exchangeFailure } : {}),
-        ...(!result.toolErrors?.length && event.toolErrors?.length ? { observedToolErrors: event.toolErrors } : {}),
+        ...(event.toolErrors?.length && (!result.toolErrors?.length || result.phase === 'STOPPED') ? { observedToolErrors: event.toolErrors } : {}),
         receiptID: id, observerEvent: event.kind, observerState: 'ended', taskSent: false, rearm: result.kind === 'observing' };
     } finally {
       if (existsSync(attempt)) withStateLock(stateRoot, () => {

@@ -97,6 +97,8 @@ While execution or a question is active, DeepSeek owns project edits and
 checks. Start review only after completed-for-review, inspect the
 actual changes, then send at most one consolidated correction at a time. An
 uncertain mutation is STOPPED; never resend it.
+If a blocked result includes `report`, read it and retain its evidence. Keep
+formal review, acceptance and dispatch gated by the current outcome.
 Only on an explicit request to resume observation of an already delivered
 assignment, use [observer arm --resume](helper/OBSERVER.md). This is a
 separate route from dispatch preflight; inspect alone does not authorize it.

@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 export const EXECUTOR_MODEL = Object.freeze({ ...MODEL, variant: 'high' });
@@ -133,8 +134,15 @@ export function localEndpoint(value) {
   return url.origin;
 }
 
-export async function connect({ registrationPath = resolve(homedir(), '.local/state/opencode/service.json'),
-  fetchImpl = httpResponse, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+export function observationReader(client, signal) {
+  return { ...client, request(route, body, requestSignal, timeout) {
+    requireValue(body === undefined, 'Observation must be read-only');
+    return client.request(route, undefined, requestSignal ? AbortSignal.any([signal, requestSignal]) : signal, timeout);
+  } };
+}
+
+export async function connect({ registrationPath = resolve(homedir(), '.local/state/opencode/service.json'), requireModel = true,
+  fetchImpl = httpResponse, now = Date.now, sleep = (ms, signal) => delay(ms, undefined, { signal }),
   setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
   const startedAt = now();
   let attempts = 0, lastError;
@@ -236,7 +244,8 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
             const pause = (attempt + 1) * 250;
             if (attempt >= 2 || parentSignal?.aborted || now() + pause >= deadline ||
               !(retryable(error) || diagnostic?.httpStatus === 429 || diagnostic?.category === 'request-json')) throw error;
-            await sleep(pause);
+            try { await sleep(pause, parentSignal); }
+            catch (failure) { if (parentSignal?.aborted) throw error; throw failure; }
             if (parentSignal?.aborted || now() >= deadline) throw error;
             let current;
             try { current = JSON.parse(readFileSync(registrationPath, 'utf8')); } catch { throw error; }
@@ -249,7 +258,7 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
       const requestTimeout = Math.max(1, Math.min(20_000, 30_000 - (now() - startedAt)));
       const bootstrapRequests = [
         requestOnce('/api/info', undefined, attemptController.signal, requestTimeout),
-        requestOnce('/api/model', undefined, attemptController.signal, requestTimeout),
+        ...(requireModel ? [requestOnce('/api/model', undefined, attemptController.signal, requestTimeout)] : []),
       ];
       let info, models;
       try { [info, models] = await Promise.all(bootstrapRequests); }
@@ -258,9 +267,9 @@ export async function connect({ registrationPath = resolve(homedir(), '.local/st
         await Promise.allSettled(bootstrapRequests);
         throw error;
       }
-      requireValue(typeof info?.version === 'string' && Array.isArray(models?.data), 'Invalid engine info/model response');
+      requireValue(typeof info?.version === 'string' && (!requireModel || Array.isArray(models?.data)), 'Invalid engine info/model response');
       if (info.version !== registration.version) throw versionMismatch(info.version, [registration.version], 'server-info');
-      requireValue(models.data.some(model => model.providerID === MODEL.providerID && model.id === MODEL.id &&
+      requireValue(!requireModel || models.data.some(model => model.providerID === MODEL.providerID && model.id === MODEL.id &&
         model.enabled === true && model.status === 'active'), 'Required Go model unavailable; no fallback');
       const bootstrap = { attempts, retried: attempts > 1 };
       return {

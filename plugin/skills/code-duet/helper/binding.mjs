@@ -6,8 +6,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
-import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, temporaryRead, validateDiagnostic } from './connection.mjs';
-import { assignmentMessages, recentSessionMessages, closureBoundary, deliveredBoundary, deliveredExchange, sessionAvailable, completion, inspectMessages, interactive, validateAnswer, observationWake, fingerprint } from './interaction.mjs';
+import { MODEL, EXECUTOR_MODEL, requireValue as need, diagnose, diagnosticError, temporaryRead, validateDiagnostic, observationReader } from './connection.mjs';
+import { assignmentMessages, recentSessionMessages, closureBoundary, deliveredBoundary, deliveredExchange, finalReport, sessionAvailable, completion, inspectMessages, interactive, validateAnswer, observationWake, fingerprint } from './interaction.mjs';
 import { validatePostgresRecovery } from './postgres-recovery.mjs';
 import { localWindowsBootTime, processOwner, ownerLiveness, validProcessOwner } from './process-owner.mjs';
 
@@ -234,11 +234,11 @@ function saveState(path, state) {
   saveJSON(path, state);
 }
 
-function saveJSON(path, value, stagingRoot = dirname(path)) {
+function saveJSON(path, value, stagingRoot = dirname(path), publish = renameSync) {
   const temporary = join(stagingRoot, basename(path) + '.' + randomUUID() + '.tmp');
   try {
     writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    renameSync(temporary, path);
+    publish(temporary, path);
   } finally { if (existsSync(temporary)) unlinkSync(temporary); }
 }
 
@@ -261,17 +261,41 @@ function recordPrompt(root, binding) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   saveJSON(path, receipt);
 }
-export function planIdentity(path) {
-  const lines = readFileSync(path, 'utf8').replace(/\r\n/g, '\n').split('\n');
+function verifyPrompt(root, binding, prompt, required = false) {
+  const path = promptPath(root, binding.messageID);
+  if (!existsSync(path)) {
+    need(!required, 'Exact prompt checksum unavailable for this unreviewed legacy delivery');
+    return;
+  }
+  const receipt = JSON.parse(readFileSync(path, 'utf8'));
+  need(receipt?.owner === deliveryFingerprint(binding) && createHash('sha256').update(prompt).digest('hex') === receipt.hash,
+    'Assignment prompt checksum changed');
+}
+const planStatuses = ['TODO', 'ACTIVE', 'DONE', 'BLOCKED', 'STALE'];
+const templateStatus = /^(\s*- Status:\s+)(?:TODO|ACTIVE|DONE|BLOCKED|STALE)(?=;\s+Priority:)/i;
+function planFingerprint(source, templateValue) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
   let checkpoint = false;
+  let statusSection = false;
   const content = [];
   for (const line of lines) {
-    if (line.startsWith('## ')) checkpoint = /^## (?:Review checkpoint(?: \(advisor-owned\))?|Контрольная точка[^\n]*)\s*$/i.test(line);
+    if (line.startsWith('## ')) {
+      checkpoint = /^## (?:Review checkpoint(?: \(advisor-owned\))?|Контрольная точка[^\n]*)\s*$/i.test(line);
+      statusSection = /^## Status\s*$/i.test(line);
+    }
     if (checkpoint || !line.trim() || /^<!-- code-duet-accepted msg_[a-zA-Z0-9]+ -->$/.test(line.trim()) ||
       /^(?:Status:|\*\*Status:\*\*)\s+(?:TODO|ACTIVE|DONE|BLOCKED|STALE)\.?\s*$/i.test(line)) continue;
-    content.push(line.trimEnd().replace(/^(\s*[-*+] )\[[ xX]\](?= )/, '$1[ ]'));
+    const normalized = line.trimEnd().replace(/^(\s*[-*+] )\[[ xX]\](?= )/, '$1[ ]');
+    content.push(!statusSection || templateValue === undefined ? normalized : normalized.replace(templateStatus, '$1' + templateValue));
   }
   return createHash('sha256').update(content.join('\n')).digest('hex');
+}
+
+export function planIdentity(path) { return planFingerprint(readFileSync(path, 'utf8'), 'TODO'); }
+
+export function matchesPlanIdentity(path, expected) {
+  const source = readFileSync(path, 'utf8');
+  return [...planStatuses, undefined].some(status => planFingerprint(source, status) === expected);
 }
 
 function loadAcceptance(root, messageID) {
@@ -293,7 +317,7 @@ function recordAcceptance(root, state, binding, planPath = binding.planPath) {
   const value = { schema: 1, owner: deliveryFingerprint(binding), planPath: binding.planPath, planHash: planIdentity(planPath),
     correctionCount: state.plans.find(plan => plan.planPath === binding.planPath).correctionCount, delivery };
   const prior = readAcceptance(root, binding);
-  if (prior) return need(prior.planHash === value.planHash, 'Accepted plan identity changed');
+  if (prior) return need(matchesPlanIdentity(planPath, prior.planHash), 'Accepted plan identity changed');
   const path = acceptedPath(root, binding.messageID);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   saveJSON(path, value);
@@ -311,7 +335,7 @@ export function acceptanceStatus(workspace, planPath, messageID, { indexPath, st
     'No exact acceptance in this chat and workspace');
   const receipt = readAcceptance(stateRoot, binding, saved);
   need(receipt && (ctx.planPath === binding.planPath || !existsSync(binding.planPath)) &&
-    planIdentity(ctx.planPath) === receipt.planHash, 'Plan does not match this acceptance receipt');
+    matchesPlanIdentity(ctx.planPath, receipt.planHash), 'Plan does not match this acceptance receipt');
   const checkpointRecorded = readFileSync(ctx.planPath, 'utf8').split(/\r?\n/)
     .some(line => line.trim() === '<!-- code-duet-accepted ' + messageID + ' -->');
   let indexStatus;
@@ -344,6 +368,14 @@ function reviewReceipt(root, binding, exchange) {
   need(isDeepStrictEqual(JSON.parse(saved), receipt),
     'Delivered history changed since review; inspect the original result before continuing');
   return receipt;
+}
+function blockedReport(root, binding, messages, history, session) {
+  try {
+    const { exchange } = deliveredBoundary(binding, messages, session, true);
+    verifyPrompt(root, binding, messages[0].text);
+    reviewReceipt(root, binding, exchange);
+    return { report: finalReport(history, session) };
+  } catch { return {}; }
 }
 function saveReviewReceipt(root, binding, receipt) {
   const path = reviewPath(root, binding.messageID);
@@ -603,7 +635,7 @@ function checkTransitionSource(binding, ctx, stateRoot, movedPlanPath) {
   if (movedPlanPath !== undefined) {
     const acceptance = readAcceptance(stateRoot, binding);
     need(binding.phase === 'FINISHED' && !existsSync(binding.planPath) && acceptance &&
-      planIdentity(source.planPath) === acceptance.planHash, 'Moved plan does not match the exact FINISHED acceptance receipt');
+      matchesPlanIdentity(source.planPath, acceptance.planHash), 'Moved plan does not match the exact FINISHED acceptance receipt');
   }
   need(['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key => source[key] === ctx[key] && source[key] === binding[key]) &&
     (movedPlanPath !== undefined || source.planPath === binding.planPath), 'Prior assignment workspace/plan identity changed');
@@ -684,7 +716,7 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
           matchingSession(client, preparedBinding(stateRoot, binding)), client.request('/api/session/active'),
           client.request('/api/session/' + binding.sessionID + '/form'),
           client.request('/api/session/' + binding.sessionID + '/permission'),
-          client.request('/api/shell?location[directory]=' + encodeURIComponent(binding.workspace)),
+          projectShells(client, binding),
         ]);
         need(active?.data && typeof active.data === 'object' && !Array.isArray(active.data) &&
           Array.isArray(forms?.data) && Array.isArray(permissions?.data) && Array.isArray(shells?.data), 'Unknown live inspection status');
@@ -697,8 +729,7 @@ export async function inspect(client, { stateRoot = resolve(homedir(), '.local/s
             if (overlaps(binding.checkout, realpathSync(other.data.location.directory))) result.blockers.push('Another executor in this checkout');
           }
         }
-        need(shells.data.every(shell => ['running', 'exited', 'timeout', 'killed'].includes(shell.status) &&
-          (shell.status === 'running' || Number.isFinite(shell.time?.completed))), 'Unknown project shell status');
+        need(shellListKnown(shells), 'Unknown project shell status');
         const runningShells = shells.data.filter(shell => shell.status === 'running').length;
         if (forms.data.length) result.blockers.push('Pending forms');
         if (permissions.data.length) result.blockers.push('Pending permissions');
@@ -1258,12 +1289,32 @@ export function stateLockStatus({ stateRoot = defaultStateRoot(), probeOwner, re
     mkdirSync(archive, { recursive: true, mode: 0o700 });
     need(readFileSync(lockPath, 'utf8') === raw && isDeepStrictEqual(stateBytes(), state),
       'State or lock changed during recovery');
-    // The exclusive receipt elects a single recoverer for this immutable token.
-    writeFileSync(join(archive, owner.token + '.json'), JSON.stringify({ owner, proof,
-      stateFingerprint: state === null ? null : createHash('sha256').update(state).digest('hex') }), { flag: 'wx', mode: 0o600 });
+    const stateFingerprint = state === null ? null : createHash('sha256').update(state).digest('hex');
+    const recoverer = processOwner();
+    need(recoverer.start, 'Cannot verify recovery process identity');
+    let receiptPath = join(archive, owner.token + '.json');
+    const visited = new Set();
+    // Each dead recoverer has one exclusive successor. Never remove its claim or race a live recoverer.
+    while (existsSync(receiptPath)) {
+      need(!visited.has(receiptPath), 'Cyclic state lock recovery receipt');
+      visited.add(receiptPath);
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+      need(isDeepStrictEqual(receipt.owner, owner) && receipt.proof?.status === 'dead' &&
+        receipt.stateFingerprint === stateFingerprint && validProcessOwner(receipt.recoverer) &&
+        receipt.recoverer.start && leaseTokenPattern.test(receipt.attempt), 'Unverifiable state lock recovery receipt');
+      if (isDeepStrictEqual(receipt.recoverer, recoverer)) break;
+      need(ownerLiveness(receipt.recoverer).status === 'dead', 'State lock recovery is already in progress or its owner is unknown');
+      receiptPath = join(archive, owner.token + '.' + receipt.attempt + '.json');
+    }
+    if (!existsSync(receiptPath)) saveJSON(receiptPath,
+      { owner, proof, stateFingerprint, recoverer, attempt: randomUUID() }, archive, linkSync);
+    const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+    need(isDeepStrictEqual(receipt.recoverer, recoverer), 'State lock recovery was claimed by another process');
     need(readFileSync(lockPath, 'utf8') === raw && isDeepStrictEqual(stateBytes(), state),
       'State or lock changed during recovery');
-    renameSync(lockPath, join(archive, owner.token + '.lock'));
+    const archivedLock = join(archive, owner.token + '.lock');
+    need(!existsSync(archivedLock), 'State lock is already archived');
+    renameSync(lockPath, archivedLock);
   } catch (error) { if (error.code) throw stateFailure(error, 'state-lock'); throw error; }
   return { ...result, kind: 'state-lock-released', leaseArchived: true };
 }
@@ -1920,9 +1971,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       const start = locked(state => {
         const binding = state.bindings.find(item => item.codexChat === chatID);
         need(binding?.messageID === messageID && binding.sessionID === sessionID && !binding.uncertain &&
-          ['EXECUTING', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.pending && !binding.nextAssignment &&
+          ['EXECUTING', 'STOPPED', 'REVIEWING', 'FINISHED'].includes(binding.phase) && !binding.pending && !binding.nextAssignment &&
           !readTransition(stateRoot, messageID) && !readClosure(stateRoot, binding), 'No exact delivered assignment to rebind');
-        savedContext({ ...binding, engineID: client.engineID }, ctx);
+        savedContext({ ...binding, engineID: client.engineID }, ctx, true);
         checkoutAvailable(state, ctx, binding);
         need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no engine rebind');
         return { expected: { ...structuredClone(binding), correctionCount: planCounter(state, binding).correctionCount },
@@ -1933,16 +1984,12 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         const current = await snapshot(expected), messages = await assignmentMessages(client, expected);
         need(messages[0].text.startsWith('Assignment ID: ' + expected.assignmentID + '\nCanonical plan: ' +
           JSON.stringify(expected.planPath) + '\n'), 'Delivery does not confirm the exact original plan');
-        const path = promptPath(stateRoot, expected.messageID);
-        if (existsSync(path)) {
-          const prompt = JSON.parse(readFileSync(path, 'utf8'));
-          need(prompt?.owner === deliveryFingerprint(expected) && createHash('sha256').update(messages[0].text).digest('hex') === prompt.hash,
-            'Assignment prompt checksum changed');
-        } else need(expected.phase !== 'EXECUTING', 'Exact prompt checksum unavailable for this running legacy delivery');
-        if (expected.phase === 'EXECUTING') {
-          need(sessionAvailable(current.session) && !current.forms.length && !current.permissions.length,
+        verifyPrompt(stateRoot, expected, messages[0].text, ['EXECUTING', 'STOPPED'].includes(expected.phase));
+        if (['EXECUTING', 'STOPPED'].includes(expected.phase)) {
+          need((sessionAvailable(current.session) || expected.phase === 'STOPPED' && !current.active) && !current.forms.length && !current.permissions.length,
             'Session is unavailable or has pending interaction');
-          need(!inspectMessages(withShellEvidence(stateRoot, expected), messages).kind, 'Delivery has failed or is interrupted');
+          if (expected.phase === 'EXECUTING') need(!inspectMessages(withShellEvidence(stateRoot, expected), messages).kind,
+            'Delivery has failed or is interrupted');
           const head = await client.request(`/api/session/${sessionID}/message?limit=1&order=desc`);
           need(isDeepStrictEqual(head?.data?.[0], messages.at(-1)), 'Delivery head changed while rebinding');
         } else {
@@ -2347,10 +2394,15 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }
       });
     },
-    async connectionLost(error, { preserveReview = false } = {}) {
+    async connectionLost(error, { preserveReview = false, selection } = {}) {
+      let ctx;
+      if (selection) {
+        try { ctx = context(selection.workspace, selection.planPath, selection.nonGitBaseline); }
+        catch { return null; }
+      }
       return locked(state => {
         const binding = state.bindings.find(binding => binding.codexChat === chatID);
-        if (!binding) return null;
+        if (!binding || ctx && ['workspace', 'workspaceID', 'checkout', 'checkoutID', 'planPath'].some(key => ctx[key] !== binding[key])) return null;
         if (binding.phase === 'STOPPED') return { ...summary(state, binding, 'stopped'),
           error: binding.stopReason || 'Prior mutation uncertain; explicit continuation required',
           executorStopped: false, retried: false, stateChange: 'unchanged', ...(binding.diagnostic ? { diagnostic: binding.diagnostic } : {}) };
@@ -2365,9 +2417,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         return { ...result, diagnostic, retried, bootstrap: error?.bootstrap };
       });
     },
-    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = WAIT_TIMEOUT_MS, signal = new AbortController().signal, resume, postgresRecovery, onReady, once = false } = {}) {
+    async wait(workspace, planPath, { nonGitBaseline, timeoutMs = WAIT_TIMEOUT_MS, signal = new AbortController().signal, resume, postgresRecovery, onReady, once = false, readStopped = false } = {}) {
       need(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= WAIT_TIMEOUT_MS, 'Wait timeout must be 1..' + WAIT_TIMEOUT_MS + ' ms');
       const resuming = resume !== undefined;
+      need(!readStopped || resuming && once && !postgresRecovery, 'Reading a stopped delivery requires its exact IDs');
       if (resuming) need(resume && Object.keys(resume).length === 3 &&
         ['sessionID', 'assignmentID', 'messageID'].every(key => typeof resume[key] === 'string') &&
         /^ses_[a-zA-Z0-9]+$/.test(resume.sessionID) && /^[a-zA-Z0-9._-]{1,120}$/.test(resume.assignmentID) &&
@@ -2394,6 +2447,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         }, 250);
         const combined = AbortSignal.any([signal, deadline]);
         let expected = begun.expected, stream;
+        const reader = observationReader(client, combined);
+        const readSnapshot = () => observationSnapshot(reader, expected);
         const record = (change, kind) => {
           const saved = commit(expected, (state, binding) => {
             if (resuming) {
@@ -2412,7 +2467,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           return saved.result;
         };
         const stopWait = (kind, reason, diagnostic) => resuming && expected.phase === 'STOPPED' ?
-          { ...rejectedOutcome(expected, new Error(reason)), phase: 'STOPPED', assignmentID: expected.assignmentID,
+          { ...rejectedOutcome(expected, new Error(reason)), ...(readStopped ? { kind: 'stopped' } : {}), phase: 'STOPPED', assignmentID: expected.assignmentID,
             messageID: expected.messageID, diagnostic, executorStopped: false } :
           stoppedOutcome(expected, Object.assign(new Error(reason), { diagnostic }), kind);
         try {
@@ -2426,18 +2481,18 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (deadline.aborted) return stopWait('connection-uncertain', 'Wait deadline reached; executor termination unconfirmed',
               stream.diagnostic ?? diagnose(null, 'deadline', 'wait', stream.observation));
             if (stream.fault) return stopWait(stream.fault, 'Event stream failed/interrupted; no reconnect or ownership transfer', stream.diagnostic);
-            const current = await snapshot(expected);
+            const current = await readSnapshot();
             if (postgresRecovery) need(!current.active && !current.forms.length && !current.permissions.length &&
               current.session.time?.idle >= expected.submittedAt, 'PostgreSQL recovery requires a terminal idle assignment');
             if (resuming && expected.phase === 'STOPPED') {
-              need(current.session.time?.archived === undefined &&
-                (current.session.archived === undefined || current.session.archived === false), 'Cannot observe an archived session');
+              need(sessionAvailable(current.session) || archivedSession(current.session) && !current.active && !current.forms.length && !current.permissions.length &&
+                current.session.time?.idle >= expected.submittedAt, 'Cannot observe an archived session');
               need(current.active === undefined || current.active?.type === 'running' && Object.keys(current.active).length === 1,
                 'Unknown active execution status');
             }
             const refresh = stream.takeFailureHint();
             if (!history || refresh || current.forms.length || current.permissions.length || !current.active) {
-              messages = await assignmentMessages(client, expected);
+              messages = await assignmentMessages(reader, expected);
               const boundHistory = withShellEvidence(stateRoot, expected);
               exchange = !current.active && !current.forms.length && !current.permissions.length &&
                 current.session.outcome === 'succeeded' && current.session.time?.idle >= expected.submittedAt ?
@@ -2454,15 +2509,20 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             const failure = history.kind ?? (current.session.time?.idle >= expected.submittedAt &&
               ['failed', 'interrupted'].includes(current.session.outcome) ? current.session.outcome : null);
             if (failure && !current.active && !current.forms.length && !current.permissions.length) {
-              const confirmed = await snapshot(expected), latest = await assignmentMessages(client, expected);
+              const confirmed = await readSnapshot(), latest = await assignmentMessages(reader, expected);
+              if (combined.aborted) continue;
               if (confirmed.active || confirmed.forms.length || confirmed.permissions.length ||
+                confirmed.session.outcome !== current.session.outcome ||
                 JSON.stringify(confirmed.session.time) !== JSON.stringify(current.session.time) ||
                 JSON.stringify(latest) !== JSON.stringify(messages)) {
                 history = undefined; continue;
               }
               return { ...stopWait(failure, history.toolFailure && history.standIssue ||
-                'Bound assignment failed/interrupted; inspect its session'), ...progress };
+                'Bound assignment failed/interrupted; inspect its session'), ...progress,
+                ...blockedReport(stateRoot, expected, messages, history, confirmed.session) };
             }
+            if (readStopped && (current.active || current.forms.length || current.permissions.length))
+              return { ...stopWait('stopped', expected.stopReason, expected.diagnostic), ...progress };
             const pending = current.permissions.length ? ['permission', current.permissions[0]] :
               current.forms.length ? ['question', current.forms[0]] : null;
             if (pending) {
@@ -2480,19 +2540,18 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             if (!current.active && current.session.time?.idle >= expected.submittedAt) {
               need(current.session.outcome === 'succeeded', 'Unknown terminal outcome');
               deliveredBoundary(expected, messages, current.session, true);
-              const review = reviewReceipt(stateRoot, expected, exchange);
-              const shells = await projectShells(client, expected);
+              const shells = await projectShells(reader, expected);
               const verified = [], verification = { verified };
               let result, completionError;
               try { result = completion(history, current.session, shells, verification); }
               catch (error) { completionError = error; }
-              const confirmed = await snapshot(expected);
+              const confirmed = await readSnapshot();
               const sameExecution = !confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
                 confirmed.session.outcome === current.session.outcome &&
                 sessionAvailable(confirmed.session) === sessionAvailable(current.session) &&
                 JSON.stringify(confirmed.session.model) === JSON.stringify(current.session.model) &&
                 JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time);
-              const stable = sameExecution && await confirmHistoryAndCheckShells(client, expected, messages, shells);
+              const stable = sameExecution && await confirmHistoryAndCheckShells(reader, expected, messages, shells);
               if (stream.fault || combined.aborted) continue;
               if (!stable) {
                 const change = sameExecution ? 'Project shells changed during completion verification' :
@@ -2501,7 +2560,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
                 await stream.next(Math.min(250, timeoutMs));
                 continue;
               }
-              if (completionError) throw completionError;
+              if (completionError || readStopped) return { ...stopWait('connection-uncertain', completionError?.message ?? expected.stopReason,
+                completionError ? diagnose(completionError, 'unknown', 'snapshot', stream.observation) : expected.diagnostic), ...progress,
+                exchangeOutcome: 'succeeded', ...blockedReport(stateRoot, expected, messages, history, confirmed.session) };
+              const review = reviewReceipt(stateRoot, expected, exchange);
               return { ...record((state, binding) => {
                 saveReviewReceipt(stateRoot, binding, review);
                 saveInvocationProofs(stateRoot, binding, verified);
@@ -2519,8 +2581,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             }
             if (resuming && expected.phase === 'STOPPED') {
               need(current.active?.type === 'running', 'No correlated active execution, request or completed result');
-              const confirmed = await snapshot(expected);
-              messages = await assignmentMessages(client, expected);
+              const confirmed = await readSnapshot();
+              messages = await assignmentMessages(reader, expected);
               history = inspectMessages(expected, messages);
               need(!history.kind || confirmed.active?.type === 'running',
                 'Failed/interrupted assignment cannot resume observation');
@@ -2528,7 +2590,7 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
               need(confirmed.active.type === 'running' && Object.keys(confirmed.active).length === 1, 'Unknown active execution status');
               record((state, binding) => { delete binding.pending; binding.phase = 'EXECUTING'; }, 'observing');
             }
-            onReady?.(); onReady = undefined;
+            await onReady?.(); onReady = undefined;
             if (once) return { kind: 'observing', ...progress, phase: expected.phase, sessionID: expected.sessionID,
               assignmentID: expected.assignmentID, messageID: expected.messageID, correctionCount: expected.correctionCount };
             await stream.next(Math.min(5_000, timeoutMs));
@@ -2540,8 +2602,10 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           const diagnostic = diagnose(category ? null : error, category ?? 'unknown', category ? 'wait' : 'snapshot',
             stream?.observation ?? { elapsedMs: Math.max(0, Date.now() - startedAt), lastEvent: null });
           return stopWait(signal.aborted ? 'interrupted' : 'connection-uncertain',
-            resuming && error?.code && !error?.diagnostic ? 'Workspace or state I/O failed; inspect diagnostic' :
-              error?.message ?? 'Wait observation failed; inspect before continuing', diagnostic);
+            deadline.aborted && !signal.aborted ? 'Wait deadline reached; executor termination unconfirmed' :
+              resuming && error?.code && !error?.diagnostic ? 'Workspace or state I/O failed; inspect diagnostic' :
+                error?.message ?? 'Wait observation failed; inspect before continuing',
+            deadline.aborted && !signal.aborted ? stream?.diagnostic ?? diagnostic : diagnostic);
         } finally { clearInterval(stopping); await stream?.close(); }
       });
       return resuming ? { ...outcome, observationOnly: true, taskSent: false } : outcome;
@@ -3017,8 +3081,28 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             return summary(state, binding, 'submit-pending');
           }, () => { reservationAttempted = true; });
         } catch (error) {
-          if (reservationAttempted) error.stateOutcome = unconfirmedOutcome(reservationExpected, error,
-            'Submission intent unconfirmed; no prompt was sent');
+          if (reservationAttempted) {
+            try {
+              const { correctionCount: reservedCount, ...reservation } = reservationExpected;
+              const notSent = { ...rejectedOutcome(start.expected, new Error('Submission reservation failed before POST; previous state preserved')),
+                diagnostic: diagnose(error, 'state-io', 'state-write'), taskSent: false };
+              error.stateOutcome = locked(state => {
+                const index = state.bindings.findIndex(binding => binding.codexChat === chatID);
+                const current = state.bindings[index];
+                if (isDeepStrictEqual(current, reservation) && planCounter(state, current).correctionCount === reservedCount) {
+                  const { correctionCount, ...previous } = start.expected;
+                  state.bindings[index] = previous;
+                  planCounter(state, previous).correctionCount = correctionCount;
+                  saveOwnedState(state);
+                  return { ...notSent, stateChange: 'saved' };
+                }
+                need(unchanged(current, start.expected, state), 'Submission reservation changed');
+                return notSent;
+              });
+            } catch {
+              error.stateOutcome = unconfirmedOutcome(reservationExpected, error, 'Submission intent unconfirmed; no prompt was sent');
+            }
+          }
           throw error;
         }
         let response;

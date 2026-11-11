@@ -134,11 +134,15 @@ assignment final, ended bound execution, no pending tool/form/permission and all
 known project-changing operations ended. Unknown status means STOP.
 The helper rechecks that gate for next/finish and for changing plans; it does
 not certify correctness of changes or authorize editing during execution.
-The documented binary-read and webfetch GET429 warnings can pass this gate while
+The documented binary-read, webfetch GET429 and confirmed prelaunch file-search
+warnings can pass this gate while
 remaining in toolErrors with semanticRecoveryVerified:false. Check all warnings
 against actual evidence before accepting work or preparing a correction. A
 completed fallback, successful idle or empty search result does not prove that
 the missing information was obtained. Unknown errors and uncertain writes block.
+When a blocked delivery includes `report`, read it for diagnosis and planning.
+Keep the process guard and wait for `completed-for-review` before acceptance or
+another assignment.
 
 ## Review evidence and decide acceptance
 

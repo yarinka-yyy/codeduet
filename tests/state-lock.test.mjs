@@ -9,6 +9,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { helper, stateLockStatus } from '../helper/binding.mjs';
 import { diagnose } from '../helper/connection.mjs';
+import { processOwner } from '../helper/process-owner.mjs';
 import { baseline, fixture } from './http-fixture.mjs';
 
 function store(t) {
@@ -127,6 +128,73 @@ for (const stage of ['before-write', 'before-rename', 'after-rename']) test('sta
 });
 
 const cli = fileURLToPath(new URL('../helper/cli.mjs', import.meta.url));
+
+test('13: exact recovery can resume after EIO and refuses a tampered receipt', t => {
+  const f = store(t), token = '00000000-0000-4000-8000-000000000013';
+  const archive = join(f.stateRoot, 'state-lock-history'), receiptPath = join(archive, token + '.json');
+  const lock = JSON.stringify({ schema: 1, token, process: { ...processOwner(), pid: 424242 } });
+  fs.writeFileSync(f.lockPath, lock);
+  const recover = () => stateLockStatus({ stateRoot: f.stateRoot, probeOwner: () => ({ state: 'absent' }), recoverToken: token });
+  const rename = fs.renameSync;
+  const hook = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (from === f.lockPath) throw Object.assign(new Error('Injected EIO'), { code: 'EIO' });
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try { assert.throws(recover, error => error.diagnostic.category === 'state-io'); }
+  finally { hook.mock.restore(); syncBuiltinESMExports(); }
+  const original = fs.readFileSync(receiptPath, 'utf8');
+  fs.writeFileSync(receiptPath, JSON.stringify({ ...JSON.parse(original), stateFingerprint: 'tampered' }));
+  assert.throws(recover, /Unverifiable state lock recovery receipt/);
+  assert.equal(fs.readFileSync(f.lockPath, 'utf8'), lock);
+  fs.writeFileSync(receiptPath, original);
+  assert.equal(recover().kind, 'state-lock-released');
+  assert.equal(fs.readFileSync(join(archive, token + '.lock'), 'utf8'), lock);
+  assert.equal(fs.readFileSync(f.statePath, 'utf8'), f.original);
+});
+
+test('13: a live recoverer excludes competitors; one successor archives after its exit', async t => {
+  const f = store(t), token = '00000000-0000-4000-8000-000000000014';
+  const lock = JSON.stringify({ schema: 1, token, process: { ...processOwner(), pid: 424242 } });
+  fs.writeFileSync(f.lockPath, lock);
+  const module = new URL('../helper/binding.mjs', import.meta.url).href;
+  const code = `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { stateLockStatus } from ${JSON.stringify(module)};
+    const [stateRoot, recoverToken, lockPath, pause] = process.argv.slice(1);
+    if (pause) {
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        if (from === lockPath) {
+          process.stdout.write('claimed');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+        return rename(from, to);
+      };
+      syncBuiltinESMExports();
+    }
+    try { console.log(stateLockStatus({ stateRoot, recoverToken, probeOwner: () => ({ state: 'absent' }) }).kind); }
+    catch (error) { console.log(error.message); }`;
+  const args = ['--input-type=module', '-e', code, f.stateRoot, token, f.lockPath];
+  const child = spawn(process.execPath, [...args, 'pause'], { windowsHide: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  const exited = new Promise((resolve, reject) => { child.once('close', resolve); child.once('error', reject); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; });
+  await Promise.race([new Promise(resolve => child.stdout.once('data', resolve)), exited.then(() => assert.fail('Recoverer did not claim'))]);
+  const run = async () => (await promisify(execFile)(process.execPath, args, { windowsHide: true })).stdout.trim();
+  assert.match(await run(), /recovery is already in progress/);
+  assert.equal(fs.readFileSync(f.lockPath, 'utf8'), lock);
+  child.kill('SIGKILL'); await exited;
+  const outcomes = await Promise.all([run(), run()]);
+  assert.equal(outcomes.filter(value => value === 'state-lock-released').length, 1);
+  assert.equal(fs.readFileSync(join(f.stateRoot, 'state-lock-history', token + '.lock'), 'utf8'), lock);
+  assert.equal(fs.readFileSync(f.statePath, 'utf8'), f.original);
+  const replacement = lock.replace(token, '00000000-0000-4000-8000-000000000015');
+  fs.writeFileSync(f.lockPath, replacement, { flag: 'wx' });
+  assert.equal(await run(), 'rejected');
+  assert.equal(fs.readFileSync(f.lockPath, 'utf8'), replacement);
+});
+
 async function deniedCLI(f, args) {
   const result = await promisify(execFile)(process.execPath,
     ['--no-warnings', '--permission', '--allow-fs-read=*', cli, ...args],

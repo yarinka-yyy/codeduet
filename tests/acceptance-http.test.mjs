@@ -134,7 +134,7 @@ for (const fault of ['drop', 'http429']) test('native CLI ' + fault + ' preserve
 for (const mode of ['disabled-go', 'free-only']) test('native CLI rejects ' + mode + ' without fallback, pair creation or saved state', async t => {
   const f = await fixture(t);
   f.models = mode === 'disabled-go' ? [{ ...model, enabled: false }] : [{ ...model, providerID: 'opencode' }];
-  const result = await f.call(['inspect']);
+  const result = await f.call(f.bindArgs(0));
   assert.equal(result.status, 1); assert.match(result.result.error, /Go model unavailable; no fallback/);
   assert.ok(!existsSync(f.statePath));
   assert.ok(f.calls.every(call => call.method === 'GET' && ['/api/info', '/api/model'].includes(call.route)));

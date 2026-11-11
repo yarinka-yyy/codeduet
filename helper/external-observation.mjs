@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { requireValue as need, diagnose } from './connection.mjs';
-import { observationContext, observationSnapshot, planIdentity, projectShells, readState, sameProjectShells } from './binding.mjs';
+import { requireValue as need, diagnose, observationReader } from './connection.mjs';
+import { observationContext, observationSnapshot, planIdentity, matchesPlanIdentity, projectShells, readState, sameProjectShells } from './binding.mjs';
 import { recentSessionMessages, inspectMessages, interactive, completion, observationWake } from './interaction.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -11,7 +11,7 @@ const count = (state, pin) => state.plans.find(value => value.workspace === pin.
 export function externalUnchanged(pin, stateRoot) {
   const ctx = observationContext(pin.workspace, pin.planPath);
   need(Object.keys(ctx).every(key => ctx[key] === pin[key]) &&
-    (pin.planHashVersion === 2 ? planIdentity(pin.planPath) : hash(readFileSync(pin.planPath))) === pin.planHash,
+    (pin.planHashVersion === 2 ? matchesPlanIdentity(pin.planPath, pin.planHash) : hash(readFileSync(pin.planPath)) === pin.planHash),
     'Observation physical context/plan changed');
   const state = readState(join(stateRoot, 'state.json'));
   need(!state.bindings.some(value => value.sessionID === pin.sessionID),
@@ -76,30 +76,41 @@ export async function externalOutcome(client, stateRoot, pin) {
   if (current.active) return outcome('observing');
   need(current.session.outcome === 'succeeded', 'No confirmed execution outcome');
   const shells = await projectShells(client, pin);
-  const result = completion(history, current.session, shells);
+  let result, completionError;
+  try { result = completion(history, current.session, shells); }
+  catch (error) { completionError = error; }
   const confirmed = await observationSnapshot(client, pin);
   const [latest, latestShells] = await Promise.all([recentSessionMessages(client, pin.sessionID), projectShells(client, pin)]);
   externalUnchanged(pin, stateRoot);
-  need(!confirmed.active && !confirmed.forms.length && !confirmed.permissions.length &&
-    confirmed.session.outcome === 'succeeded' && JSON.stringify(confirmed.session.time) === JSON.stringify(current.session.time) &&
-    hash(JSON.stringify(latest)) === hash(JSON.stringify(messages)) && sameProjectShells(latestShells, shells),
-  'Execution changed during completion confirmation');
+  need(latest[0]?.id === pin.messageID && typeof latest[0]?.text === 'string' && hash(latest[0].text) === pin.promptHash,
+    'Observation prompt changed; no automatic retarget');
+  if (confirmed.active || confirmed.forms.length || confirmed.permissions.length || confirmed.session.outcome !== 'succeeded' ||
+    JSON.stringify(confirmed.session.time) !== JSON.stringify(current.session.time) ||
+    hash(JSON.stringify(latest)) !== hash(JSON.stringify(messages)) || !sameProjectShells(latestShells, shells)) {
+    return outcome('retryable-read', { error: 'Execution changed during completion confirmation' });
+  }
+  if (completionError) throw completionError;
   return outcome('external-completed', { result: result.result });
 }
 
 export async function waitExternal(client, stateRoot, pin, { signal, timeoutMs, onReady }) {
   const deadline = AbortSignal.timeout(timeoutMs), combined = AbortSignal.any([signal, deadline]);
+  const reader = observationReader(client, combined);
+  const interrupted = () => ({ kind: 'observer-error', diagnostic: diagnose(null, signal.aborted ? 'interrupted' : 'deadline', 'wait', stream?.observation) });
   let stream;
   try {
     stream = await observationWake(client, pin.sessionID, combined, pin.workspace);
     while (true) {
-      if (combined.aborted) return { kind: 'observer-error', diagnostic: diagnose(null, signal.aborted ? 'interrupted' : 'deadline', 'wait', stream.observation) };
+      if (combined.aborted) return interrupted();
       if (stream.fault) return { kind: 'observer-error', diagnostic: stream.diagnostic };
-      const outcome = await externalOutcome(client, stateRoot, pin);
+      const outcome = await externalOutcome(reader, stateRoot, pin);
       if (stream.fault || combined.aborted) continue;
-      if (outcome.kind !== 'observing') return outcome;
-      onReady?.(); onReady = undefined;
-      await stream.next(Math.min(5000, timeoutMs));
+      if (!['observing', 'retryable-read'].includes(outcome.kind)) return outcome;
+      await onReady?.(); onReady = undefined;
+      await stream.next(Math.min(outcome.kind === 'retryable-read' ? 250 : 5000, timeoutMs));
     }
+  } catch (error) {
+    if (combined.aborted) return interrupted();
+    throw error;
   } finally { await stream?.close(); }
 }

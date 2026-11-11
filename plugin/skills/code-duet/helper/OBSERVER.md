@@ -184,6 +184,10 @@ After reply, arm again and end the turn.
 For a bound delivery, observing means the event is stale: rearm the unchanged
 delivery and end the turn.
 STOPPED/observer-error means report the failure, without automatic recovery.
+If the exact delivery has a confirmed terminal idle and a final answer, a
+blocked bound result may also return `report` for read-only inspection. The
+receipt does not store the report. `reviewAllowed` and `dispatchAllowed` remain
+false until the normal guard succeeds, and the stored STOPPED phase is preserved.
 For passive observation, an observer-error consume also returns executorCheck:
 checked with the freshly validated outcome kind, or unavailable with a sanitized
 diagnostic. The saved observer error remains the primary result; even a live
@@ -206,8 +210,10 @@ again. A changed snapshot keeps observing; it cannot end a newly resumed run.
 An old session.outcome:succeeded while
 active is running does not complete the current exchange. Error executorCheck may
 describe a fresh completed exchange, but grants neither review nor dispatch there.
-Repeated consume after success returns already-consumed with no action. A wake
-that was already queued when the result was read manually has the same outcome.
+Repeated consume after success returns already-consumed with no action. If a
+manual wait was followed by a new delivery in the same session, arm retires the
+old slot only after confirming the old worker ended. A late wake for that
+retired receipt returns already-consumed and cannot touch the new slot.
 If consume returns retryable-read, it leaves the receipt unconsumed. After the read problem
 is resolved, use the returned manualCommand to consume the same receipt in the
 owner chat without cancelling it, rearming or resending.
@@ -220,16 +226,18 @@ software wait. Token/tool progress and ordinary polls do not wake GPT. The total
 deadline defaults to four hours (14400000 ms), also the maximum; shorter explicit
 deadlines remain supported. Expiration is an error, never completion. Receipts
 already armed retain their recorded deadline; an installation update does not
-extend or restart an existing observer.
+extend or restart an existing observer. The deadline covers in-flight reads.
 
 The shared event stream covers all engine locations. A lifecycle event whose
 event.location.directory resolves to a different physical directory is ignored.
 Selected or unresolved location shutdown/disposal stops observation with
 location-shutdown; server shutdown stops it with engine-shutdown. Diagnostics
 retain the exact known event type and eventScope (server/selected/unknown),
-without copying event payloads or filesystem paths. SSE EOF switches the worker
-to HTTP polling through the original deadline. Completion requires a fresh exact
-history and idle/shell check.
+without copying event payloads or filesystem paths. SSE EOF and a temporary
+HTTP handshake failure (429, 502, 503 or 504) switch the worker to GET polling
+through the original deadline. Completion requires a fresh exact history and
+idle/shell check. A transient change between passive completion snapshots repeats
+that check for the same prompt. A changed prompt still stops observation.
 
 ## Stop and remove
 

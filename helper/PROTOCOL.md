@@ -123,6 +123,9 @@ with up to 7 attempts in a 120 ms window. `state-lock` inspects the current owne
 Use `state-lock <exact-token>` to archive a lock only after proving that its owner
 ended and checking that the lock and `state.json` are unchanged. Unknown or legacy
 owners remain locked. State access errors and process identity errors are distinct.
+If archiving is interrupted after writing the receipt, repeat the exact token.
+Only its recorded recoverer or one verified successor of a dead recoverer may
+continue. A receipt without a verified recoverer cannot authorize a takeover.
 This does not lock the OS or prevent user edits to the project.
 
 Long operations hold a separate per-checkout ownership lease. The lease prevents
@@ -140,6 +143,9 @@ Schema3 operation leases record physical workspace, plan and process identity.
 Each protected save pins the binding and plan counters on both sides of the
 atomic write. `ownership --action inspect` and `--action recover` use those pins.
 Recovering a lease preserves the saved delivery, receipts and any uncertain POST.
+If saving a prompt reservation fails and the sending process can prove it never
+started the POST, it restores the exact prior assignment and correction count.
+Once POST has started or its outcome cannot be proved, the reservation remains.
 Every post-network save reloads the store under `state.lock` and validates the
 saved chat/session/assignment/message/phase before applying only its own change,
 so another workspace's binding and counter are retained. Schema-1 bindings and
@@ -421,6 +427,12 @@ The command acquires the existing per-checkout lease, verifies identity/model/
 variant, reads history back to the exact assignment prompt and validates fresh
 execution/form/permission state. It performs GET/SSE only: no prompt, engine
 resume/cancel, answer, new session, count import/reset or automatic retry.
+Reading an existing delivery uses its saved session model identity and does not
+require the model to remain available for new submissions. An archived session
+may return a confirmed completed delivery, but cannot receive another assignment.
+If the registration ID changed, `rebind-engine` first verifies the exact session,
+message and original prompt checksum. It leaves an unreviewed STOPPED delivery
+stopped so `resume-watch` can check it separately.
 
 A verified active execution becomes EXECUTING and continues the same wait;
 a correlated pending request becomes WAITING_FOR_ANSWER without answering it;

@@ -299,7 +299,8 @@ test('bind and submit reserve/final saves report unconfirmed and never replay PO
   const sessionID = submit.state().bindings.find(binding => binding.codexChat === submitChat).sessionID;
   const beforeReservation = fs.readFileSync(submit.statePath);
   const failedReservation = await submit.call(submit.submitArgs, submitChat, 10_000, failStateRename(submit, 1));
-  assert.equal(failedReservation.status, 1); assert.equal(failedReservation.result.stateChange, 'unconfirmed');
+  assert.equal(failedReservation.status, 1); assert.equal(failedReservation.result.stateChange, 'unchanged');
+  assert.equal(failedReservation.result.taskSent, false);
   assert.equal(failedReservation.result.diagnostic.errorCode, 'EIO');
   assert.deepEqual(fs.readFileSync(submit.statePath), beforeReservation);
   assert.equal(submit.posts('/api/session/' + sessionID + '/prompt'), 0);

@@ -13,7 +13,7 @@ import { processOwner } from '../helper/process-owner.mjs';
 import { fileURLToPath } from 'node:url';
 
 const chatID = '00000000-0000-4000-8000-000000000017';
-async function setup(t, deliver = async () => ({ status: 'sent', exitCode: 0 })) {
+async function setup(t, deliver = async () => ({ status: 'sent', exitCode: 0 }), beforeWorker) {
   const f = await fixture(t, undefined, '2.2.1'), stateRoot = dirname(f.statePath);
   const connectEngine = () => connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const client = await connectEngine(), adapter = helper(client, { stateRoot, chatID });
@@ -24,7 +24,10 @@ async function setup(t, deliver = async () => ({ status: 'sent', exitCode: 0 }))
   const o = observer({ stateRoot, chatID, connectEngine,
     checkCapability: () => ({ path: process.execPath, hash: 'fixture', version: 'fixture' }),
     deliver: async value => { sent.push(value); return deliver(value); },
-    launch: async id => { running = o.worker(id); },
+    launch: async (id, markExited) => {
+      beforeWorker?.(stateRoot);
+      running = o.worker(id).catch(error => { markExited(); if (!error.lockBusy) throw error; });
+    },
   });
   t.after(async () => { if (o.status().id) await o.cancel(o.status().id); await running; });
   return Object.assign(f, { o, adapter, sent, stateRoot, client,
@@ -32,6 +35,80 @@ async function setup(t, deliver = async () => ({ status: 'sent', exitCode: 0 }))
     end: () => running,
     session: f.state().bindings[0].sessionID });
 }
+
+test('05: worker retries a temporary state lock before its first claim', async t => {
+  const record = JSON.stringify({ schema: 1, token: randomUUID(), process: processOwner() });
+  const f = await setup(t, undefined, stateRoot => {
+    const lock = join(stateRoot, 'state.lock');
+    writeFileSync(lock, record, { flag: 'wx' });
+    setTimeout(() => { if (readFileSync(lock, 'utf8') === record) fs.unlinkSync(lock); }, 450);
+  });
+  const armed = await f.arm();
+  assert.equal(armed.kind, 'observer-armed');
+  assert.equal(armed.ready, true);
+  f.finish(f.session); await f.end();
+  assert.equal((await f.o.consume(armed.id)).kind, 'completed-for-review');
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
+test('05: exhausted startup contention leaves a durable exit and no wake or replacement delivery', async t => {
+  const record = JSON.stringify({ schema: 1, token: randomUUID(), process: processOwner() });
+  let lock;
+  const f = await setup(t, undefined, stateRoot => {
+    lock = join(stateRoot, 'state.lock');
+    writeFileSync(lock, record, { flag: 'wx' });
+  });
+  const before = f.state();
+  let failed;
+  try {
+    failed = await f.arm();
+    assert.equal(failed.kind, 'observer-start-failed');
+    assert.equal(failed.endTurn, false);
+    assert.equal(f.o.status(failed.id).exited, true);
+    assert.match(f.o.status(failed.id).startupFailure, /Worker exited/);
+    assert.equal(readFileSync(lock, 'utf8'), record);
+  } finally { if (lock && existsSync(lock)) fs.unlinkSync(lock); }
+  await f.o.cancel(failed.id); await f.end();
+  assert.equal(f.o.status().state, 'absent');
+  assert.equal(f.sent.length, 0);
+  assert.deepEqual(f.state(), before);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
+
+test('06: a finished receipt after manual wait cannot occupy the next delivery slot', async t => {
+  const f = await setup(t), first = await f.arm();
+  f.finish(f.session); await f.end();
+  assert.equal((await f.adapter.wait(f.workspace, f.plan, { nonGitBaseline: baseline, once: true })).kind, 'completed-for-review');
+  await f.adapter.next(f.workspace, f.plan, 'correction', baseline);
+  const admitted = await f.adapter.submit(f.workspace, f.plan, 'observer-correction-ten', f.packet, baseline, 'correction');
+  const second = await f.arm();
+  assert.equal(second.kind, 'observer-armed');
+  assert.notEqual(second.id, first.id);
+  assert.equal((await f.o.consume(first.id)).kind, 'already-consumed');
+  assert.equal(f.o.status().id, second.id);
+  f.finish(f.session); await f.end();
+  const result = await f.o.consume(second.id);
+  assert.equal(result.kind, 'completed-for-review');
+  assert.equal(result.messageID, admitted.messageID);
+  assert.equal(result.correctionCount, 10);
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 2);
+});
+
+test('consume returns the exact stopped report while keeping the process guard and the stored phase', async t => {
+  const f = await setup(t), armed = await f.arm();
+  f.shells = [{ id: 'sh_active', status: 'running', time: {} }];
+  f.finish(f.session); await f.end();
+  const before = readFileSync(f.statePath), result = await f.o.consume(armed.id);
+  assert.equal(result.kind, 'stopped');
+  assert.equal(result.messageID, armed.messageID);
+  assert.match(result.report.text, /Simulator completed/);
+  assert.equal(result.reviewAllowed, false);
+  assert.equal(result.dispatchAllowed, false);
+  assert.deepEqual(readFileSync(f.statePath), before);
+  assert.ok(!JSON.stringify(f.o.status(armed.id)).includes('Simulator completed'));
+  assert.equal(f.posts(`/api/session/${f.session}/prompt`), 1);
+});
 
 test('detached contract: arm returns ready, waits without a model, one completion hint, fresh consume and no repeat/count reset', async t => {
   const f = await setup(t), from = f.calls.length;

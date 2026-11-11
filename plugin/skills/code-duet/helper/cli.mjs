@@ -98,12 +98,12 @@ try {
     result = await helper(ownershipClient).observationOwner(workspace, plan, assignment,
       { action: values.action, nonGitBaseline: values['non-git-baseline'] });
   }
-  try { if (result === undefined) client = await connect(); }
+  try { if (result === undefined) client = await connect({ requireModel: ['preflight', 'bind', 'adopt', 'submit', 'replace-finished-session'].includes(command) }); }
   catch (error) {
     if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
     else {
       try { if (!replacing && !rebinding && !['sessions', 'retire-legacy', 'reconcile', 'wait', 'resume-watch'].includes(command)) result = await helper(null).connectionLost(error,
-        { preserveReview: ['next', 'finish'].includes(command) }); }
+        { preserveReview: ['next', 'finish'].includes(command), selection: { workspace, planPath: plan, nonGitBaseline: values['non-git-baseline'] } }); }
       catch (stateError) {
         error.persistenceFailure = diagnose(stateError, 'state-io', 'state-write');
       }

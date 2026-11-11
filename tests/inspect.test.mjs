@@ -30,14 +30,14 @@ for (const kind of ['question', 'permission']) test('native quiet wait returns o
   assert.equal(f.calls.filter(call => call.method === 'POST').length, 2);
 });
 
-for (const fault of ['http', 'redirect', 'content-type']) test('native SSE rejects ' + fault + ' without follow/retry or body leak', async t => {
+for (const fault of ['redirect', 'content-type']) test('native SSE rejects ' + fault + ' without follow/retry or body leak', async t => {
   const f = await fixture(t); await f.call(f.bindArgs(0));
   await f.call(['submit', f.workspace, f.plan, 'initial', f.packet, '--non-git-baseline', baseline]);
   f.eventFault = fault;
   const outcome = await f.call(['wait', f.workspace, f.plan, '--non-git-baseline', baseline, '--timeout-ms', '2000']);
   assert.equal(outcome.status, 1);
   assert.equal(outcome.result.diagnostic.category, fault === 'content-type' ? 'event-content-type' : 'event-http');
-  if (fault !== 'content-type') assert.equal(outcome.result.diagnostic.httpStatus, fault === 'http' ? 429 : 302);
+  if (fault === 'redirect') assert.equal(outcome.result.diagnostic.httpStatus, 302);
   assert.equal(outcome.result.phase, 'STOPPED');
   assert.equal(f.calls.filter(call => call.route === '/api/event').length, 1);
   assert.ok(!f.calls.some(call => call.route === '/must-not-follow'));
@@ -103,7 +103,7 @@ for (const ending of ['end', 'destroy']) test('native SSE ' + ending + ' retains
   const online = await f.call(['inspect']);
   assert.equal(online.result.binding.phase, 'STOPPED');
   assert.deepEqual(online.result.binding.diagnostic, stopped.result.diagnostic);
-  f.models = [];
+  f.fault = 'bootstrap-offline';
   const offline = await f.call(['inspect']);
   assert.equal(offline.status, 1); assert.equal(offline.result.connection.verified, false);
   assert.equal(offline.result.binding.sessionID, bound.result.sessionID);

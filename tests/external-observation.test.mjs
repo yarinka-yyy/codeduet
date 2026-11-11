@@ -94,8 +94,32 @@ test('passive completion checks the parent checkout shell registry again before 
     Promise.resolve(++rootReads === 1 && quietFirst ? { data: [] } : running) : f.client.request(route, ...args) };
   await assert.rejects(externalOutcome(client, f.stateRoot, pin), /Project shell still running/);
   rootReads = 0; quietFirst = true;
-  await assert.rejects(externalOutcome(client, f.stateRoot, pin), /Execution changed during completion confirmation/);
+  const transient = await externalOutcome(client, f.stateRoot, pin);
+  assert.equal(transient.kind, 'retryable-read');
+  assert.equal(transient.reviewAllowed, false);
+  assert.match(transient.error, /Execution changed during completion confirmation/);
   assert.equal(rootReads, 2);
+  const reread = await externalOutcome(f.client, f.stateRoot, pin);
+  assert.equal(reread.kind, 'external-completed');
+  assert.equal(reread.messageID, pin.messageID);
+});
+
+test('07: passive observer retries a changed snapshot and delivers one wake for the same receipt', async t => {
+  const f = await setup(t), armed = await f.arm();
+  let shellReads = 0;
+  f.onRequest = route => {
+    if (route.startsWith('/api/shell?') && ++shellReads === 2)
+      f.shells = [{ id: 'sh_ended', status: 'exited', exit: 0, time: { completed: Date.now() } }];
+  };
+  f.finish(sessionID); await f.end();
+  assert.ok(shellReads >= 4);
+  assert.equal(f.sent.length, 1);
+  const result = await f.o.consume(armed.id);
+  assert.equal(result.kind, 'external-completed');
+  assert.equal(result.receiptID, armed.id);
+  assert.equal(result.messageID, messageID);
+  assert.match(result.result.text, /Simulator completed/);
+  assert.equal(result.dispatchAllowed, false);
 });
 
 test('one passive observer per chat/checkout, concurrent arms and cancellation send no task or hint', async t => {

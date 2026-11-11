@@ -32,6 +32,36 @@ function unchanged(f, before, callsFrom) {
   assert.deepEqual(existsSync(owners) ? readdirSync(owners) : [], []);
 }
 
+for (const scenario of ['prelaunch search', 'executed error', 'different error', 'unrecognized command']) {
+  test('B5-01 resumes the original delivery only for a confirmed prelaunch search: ' + scenario, async t => {
+    const f = await stopped(t);
+    f.mutate((_binding, state) => { state.plans[0].correctionCount = 2; });
+    const now = Date.now(), { sessionID, assignmentID, messageID } = f.resume;
+    const error = { type: 'unknown', message: 'Portable shell scanner cannot analyze command: unterminated-quote' };
+    const command = String.raw`cd 'C:\fixture'; Select-String -Path "internal\toolrun\*.go" -Pattern "Name: \"|func Example" | ForEach-Object { "$($_.LineNumber): $($_.Line.Substring(0, [Math]::Min(100, $_.Line.Length)))" } | Select-Object -First 60`;
+    const shell = { id: 'call_b5search', type: 'tool', name: 'shell', time: { ran: now - 1, completed: now },
+      state: { status: 'error', error, input: { command } } };
+    if (scenario === 'executed error') shell.state.metadata = { status: 'completed', exit: 1 };
+    if (scenario === 'different error') error.message = 'Failed while running command';
+    if (scenario === 'unrecognized command') shell.state.input.command += '; Remove-Item important.txt';
+    f.messages.get(sessionID).push({ id: 'msg_b5search', type: 'assistant', model, time: { completed: now }, content: [shell] });
+    f.finish(sessionID);
+    const from = f.calls.length, result = (await f.call(f.args)).result;
+    if (scenario === 'prelaunch search') {
+      assert.equal(result.kind, 'completed-for-review', JSON.stringify(result));
+      assert.deepEqual(result.result.toolErrors.map(({ classification, category, semanticRecoveryVerified }) =>
+        [classification, category, semanticRecoveryVerified]), [['read-only-warning', 'shell-search-rejected-before-launch', false]]);
+      assert.equal(result.result.shellOutcomes, undefined);
+      assert.equal((await f.call(['finish', f.workspace, f.plan, '--non-git-baseline', baseline])).result.kind, 'released');
+    } else assert.equal(result.phase, 'STOPPED', JSON.stringify(result));
+    assert.deepEqual(Object.fromEntries(Object.keys(f.resume).map(key => [key, f.state().bindings[0][key]])),
+      { sessionID, assignmentID, messageID });
+    assert.equal(f.state().plans[0].correctionCount, 2);
+    assert.ok(f.calls.slice(from).every(call => call.method === 'GET'));
+    assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
+  });
+}
+
 test('explicit CLI resumes the same completed assignment without POST, new binding or counter reset', async t => {
   const f = await stopped(t), saved = f.state(), callsFrom = f.calls.length;
   const now = Date.now();
@@ -628,7 +658,7 @@ const unsafe = {
     f.active.ses_foreign = { type: 'running' };
     f.sessions.set('ses_foreign', { id: 'ses_foreign', location: { directory: f.workspace } });
   },
-  'event handshake failure': f => { f.eventFault = 'http'; },
+  'event redirect': f => { f.eventFault = 'redirect'; },
   'unknown active status': f => { f.active[f.resume.sessionID] = { type: 'unknown' }; },
   'history HTTP 400': f => { f.rejectRequest = (method, route) => method === 'GET' && route.includes('/message?'); },
 };
