@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export const MODEL = Object.freeze({ providerID: 'opencode-go', id: 'deepseek-v4.1-flash' });
 export const EXECUTOR_MODEL = Object.freeze({ ...MODEL, variant: 'high' });
-export const ENGINE_VERSIONS = Object.freeze(['2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7']);
+export const ENGINE_VERSIONS = Object.freeze(['2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7', '2.3.0']);
 const releaseVersion = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value);
 const categories = new Set(['unknown', 'request-read', 'request-timeout', 'request-http', 'request-json',
   'event-open', 'event-handshake-timeout', 'event-http', 'event-content-type', 'event-eof', 'event-read',

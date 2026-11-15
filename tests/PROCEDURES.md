@@ -142,7 +142,7 @@ Direct API/helper component proof does not establish actual skill-entry routing.
 
 ## Engine release compatibility
 
-`node --test tests/version.test.mjs` checks exact releases 2.2.1, 2.2.2, 2.2.3, 2.2.5, 2.2.6 and 2.2.7,
+`node --test tests/version.test.mjs` checks exact releases 2.2.2, 2.2.3, 2.2.5, 2.2.6, 2.2.7 and 2.3.0,
 including multi-page completed native synthetic/compaction history, explicit
 adoption, variant/count preservation, SSE review/correction and safe version
 mismatches before any dispatch. New releases are not accepted by a version range.
@@ -162,7 +162,7 @@ and compare production state/registration/config hashes separately.
 
 `node --test tests/synthetic.test.mjs` covers nested AGENTS.md injection inside
 a running/completed read, matching paths and tool times, and rejecting unrelated
-or malformed synthetic input. The HTTP/SSE fixtures verify completion on both
+or malformed synthetic input. The HTTP/SSE fixtures verify completion on the
 supported releases, unchanged final/tool gates, one correction delivery, count
 preservation and durable history diagnostics without private instruction text.
 A stopped delivered assignment stays stopped; these tests never resume P4.

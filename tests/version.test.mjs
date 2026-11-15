@@ -14,7 +14,7 @@ test('supported engine releases are unique and limited to six', () => {
   assert.equal(new Set(ENGINE_VERSIONS).size, ENGINE_VERSIONS.length);
 });
 
-for (const version of ['2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7']) test('validated engine ' + version + ' preserves adoption, SSE completion and correction history', async t => {
+for (const version of ['2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7', '2.3.0']) test('validated engine ' + version + ' preserves adoption, SSE completion and correction history', async t => {
   const f = await fixture(t, undefined, version), sessionID = 'ses_versionfixture';
   f.sessions.set(sessionID, { id: sessionID, title: 'Dedicated version fixture',
     location: { directory: f.workspace }, model: { providerID: model.providerID, id: model.id, variant: 'high' }, time: {} });
@@ -54,13 +54,13 @@ for (const version of ['2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7']) te
   assert.ok(cursorPages.every(call => !new URL(call.route, 'http://localhost').searchParams.has('order')));
 });
 
-for (const version of ['2.2.0', '2.3.0']) test('unsupported ' + version + ' blocks read-only preflight with actionable version fields', async t => {
+for (const version of ['2.2.1', '2.3.1']) test('unsupported ' + version + ' blocks read-only preflight with actionable version fields', async t => {
   const f = await fixture(t, undefined, version);
   const result = await f.call(preflightArgs(f));
   assert.equal(result.status, 1); assert.equal(result.result.status, 'blocked');
   const diagnostic = result.result.connection.diagnostic;
   assert.equal(diagnostic.category, 'engine-version');
-  assert.deepEqual(diagnostic.expectedVersions, ['2.2.1', '2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7']);
+  assert.deepEqual(diagnostic.expectedVersions, ['2.2.2', '2.2.3', '2.2.5', '2.2.6', '2.2.7', '2.3.0']);
   assert.equal(diagnostic.observedVersion, version); assert.equal(diagnostic.versionSource, 'registration');
   assert.equal(result.result.connection.attempts, 1); assert.equal(result.result.connection.retried, false);
   const check = result.result.checks.find(item => item.name === 'connection');
@@ -73,12 +73,12 @@ for (const version of ['2.2.0', '2.3.0']) test('unsupported ' + version + ' bloc
 });
 
 test('registration and server version must agree even when both releases are supported', async t => {
-  const f = await fixture(t, undefined, '2.2.1'), calls = [];
+  const f = await fixture(t, undefined, '2.2.2'), calls = [];
   await assert.rejects(connect({ registrationPath: registrationPath(f), fetchImpl: async url => {
     calls.push(new URL(url).pathname);
     return Response.json(new URL(url).pathname === '/api/info' ? { version: '2.2.6' } : { data: [model] });
   } }), error => {
-    assert.deepEqual(error.diagnostic.expectedVersions, ['2.2.1']);
+    assert.deepEqual(error.diagnostic.expectedVersions, ['2.2.2']);
     assert.equal(error.diagnostic.observedVersion, '2.2.6'); assert.equal(error.diagnostic.versionSource, 'server-info');
     assert.equal(error.bootstrap.attempts, 1); return true;
   });
@@ -97,13 +97,13 @@ test('untrusted registration version values are not reflected in diagnostics', a
 
 test('version diagnostics reject private strings and preserve existing stopped state without recovery', async t => {
   const valid = { category: 'engine-version', stage: 'connection', elapsedMs: 0, lastEvent: null,
-    expectedVersions: [...ENGINE_VERSIONS], observedVersion: '2.3.0', versionSource: 'registration' };
+    expectedVersions: [...ENGINE_VERSIONS], observedVersion: '2.3.1', versionSource: 'registration' };
   assert.equal(validateDiagnostic(valid), valid);
   for (const change of [{ observedVersion: 'PRIVATE_DIAGNOSTIC' }, { expectedVersions: ['PRIVATE_DIAGNOSTIC'] },
     { versionSource: 'PRIVATE_DIAGNOSTIC' }, { category: 'unknown' }, { rawBody: 'PRIVATE_DIAGNOSTIC' }]) {
     assert.throws(() => validateDiagnostic({ ...valid, ...change }), /Invalid diagnostic/);
   }
-  const f = await fixture(t, undefined, '2.2.1'), client = await connect({ registrationPath: registrationPath(f) });
+  const f = await fixture(t, undefined, '2.2.2'), client = await connect({ registrationPath: registrationPath(f) });
   const options = { stateRoot: dirname(f.statePath), chatID: 'version-stopped-fixture' }, adapter = helper(client, options);
   await adapter.bind(f.workspace, f.plan, baseline, 7);
   await adapter.submit(f.workspace, f.plan, 'version-active', f.packet, baseline);
