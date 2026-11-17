@@ -665,7 +665,9 @@ for (const unavailable of ['archived', 'deleted']) test('replace ' + unavailable
   f.shells = [];
   const preflight = await f.call(preflightArgs(f, 7));
   assert.equal(preflight.result.status, 'blocked');
-  assert.deepEqual([preflight.result.nextCommand.command, ...preflight.result.nextCommand.args], args);
+  const next = preflight.result.nextCommand;
+  assert.deepEqual([next.command, ...next.args], unavailable === 'archived' ? args :
+    ['replace-missing-session', f.workspace, f.plan, sessionID, '--correction-count', '7', '--non-git-baseline', baseline]);
   const replaced = await f.call(args);
   assert.equal(replaced.status, 0, JSON.stringify(replaced.result));
   assert.equal(replaced.result.kind, 'finished-session-replaced');
@@ -678,6 +680,77 @@ for (const unavailable of ['archived', 'deleted']) test('replace ' + unavailable
   assert.equal(f.posts('/api/session'), 2);
   assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
 });
+
+for (const chatID of ['offline-http-chat-A', 'offline-http-chat-B']) {
+  test('replace a deleted STOPPED session without replay or counter reset from ' + chatID, async t => {
+    const f = await fixture(t, undefined, '2.3.0');
+    const bound = await f.call(f.bindArgs(1)), sessionID = bound.result.sessionID;
+    assert.equal(bound.status, 0, JSON.stringify(bound.result));
+    assert.equal((await f.call(f.submitArgs)).result.kind, 'admitted');
+    f.finish(sessionID);
+    f.shells = [{ id: 'sh_running', status: 'running' }];
+    assert.equal((await f.call(['wait', f.workspace, f.plan, '--non-git-baseline', baseline])).result.phase, 'STOPPED');
+    f.shells = [];
+    const saved = f.state();
+    const [source] = saved.bindings;
+    source.engineID = 'previous-engine';
+    writeFileSync(f.statePath, JSON.stringify(saved));
+    const before = readFileSync(f.statePath);
+    const args = ['replace-missing-session', f.workspace, f.plan, sessionID,
+      '--correction-count', '2', '--non-git-baseline', baseline];
+    const check = () => f.call(preflightArgs(f, 2), chatID);
+    const replace = () => f.call(args, chatID);
+    assert.match((await replace()).result.error, /still available/);
+    f.sessions.delete(sessionID);
+    if (chatID === 'offline-http-chat-B') {
+      f.rejectRequest = (_method, route) => route === '/api/session/' + sessionID && { _tag: 'InvalidRequestError' };
+      assert.notEqual((await check()).result.nextCommand?.command, args[0]);
+      assert.equal((await replace()).status, 1);
+      f.rejectRequest = undefined;
+      f.active[sessionID] = { type: 'running' };
+      assert.notEqual((await check()).result.nextCommand?.command, args[0]);
+      assert.equal((await replace()).status, 1);
+      delete f.active[sessionID];
+      f.shells = [{ id: 'sh_running', status: 'running' }];
+      assert.notEqual((await check()).result.nextCommand?.command, args[0]);
+      assert.match((await replace()).result.error, /shell still running/);
+      f.shells = [];
+      const pointer = join(dirname(f.statePath), 'observers', 'unknown', 'active');
+      mkdirSync(dirname(pointer), { recursive: true });
+      writeFileSync(pointer, '{}');
+      assert.notEqual((await check()).result.nextCommand?.command, args[0]);
+      assert.match((await replace()).result.error, /observer is active or uncertain/);
+      fs.unlinkSync(pointer);
+    }
+    const checked = await check();
+    assert.ok(checked.result.nextCommand, JSON.stringify(checked.result));
+    assert.deepEqual([checked.result.nextCommand.command, ...checked.result.nextCommand.args], args);
+    assert.deepEqual(readFileSync(f.statePath), before);
+    assert.equal(f.posts('/api/session'), 1);
+    const replaced = await replace();
+    assert.equal(replaced.status, 0, JSON.stringify(replaced));
+    assert.equal(replaced.result.kind, 'missing-session-replaced');
+    assert.equal(replaced.result.taskSent, false);
+    assert.deepEqual(replaced.result.previous, { phase: 'STOPPED', sessionID, messageID: source.messageID,
+      correctionCount: 2, reason: 'session-missing' });
+    const archive = join(dirname(f.statePath), 'missing-session-replacements', sessionID + '.json');
+    assert.deepEqual(JSON.parse(readFileSync(archive)).source, source);
+    const newSession = replaced.result.sessionID;
+    assert.notEqual(newSession, sessionID);
+    assert.deepEqual(f.messages.get(newSession), []);
+    assert.deepEqual(f.state().bindings.map(item => item.codexChat), [chatID]);
+    assert.deepEqual(f.state().plans, saved.plans);
+    assert.equal((await check()).result.status, 'pass');
+    assert.equal((await replace()).status, 1);
+    assert.equal(f.posts('/api/session'), 2);
+    assert.equal(f.posts('/api/session/' + sessionID + '/prompt'), 1);
+    assert.equal(f.posts('/api/session/' + newSession + '/prompt'), 0);
+    const next = await f.call(['submit', f.workspace, f.plan, 'fresh-assignment', f.packet, '--non-git-baseline', baseline], chatID);
+    assert.equal(next.result.kind, 'admitted', JSON.stringify(next));
+    assert.equal(next.result.correctionCount, 2);
+    assert.equal(f.posts('/api/session/' + newSession + '/prompt'), 1);
+  });
+}
 
 test('offline preflight preserves active and STOPPED saved bindings byte-for-byte', async t => {
   const f = await fixture(t), pair = await f.call(f.bindArgs(0));

@@ -22,7 +22,10 @@ try {
   const closeUsage = 'close-assignment <workspace> <plan> <assignment-id> <message-id> --session <exact-id>';
   const transitionUsage = 'transition <workspace> <target-plan> <prior-message-id> <accepted|blocked|without-acceptance> [--kind block|correction] [--non-git-baseline <declaration>]';
   const replacing = command === 'replace-finished-session';
+  const replacingMissing = command === 'replace-missing-session';
   const rebinding = command === 'rebind-engine';
+  if (replacingMissing && (args.length !== 4 || !/^ses_[a-zA-Z0-9]+$/.test(assignment)))
+    throw new Error('Usage: replace-missing-session <workspace> <plan> <prior-session-id> [--correction-count <0..20>]');
   if (rebinding && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) || !/^ses_[a-zA-Z0-9]+$/.test(values.session)))
     throw new Error('Usage: rebind-engine <workspace> <plan> <message-id> --session <session-id>');
   if (replacing && (args.length !== 4 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
@@ -37,11 +40,11 @@ try {
   if (command === 'close-assignment' && args.length !== 5) throw new Error('Usage: cli.mjs ' + closeUsage);
   if (command === 'transition' && (args.length !== 5 || !/^msg_[a-zA-Z0-9]+$/.test(assignment) ||
     !['accepted', 'blocked', 'without-acceptance'].includes(packet))) throw new Error('Usage: cli.mjs ' + transitionUsage);
-  if (!stateLock && !checkingAcceptance && !replacing && !rebinding && (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment', 'transition', 'reconcile'].includes(command) ||
+  if (!stateLock && !checkingAcceptance && !replacing && !replacingMissing && !rebinding && (!['ownership', 'task-maintenance', 'start-cycle', 'retire-legacy', 'inspect', 'sessions', 'preflight', 'adopt', 'bind', 'submit', 'wait', 'resume-watch', 'reply', 'next', 'finish', 'close-assignment', 'transition', 'reconcile'].includes(command) ||
     !(command === 'inspect' ? [1, 2].includes(args.length) : args.length === ({ ownership: 4, 'task-maintenance': 3, 'start-cycle': 3, 'retire-legacy': 4, sessions: 2, preflight: 3, adopt: 4, bind: 3, submit: 5, wait: 3, 'resume-watch': 5, reply: 6, next: 4, finish: 3, 'close-assignment': 5, transition: 5, reconcile: 3 })[command]))) {
     throw new Error('Usage: cli.mjs inspect [<workspace>] | sessions <workspace> [--cursor <cursor>] | preflight <workspace> <plan> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>] | adopt <workspace> <plan> <session-id> [--correction-count <0..20>] | bind <workspace> <plan> [--correction-count <0..20>] | submit <workspace> <plan> <assignment-id> <packet> [--kind initial|block|correction] | resume-watch <workspace> <plan> <assignment-id> <message-id> --session <exact-id> [--timeout-ms <ms>] | wait <workspace> <plan> [--timeout-ms <ms>] | reply <workspace> <plan> <question|permission> <request-id> <answer-json-file> | next <workspace> <plan> <block|correction> | finish <workspace> <plan> [--non-git-baseline <declaration>] | retire-legacy <workspace> <old-plan> <lease-token>; paths must be absolute');
   }
-  if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !replacing && !rebinding && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Invalid option for the selected command');
+  if (values.kind !== undefined && !['submit', 'transition'].includes(command) || values['correction-count'] !== undefined && !['bind', 'adopt', 'preflight', 'replace-missing-session'].includes(command) || values.cursor !== undefined && command !== 'sessions' || values.session !== undefined && !replacing && !rebinding && !['preflight', 'resume-watch', 'close-assignment'].includes(command)) throw new Error('Invalid option for the selected command');
   if (values.action !== undefined && command !== 'ownership' || command === 'ownership' &&
     !['inspect', 'stop', 'recover', 'recover-legacy-bind'].includes(values.action ?? 'inspect')) throw new Error('Usage: cli.mjs ' + ownershipUsage);
   if (values['timeout-ms'] !== undefined && !['wait', 'resume-watch'].includes(command)) throw new Error('timeout-ms belongs to wait/resume-watch');
@@ -98,11 +101,11 @@ try {
     result = await helper(ownershipClient).observationOwner(workspace, plan, assignment,
       { action: values.action, nonGitBaseline: values['non-git-baseline'] });
   }
-  try { if (result === undefined) client = await connect({ requireModel: ['preflight', 'bind', 'adopt', 'submit', 'replace-finished-session'].includes(command) }); }
+  try { if (result === undefined) client = await connect({ requireModel: ['preflight', 'bind', 'adopt', 'submit', 'replace-finished-session', 'replace-missing-session'].includes(command) }); }
   catch (error) {
     if (['inspect', 'preflight', 'close-assignment', 'transition'].includes(command)) connectionError = error;
     else {
-      try { if (!replacing && !rebinding && !['sessions', 'retire-legacy', 'reconcile', 'wait', 'resume-watch'].includes(command)) result = await helper(null).connectionLost(error,
+      try { if (!replacing && !replacingMissing && !rebinding && !['sessions', 'retire-legacy', 'reconcile', 'wait', 'resume-watch'].includes(command)) result = await helper(null).connectionLost(error,
         { preserveReview: ['next', 'finish'].includes(command), selection: { workspace, planPath: plan, nonGitBaseline: values['non-git-baseline'] } }); }
       catch (stateError) {
         error.persistenceFailure = diagnose(stateError, 'state-io', 'state-write');
@@ -124,6 +127,8 @@ try {
     if (command === 'bind') result = await adapter.bind(workspace, plan, baseline, importedCount);
     else if (command === 'reconcile') result = await adapter.reconcile(workspace, plan, baseline);
     else if (rebinding) result = await adapter.rebindEngine(workspace, plan, assignment, values.session, baseline);
+    else if (replacingMissing) result = await adapter.bind(workspace, plan, baseline, importedCount,
+      { sessionID: assignment, missing: true });
     else if (replacing) result = await adapter.bind(workspace, plan, baseline, undefined, {
       sessionID: values.session, messageID: assignment,
       ...(values.unavailable ? { unavailable: true } :

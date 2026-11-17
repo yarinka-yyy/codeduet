@@ -25,6 +25,7 @@ node helper/cli.mjs inspect <absolute-workspace>
 node helper/cli.mjs sessions <absolute-workspace> [--cursor <cursor>]
 node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs preflight <absolute-workspace> <absolute-plan.md> [--session <exact-id>] [--correction-count <0..20>] [--non-git-baseline <declaration>]
+node helper/cli.mjs replace-missing-session <absolute-workspace> <absolute-plan.md> <prior-session-id> [--correction-count <0..20>] [--non-git-baseline <declaration>]
 node helper/cli.mjs adopt <absolute-workspace> <absolute-plan.md> <exact-session-id> [--correction-count <0..20>]
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md>
 node helper/cli.mjs bind <absolute-workspace> <absolute-plan.md> --correction-count <0..20>
@@ -799,6 +800,26 @@ For an older FINISHED delivery, the owner chat can run
 with the existing baseline option if required. The helper applies the same
 event checks to the archived Windows PowerShell log when live evidence is
 missing. Unmatched or missing events leave the saved phase and count intact.
+
+## Replace a missing session
+
+`replace-missing-session <workspace> <plan> <prior-session-id> [--correction-count <0..20>] [--non-git-baseline <declaration>]`
+
+When the user asks for a new OpenCode chat and the exact previous session
+returns HTTP 404, use the `nextCommand` from ordinary preflight. Run it from
+the current Codex chat, including when the missing session belonged to an old
+Codex chat. A live session, failed connection, unresolved mutation or
+interactive request, overlapping writer, running shell, or active or uncertain
+observer prevents replacement. A session that still exists in OpenCode,
+including an archived session, needs the appropriate existing route below.
+
+The helper saves the old binding, delivery IDs, phase and count in
+`missing-session-replacements/<prior-session-id>.json` within its state store.
+It creates an empty OpenCode session in the same physical workspace and binds
+it to the current Codex chat. The plan keeps its saved count and review status.
+The old delivery has the same disposition as before, so an unaccepted delivery
+still needs an explicit review decision. Rerun preflight before submitting a
+separately authorized assignment with a fresh ID. Replacement sends no prompt.
 
 ## Replace an unavailable accepted session
 

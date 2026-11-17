@@ -543,6 +543,26 @@ function preparedTransition(root, binding) {
 const blocksCheckout = (root, binding) => binding.uncertain ||
   !['PREPARING', 'FINISHED'].includes(binding.phase) || !!preparedTransition(root, binding);
 
+function checkMissingSessionSource(root, binding, ctx) {
+  need(binding && /^ses_[a-zA-Z0-9]+$/.test(binding.sessionID) &&
+    ['workspace', 'workspaceID', 'checkout', 'checkoutID'].every(key => binding[key] === ctx[key]),
+  'No exact prior session in this physical workspace');
+  need(!binding.uncertain && !binding.pending && binding.phase !== 'WAITING_FOR_ANSWER',
+    'Prior mutation or interactive request is unresolved');
+  need(!readTransition(root, binding.messageID) &&
+    !(binding.phase === 'STOPPED' && readClosure(root, binding)), 'Prior transition or closure is staged');
+  need(!observerPresent(root, ctx.checkout), 'An observer is active or uncertain; no replacement');
+}
+
+async function sessionMissing(client, sessionID) {
+  try { await client.request('/api/session/' + sessionID); }
+  catch (error) {
+    if (error.diagnostic?.httpStatus === 404) return true;
+    throw error;
+  }
+  return false;
+}
+
 async function matchingSession(client, binding) {
   const response = await client.request('/api/session/' + binding.sessionID);
   const session = response?.data;
@@ -996,7 +1016,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     }
   } else add('ownership', 'unknown', 'Checkout ownership depends on a valid physical checkout');
 
-  let selectedUnavailable = false;
+  let selectedMissing = false, selectedUnavailable = false;
   if (!client) {
     for (const name of ['session', 'session-model', 'session-directory', 'session-options', 'execution', 'forms', 'permissions', 'history', 'background']) {
       add(name, 'unknown', 'OpenCode is unavailable; this dependent check cannot be made',
@@ -1016,7 +1036,8 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     const [activeResult, shellsResult, sessionResult, formsResult, permissionsResult, historyResult] = probes;
     let liveSession;
     if (validSelectedID) {
-      selectedUnavailable = sessionResult.error?.diagnostic?.httpStatus === 404 || archivedSession(sessionResult.value?.data);
+      selectedMissing = sessionResult.error?.diagnostic?.httpStatus === 404;
+      selectedUnavailable = selectedMissing || archivedSession(sessionResult.value?.data);
       if (sessionResult.error) add('session', errorStatus(sessionResult.error), 'Exact session lookup failed: ' + errorReason(sessionResult.error),
         false, diagnosticOf(sessionResult.error));
       else if (sessionResult.value?.data?.id !== selectedSessionID) add('session', 'blocked', 'Exact session ID did not match the returned session');
@@ -1138,10 +1159,21 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
   const permanentRequest = checks.find(item => item.diagnostic?.category === 'request-http' &&
     item.diagnostic.httpStatus >= 400 && item.diagnostic.httpStatus < 500);
   let transition;
+  let missingSession;
   if (client && state && ctx && hasChatID && !explicitSession && blockers.length) {
     const priorOwners = state.bindings.filter(item =>
       (overlaps(ctx.checkout, item.checkout) || ctx.checkoutID === item.checkoutID) && blocksCheckout(stateRoot, item));
-    if (priorOwners.length === 1 && (!savedBinding || savedBinding === priorOwners[0])) {
+    const candidate = savedBinding ?? (priorOwners.length === 1 ? priorOwners[0] : undefined);
+    const recipientChecks = ['recipient', 'saved-phase', 'saved-writers', 'session', 'session-model', 'session-directory',
+      'session-options', 'forms', 'permissions', 'history'];
+    if (candidate && priorOwners.every(owner => owner === candidate) && checks.every(check =>
+      check.status === 'pass' || check.deferred || recipientChecks.includes(check.name))) {
+      try {
+        checkMissingSessionSource(stateRoot, candidate, ctx);
+        if (candidate === savedBinding ? selectedMissing : await sessionMissing(client, candidate.sessionID)) missingSession = candidate;
+      } catch { /* The original blockers still apply. */ }
+    }
+    if (!missingSession && priorOwners.length === 1 && (!savedBinding || savedBinding === priorOwners[0])) {
       const prior = priorOwners[0];
       const evidence = { planPath: prior.planPath, phase: prior.phase, sessionID: prior.sessionID,
         assignmentID: prior.assignmentID ?? null, messageID: prior.messageID ?? null,
@@ -1162,7 +1194,7 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     }
   }
   const legacyBind = legacyCandidates.find(candidate => candidate.action === 'recover-legacy-bind');
-  const replacementSuggested = !explicitSession && selectedUnavailable && savedBinding?.phase === 'FINISHED' &&
+  const replacementSuggested = !missingSession && !explicitSession && selectedUnavailable && savedBinding?.phase === 'FINISHED' &&
     savedBinding.messageID && !savedBinding.uncertain && sameSavedWorkspace(savedBinding) &&
     ['ownership', 'execution', 'background'].every(name => checks.some(item => item.name === name && item.status === 'pass'));
   let nextStep, nextCommand = null;
@@ -1184,6 +1216,11 @@ export async function preflight(client, { stateRoot = resolve(homedir(), '.local
     nextStep = 'If the prior delivery has a saved acceptance receipt, replace its unavailable session with an empty project session, then rerun preflight.';
     nextCommand = { command: 'replace-finished-session', args: [workspacePath, planRealPath, savedBinding.messageID,
       '--session', savedBinding.sessionID, '--unavailable', ...nonGitArgs] };
+  }
+  else if (missingSession) {
+    nextStep = 'If the user requested a new chat, archive the missing pair and create an empty session in this project, then rerun preflight. No prior work is accepted or resent.';
+    nextCommand = { command: 'replace-missing-session', args: [workspacePath, planRealPath, missingSession.sessionID,
+      '--correction-count', String(effectiveCount), ...nonGitArgs] };
   }
   else if (blockers.length && permanentRequest) {
     const diagnostic = permanentRequest.diagnostic;
@@ -1667,9 +1704,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     need(binding.sessionID && !binding.uncertain && (binding.phase !== 'STOPPED' || resumeObservation), 'Binding stopped or mutation uncertain; do not retry');
   }
   const sessionMatches = binding => matchingSession(client, binding);
-  async function idleWorkspace(state, ctx) {
+  async function idleWorkspace(state, ctx, replacingChat) {
     for (const binding of state.bindings) {
-      if (overlaps(ctx.checkout, binding.checkout) || ctx.checkoutID === binding.checkoutID) need(['PREPARING', 'FINISHED'].includes(binding.phase) && !binding.uncertain, 'Prior helper assignment not reviewed/stopped; no new writer');
+      if (binding.codexChat !== replacingChat && (overlaps(ctx.checkout, binding.checkout) || ctx.checkoutID === binding.checkoutID)) need(['PREPARING', 'FINISHED'].includes(binding.phase) && !binding.uncertain, 'Prior helper assignment not reviewed/stopped; no new writer');
     }
     const activity = await checkoutActivity(client, ctx.checkout, await client.request('/api/session/active'));
     need(!activity.overlapping, 'Active executor in this physical checkout');
@@ -2761,7 +2798,9 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
     },
     async bind(workspace, planPath, nonGitBaseline, importedCount, replacement) {
       const ctx = context(workspace, planPath, nonGitBaseline);
-      if (replacement) need(/^ses_[a-zA-Z0-9]+$/.test(replacement.sessionID) && /^msg_[a-zA-Z0-9]+$/.test(replacement.messageID) &&
+      const missing = replacement?.missing === true;
+      if (replacement) need(/^ses_[a-zA-Z0-9]+$/.test(replacement.sessionID), 'Use the exact prior session ID');
+      if (replacement && !missing) need(/^msg_[a-zA-Z0-9]+$/.test(replacement.messageID) &&
         (replacement.unavailable === true && replacement.lostCalls === undefined && replacement.recoveredBind === undefined ||
         Array.isArray(replacement.lostCalls) && replacement.lostCalls.length > 0 && replacement.lostCalls.length <= 32 &&
         replacement.lostCalls.every(id => /^call_[a-zA-Z0-9_]{1,120}$/.test(id)) &&
@@ -2773,6 +2812,15 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
       const start = locked(state => {
         const existing = state.bindings.find(binding => binding.codexChat === chatID);
         planCounter(state, ctx, importedCount);
+        if (missing) {
+          const matches = state.bindings.filter(binding => binding.sessionID === replacement.sessionID);
+          need(matches.length === 1 && (!existing || existing === matches[0]), 'Prior session or this Codex chat binding conflicts');
+          const source = matches[0];
+          checkMissingSessionSource(stateRoot, source, ctx);
+          checkoutAvailable(state, ctx, source);
+          return { ctx, state, source: structuredClone(source), correctionCount: planCounter(state, source).correctionCount,
+            lease: claimOwnership(state, ctx, source, 'bind') };
+        }
         if (replacement) {
           need(existing?.phase === 'FINISHED' && existing.assignmentID && existing.sessionID === replacement.sessionID &&
             existing.messageID === replacement.messageID, 'Only the exact FINISHED delivery in this chat can be replaced');
@@ -2837,7 +2885,11 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           } catch (error) { return stoppedOutcome(start.expected, error, 'connection-uncertain'); }
         }
         let archive;
-        if (start.source && replacement.unavailable) {
+        if (missing) {
+          await requireQuietShells(client, ctx);
+          archive = { schema: 1, source: start.source, correctionCount: start.correctionCount,
+            reason: 'session-missing' };
+        } else if (start.source && replacement.unavailable) {
           await requireQuietShells(client, start.source);
           let session;
           try { session = await sessionMatches(start.source); }
@@ -2857,14 +2909,16 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
           archive = { schema: 1, source: start.source, correctionCount: start.correctionCount, boundary,
             reason: 'lost-powershell-lifecycle-evidence', gaps };
         }
-        await idleWorkspace(start.state, ctx);
+        await idleWorkspace(start.state, ctx, missing ? start.source.codexChat : undefined);
+        if (missing) need(await sessionMissing(client, start.source.sessionID), 'Prior OpenCode session is still available');
         let reservationAttempted = false, reservationExpected, reserved;
         try {
           reserved = locked(state => {
-            const current = state.bindings.find(binding => binding.codexChat === chatID);
+            const current = state.bindings.find(binding => binding.codexChat === (start.source?.codexChat ?? chatID));
             if (archive) {
-              need(unchanged(current, { ...start.source, correctionCount: start.correctionCount }, state),
-                'Finished delivery changed during replacement');
+              need(isDeepStrictEqual(current, start.source) && planCounter(state, current).correctionCount === start.correctionCount &&
+                !state.bindings.some(binding => binding !== current && binding.codexChat === chatID),
+              'Prior binding or destination changed during replacement');
               need(!observerPresent(stateRoot, ctx.checkout), 'An observer is active or uncertain; no replacement');
             } else need(!current, 'Binding appeared during create preparation');
             checkoutAvailable(state, ctx, current);
@@ -2872,7 +2926,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
             const binding = { codexChat: chatID, ...ctx, engineID: client.engineID,
               sessionID: null, phase: 'STOPPED', uncertain: 'create', intent: { nonce: randomUUID() } };
             if (archive) {
-              const path = join(stateRoot, 'finished-session-replacements', start.source.messageID + '.json');
+              const path = missing ? join(stateRoot, 'missing-session-replacements', start.source.sessionID + '.json') :
+                join(stateRoot, 'finished-session-replacements', start.source.messageID + '.json');
               mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
               if (existsSync(path)) need(JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) === JSON.stringify(archive),
                 'A different replacement record already exists');
@@ -2930,8 +2985,8 @@ export function helper(client, { stateRoot = resolve(homedir(), '.local/state/co
         try {
           return commit(expected, (state, binding) => {
             delete binding.uncertain; delete binding.intent; binding.phase = 'PREPARING';
-            return archive ? { ...summary(state, binding, 'finished-session-replaced'), taskSent: false,
-              previous: { phase: 'FINISHED', sessionID: start.source.sessionID, messageID: start.source.messageID,
+            return archive ? { ...summary(state, binding, missing ? 'missing-session-replaced' : 'finished-session-replaced'), taskSent: false,
+              previous: { phase: start.source.phase, sessionID: start.source.sessionID, messageID: start.source.messageID ?? null,
                 correctionCount: start.correctionCount, reason: archive.reason } } : summary(state, binding, 'created');
           }).result;
         } catch (error) {

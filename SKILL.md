@@ -28,10 +28,12 @@ without accepting it, follow [close-assignment](helper/PROTOCOL.md#close-assignm
 Close it before preflight or a new correction. Treat a subsequent submit as
 separate work that requires its own authorization and packet.
 
-If preflight finds that the last accepted OpenCode session is archived or
-deleted, use its [replacement route](helper/PROTOCOL.md#replace-an-unavailable-accepted-session)
-for the authorized next assignment. The new OpenCode session starts empty in
-the same physical project. Rerun preflight before submitting. For lost
+When the user asks for a new OpenCode chat, follow preflight's
+[missing-session route](helper/PROTOCOL.md#replace-a-missing-session) if the old
+session returns HTTP 404. The request for a new chat authorizes this replacement
+from the current Codex chat. Use the saved counter and rerun preflight before
+sending a fresh assignment. An archived accepted session has a
+[separate replacement route](helper/PROTOCOL.md#replace-an-unavailable-accepted-session). For lost
 PowerShell evidence on a FINISHED session, use the
 [separate proof requirements](helper/PROTOCOL.md#replace-a-finished-session-with-lost-powershell-evidence).
 
@@ -59,7 +61,8 @@ record use and restore an archived counter when preflight requests it. Maintenan
 sends no OpenCode request and skips active or uncertain ownership.
 For a new explicit user selection of Code Duet, after maintenance run
 `node helper/cli.mjs start-cycle <absolute-workspace> <absolute-plan.md>` if this is a
-new correction cycle. Use preflight first when continuing an existing assignment or changing plans.
+new correction cycle. Use preflight first when requesting a new chat for the
+same task, continuing an existing assignment or changing plans.
 It starts this selection's correction count at zero and saves the previous count.
 Never run it as part of a transition, for an observer wake, automatic continuation, or an active/uncertain
 assignment. If it refuses, preserve the owner and resolve that task first.

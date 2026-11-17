@@ -69,16 +69,22 @@ state in one result. With no pair it proposes a new OpenCode session unless the
 user explicitly selected an existing recipient; for that case pass the exact ID
 with --session and follow [existing-session routing](existing-session.md).
 Beginning in an already-used Codex chat is supported. Code Duet dispatches with
-opencode-go/deepseek-v4.1-flash at High reasoning. No model/billing fallback, automatic chat rotation,
+opencode-go/deepseek-v4.1-flash at High reasoning. No model/billing fallback,
 subagents, new service or global agent configuration. The user creates a new
-Codex chat manually; only a new explicit selection starts a new cycle.
+Codex chat manually. Creating a chat for the same task keeps the current
+correction count.
 
 Preflight is read-only and reports pass, blocked and unknown checks plus the
 exact next step. It does not create a recipient, change helper state, test
 writability or send a task. A pass is a snapshot, not authority: bind/adopt and
 submit recheck current state. An explicit exact recipient needs no second
 confirmation.
-For an accepted but unavailable prior session, follow preflight's
+For a new OpenCode chat when the old one returns HTTP 404, follow preflight's
+[missing-session route](../helper/PROTOCOL.md#replace-a-missing-session) from the
+current Codex chat. Keep the saved plan counter and report whether the prior
+delivery still needs review. Rerun preflight and prepare a fresh assignment
+from the canonical plan and the evidence still available in the project.
+For an archived accepted prior session, follow preflight's
 [replacement route](../helper/PROTOCOL.md#replace-an-unavailable-accepted-session).
 Continue from the accepted checkpoint in the empty project session.
 
