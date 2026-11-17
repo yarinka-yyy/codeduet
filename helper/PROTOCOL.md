@@ -571,8 +571,10 @@ the shutdown result.
 . "<RUN>\pg.ps1"; $lines=@(); $lines += "status_before_stop=$(Get-ClusterStatus)"; $lines += "listeners_before_stop=$((Get-PortListeners $Port).Count)"; $lines += "postmaster_pid_before_stop=$((Get-Content -LiteralPath (Join-Path $Data 'postmaster.pid') -TotalCount 1))"; $lines += "data_dir=$Data"; $lines += "log=$Log"; $lines += "port=$Port"; $code = Invoke-PgCtl -PgCtlArgs @('-D', $Data, '-m', 'fast', '-w', '-t', '60', 'stop'); Start-Sleep -Seconds 2; $lines += "stop_exit=$code"; $lines += "status_after_stop=$(Get-ClusterStatus)"; $lines += "listeners_after_stop=$((Get-PortListeners $Port).Count)"; $lines += "pidfile_present=$((Test-Path -LiteralPath (Join-Path $Data 'postmaster.pid')))"; $lines += "postgres_procs=$((@(Get-Process postgres -ErrorAction SilentlyContinue)).Count)"; $lines | Set-Content -LiteralPath (Join-Path $Run 'logs\pg-stop.log') -Encoding ascii; $lines | Out-String; Get-Content -LiteralPath $Log -Tail 4 | Out-String -Width 200
 ```
 
-The recovery gate recognizes this wrapper and these command bodies. It uses the
-wrapper reconstructed from OpenCode history, the exact launch command hash,
+The recovery gate recognizes this wrapper and these command bodies. Each of
+the two single-statement `finally` blocks can put its statement and closing
+brace on separate lines. Use the same wrapper revision for start and stop. The
+gate uses the wrapper reconstructed from OpenCode history, the exact launch command hash,
 both shell outputs, and the PID, port, and timestamps in `logs/postgres.log`.
 It checks Windows for the process, listener and PID file. `resume-watch` can
 infer this evidence without `--postgres-evidence`. Use the original owner chat

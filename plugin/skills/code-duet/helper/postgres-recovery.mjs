@@ -234,8 +234,12 @@ function wrappedPgdataCall(tool, tools) {
   const run = literalPath(body.match(/^\$Run[ \t]*=[ \t]*('[^'\r\n]+')$/m)?.[1]);
   const bin = literalPath(body.match(/^\$Bin[ \t]*=[ \t]*('[^'\r\n]+')$/m)?.[1]);
   const port = Number(body.match(/^\$Port[ \t]*=[ \t]*(\d+)$/m)?.[1]);
+  const normalizedBody = body
+    .replace(/^\$(Run|Bin|Port)[ \t]*=.*$/gm, (_, name) => '$' + name + ' = <' + name.toUpperCase() + '>')
+    .replace(/^(    \} finally \{)[ \t\n]+(\$proc\.Dispose\(\)|\$ErrorActionPreference = \$previous)[ \t\n]+\}[ \t]*$/gm,
+      '$1 $2 }');
   if (!run || !bin || relative(path, join(run, 'pg.ps1')) || !Number.isInteger(port) || port <= 0 || port > 65535 ||
-    sha256(body.replace(/^\$(Run|Bin|Port)[ \t]*=.*$/gm, (_, name) => '$' + name + ' = <' + name.toUpperCase() + '>')) !== pgdataBody) return;
+    sha256(normalizedBody) !== pgdataBody) return;
   const fields = completedShellFields(tool);
   if (!fields) return;
   const { field } = fields;

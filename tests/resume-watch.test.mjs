@@ -254,12 +254,13 @@ test('Windows B4-02 pg_ctl history opens ordinary and resumed review without a s
   });
 });
 
-test('B4-05-R1 uses the historical pgdata wrapper and its paired stop to resume correction two', async t => {
-  const f = await fixture(t, undefined, '2.2.6');
+for (const assignmentID of ['B4-05-R1', 'B5-01-VERIFY']) test(assignmentID + ' resumes correction two using the historical pgdata wrapper', async t => {
+  const reformatted = assignmentID === 'B5-01-VERIFY';
+  const f = await fixture(t, undefined, reformatted ? '2.3.0' : '2.2.6');
   const client = await connect({ registrationPath: join(f.home, '.local/state/opencode/service.json') });
   const adapter = helper(client, { stateRoot: dirname(f.statePath), chatID: 'offline-http-chat-A' });
   await adapter.bind(f.workspace, f.plan, baseline, 1);
-  await adapter.submit(f.workspace, f.plan, 'B4-05-R1', f.packet, baseline, 'correction');
+  await adapter.submit(f.workspace, f.plan, assignmentID, f.packet, baseline, 'correction');
   const binding = f.state().bindings[0], run = join(f.workspace, 'pgdata run');
   const path = join(run, 'pg.ps1'), data = join(run, 'data', 'pgdata'), log = join(run, 'logs', 'postgres.log');
   const port = 65427, pid = 35944, at = Date.now();
@@ -272,7 +273,10 @@ test('B4-05-R1 uses the historical pgdata wrapper and its paired stop to resume 
   const tool = (id, name, input, step, output) => ({ id, name, type: 'tool', time: { ran: at + step, completed: at + step + 4 },
     state: { status: 'completed', input, metadata: { status: 'completed', exit: 0, truncated: false },
       content: [{ type: 'text', text: output }] } });
-  const write = tool('call_write', 'write', { path, content }, 0, 'Created file successfully');
+  const script = reformatted ? content.replace('} finally { $ErrorActionPreference = $previous }',
+    () => '} finally {\n        $ErrorActionPreference = $previous\n    }') : content;
+  if (reformatted) assert.notEqual(script, content);
+  const write = tool('call_write', 'write', { path, content: script }, 0, 'Created file successfully');
   const start = tool('call_23631d4733ae4c8eb299e27d', 'shell', { command: startCommand }, 5,
     `status_before_start=3\nlisteners_before_start=0\nstart_exit=0\npg_isready_ok=True\nstatus_after_start=0\nlisteners_after_start=1\npostmaster_pid=${pid}\nport=${port}`);
   const stop = tool('call_334e199a12a84adc8174134d', 'shell', { command: stopCommand }, 20,
@@ -289,8 +293,20 @@ test('B4-05-R1 uses the historical pgdata wrapper and its paired stop to resume 
   const verify = (history = tools, probe = () => true, changes = {}) =>
     verifyPostgresRecovery({ ...binding, postgresRecovery: { ...evidence, ...changes } }, history, at + 30, probe);
   assert.equal(verify(tools, (...args) => { assert.deepEqual(args, [port, false, data, [pid]]); return true; }).get(start.id).stop.tool, stop);
+  if (reformatted) {
+    const bothBlocks = structuredClone(write);
+    bothBlocks.state.input.content = script.replace('} finally { $proc.Dispose() }', () => '} finally {\n        $proc.Dispose()\n    }');
+    assert.notEqual(bothBlocks.state.input.content, script);
+    assert.deepEqual(inferPostgresRecovery(binding, [bothBlocks, start, stop], at + 30), evidence);
+    assert.equal(verify([bothBlocks, start, stop]).get(start.id).stop.tool, stop);
+  }
   assert.throws(() => verify([start, stop]), /Unsupported PostgreSQL launch syntax/);
   assert.throws(() => verify([write, start]), /lacks a matching stop/);
+  const changedScript = structuredClone(write);
+  changedScript.state.input.content = script.replace('$ErrorActionPreference = $previous',
+    () => '$ErrorActionPreference = $previous; Write-Output changed');
+  assert.equal(inferPostgresRecovery(binding, [changedScript, start, stop], at + 30), undefined);
+  assert.throws(() => verify([changedScript, start, stop]), /Unsupported PostgreSQL launch syntax/);
   const newer = tool('call_edit', 'edit', { path, oldString: "$Run    =", newString: "$Run =" }, 12, 'Edited file');
   assert.throws(() => verify([write, start, newer, stop]), /lacks a matching stop/);
   for (const [original, replacement] of [[`=${pid}`, '=1'], [`port=${port}`, 'port=1'], [`data_dir=${data}`, `data_dir=${run}`],
